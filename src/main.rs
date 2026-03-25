@@ -10,7 +10,7 @@ use pg_union_find_rs::handlers::AppState;
 #[tokio::main]
 async fn main() {
     let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://postgres:postgres@localhost:5432/union_find".into()
+        "postgres://postgres:postgres@localhost:54320/union_find".into()
     });
 
     let pool = PgPoolOptions::new()
