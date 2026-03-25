@@ -1,4 +1,5 @@
 use sqlx::PgPool;
+use sqlx::postgres::PgConnection;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -51,12 +52,15 @@ pub async fn worker_loop(pool: PgPool, mut rx: mpsc::Receiver<DbOp>) {
 }
 
 // ---------------------------------------------------------------------------
-// Resolve: recursive CTE following the person_overrides chain.
-// Returns None when the distinct_id is unknown to the system.
+// Transaction-level primitives.
+//
+// These operate on a bare PgConnection (or a Transaction deref'd to one) so
+// callers can group multiple calls into a single commit.  The public API
+// functions below wrap each operation in its own transaction.
 // ---------------------------------------------------------------------------
 
-pub async fn resolve(
-    pool: &PgPool,
+pub async fn resolve_tx(
+    conn: &mut PgConnection,
     team_id: i64,
     distinct_id: &str,
 ) -> DbResult<Option<ResolvedPerson>> {
@@ -83,7 +87,7 @@ pub async fn resolve(
     )
     .bind(team_id)
     .bind(distinct_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
 
     Ok(row.map(|(person_id, internal_id, is_identified)| ResolvedPerson {
@@ -93,16 +97,12 @@ pub async fn resolve(
     }))
 }
 
-// ---------------------------------------------------------------------------
-// /identify — get-or-create a person for a single distinct_id.
-// ---------------------------------------------------------------------------
-
-pub async fn handle_identify(
-    pool: &PgPool,
+pub async fn identify_tx(
+    conn: &mut PgConnection,
     team_id: i64,
     distinct_id: &str,
 ) -> DbResult<IdentifyResponse> {
-    if let Some(resolved) = resolve(pool, team_id, distinct_id).await? {
+    if let Some(resolved) = resolve_tx(&mut *conn, team_id, distinct_id).await? {
         return Ok(IdentifyResponse {
             person_id: resolved.person_id,
         });
@@ -120,10 +120,9 @@ pub async fn handle_identify(
     )
     .bind(team_id)
     .bind(&person_id_str)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?
     .unwrap_or_else(|| {
-        // Conflict on the generated UUID is astronomically unlikely, but handle it.
         panic!("UUID collision for person_id {person_id_str}");
     });
 
@@ -137,12 +136,48 @@ pub async fn handle_identify(
     .bind(team_id)
     .bind(distinct_id)
     .bind(internal_id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
 
     Ok(IdentifyResponse {
         person_id: person_id_str,
     })
+}
+
+async fn mark_identified_tx(conn: &mut PgConnection, internal_id: i64) -> DbResult<()> {
+    sqlx::query("UPDATE persons SET is_identified = true WHERE id = $1 AND NOT is_identified")
+        .bind(internal_id)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Public API — each operation wrapped in an explicit transaction so all
+// statements share a single WAL sync / commit.
+// ---------------------------------------------------------------------------
+
+/// Resolve a distinct_id to its canonical person through the override chain.
+/// Single read — no transaction needed.
+pub async fn resolve(
+    pool: &PgPool,
+    team_id: i64,
+    distinct_id: &str,
+) -> DbResult<Option<ResolvedPerson>> {
+    let mut conn = pool.acquire().await?;
+    resolve_tx(&mut conn, team_id, distinct_id).await
+}
+
+/// /identify — get-or-create a person for a single distinct_id.
+pub async fn handle_identify(
+    pool: &PgPool,
+    team_id: i64,
+    distinct_id: &str,
+) -> DbResult<IdentifyResponse> {
+    let mut tx = pool.begin().await?;
+    let result = identify_tx(&mut tx, team_id, distinct_id).await?;
+    tx.commit().await?;
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -161,17 +196,16 @@ pub async fn handle_create_alias(
     known: &str,
     unknown: &str,
 ) -> DbResult<CreateAliasResponse> {
-    // Resolve the known (target) distinct_id — must already exist.
-    let known_person = resolve(pool, team_id, known)
+    let mut tx = pool.begin().await?;
+
+    let known_person = resolve_tx(&mut tx, team_id, known)
         .await?
         .ok_or_else(|| DbError::NotFound(format!("known distinct_id '{known}' not found")))?;
 
-    // Resolve the unknown (source) distinct_id — may not exist.
-    let unknown_person = resolve(pool, team_id, unknown).await?;
+    let unknown_person = resolve_tx(&mut tx, team_id, unknown).await?;
 
-    match unknown_person {
+    let result = match unknown_person {
         None => {
-            // Unknown doesn't exist yet — just associate it with the known person.
             sqlx::query(
                 "INSERT INTO distinct_ids (team_id, distinct_id, person_id)
                  VALUES ($1, $2, $3)
@@ -180,36 +214,34 @@ pub async fn handle_create_alias(
             .bind(team_id)
             .bind(unknown)
             .bind(known_person.internal_id)
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
 
-            mark_identified(pool, known_person.internal_id).await?;
+            mark_identified_tx(&mut tx, known_person.internal_id).await?;
 
-            Ok(CreateAliasResponse {
+            CreateAliasResponse {
                 person_id: known_person.person_id,
                 refused: false,
-            })
+            }
         }
         Some(unk) if unk.internal_id == known_person.internal_id => {
-            // Already the same person — no-op, just mark identified.
-            mark_identified(pool, known_person.internal_id).await?;
+            mark_identified_tx(&mut tx, known_person.internal_id).await?;
 
-            Ok(CreateAliasResponse {
+            CreateAliasResponse {
                 person_id: known_person.person_id,
                 refused: false,
-            })
+            }
         }
         Some(unk) if unk.is_identified => {
             // Source person is already identified — refuse merge.
             // Matches PostHog's isMergeAllowed: $create_alias / $identify won't
             // merge a person that is already identified.
-            Ok(CreateAliasResponse {
+            CreateAliasResponse {
                 person_id: known_person.person_id,
                 refused: true,
-            })
+            }
         }
         Some(unk) => {
-            // Different, unidentified source person — insert override.
             sqlx::query(
                 "INSERT INTO person_overrides (team_id, old_person_id, override_person_id)
                  VALUES ($1, $2, $3)
@@ -218,17 +250,20 @@ pub async fn handle_create_alias(
             .bind(team_id)
             .bind(unk.internal_id)
             .bind(known_person.internal_id)
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
 
-            mark_identified(pool, known_person.internal_id).await?;
+            mark_identified_tx(&mut tx, known_person.internal_id).await?;
 
-            Ok(CreateAliasResponse {
+            CreateAliasResponse {
                 person_id: known_person.person_id,
                 refused: false,
-            })
+            }
         }
-    }
+    };
+
+    tx.commit().await?;
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -243,16 +278,17 @@ pub async fn handle_merge(
     primary: &str,
     others: &[String],
 ) -> DbResult<MergeResponse> {
-    let primary_person = resolve(pool, team_id, primary)
+    let mut tx = pool.begin().await?;
+
+    let primary_person = resolve_tx(&mut tx, team_id, primary)
         .await?
         .ok_or_else(|| DbError::NotFound(format!("primary distinct_id '{primary}' not found")))?;
 
     for other in others {
-        let other_person = resolve(pool, team_id, other).await?;
+        let other_person = resolve_tx(&mut tx, team_id, other).await?;
 
         match other_person {
             None => {
-                // Doesn't exist — associate directly with the primary person.
                 sqlx::query(
                     "INSERT INTO distinct_ids (team_id, distinct_id, person_id)
                      VALUES ($1, $2, $3)
@@ -261,14 +297,11 @@ pub async fn handle_merge(
                 .bind(team_id)
                 .bind(other.as_str())
                 .bind(primary_person.internal_id)
-                .execute(pool)
+                .execute(&mut *tx)
                 .await?;
             }
-            Some(op) if op.internal_id == primary_person.internal_id => {
-                // Already the same person — nothing to do.
-            }
+            Some(op) if op.internal_id == primary_person.internal_id => {}
             Some(op) => {
-                // Different person — override it into the primary. No is_identified check.
                 sqlx::query(
                     "INSERT INTO person_overrides (team_id, old_person_id, override_person_id)
                      VALUES ($1, $2, $3)
@@ -277,27 +310,17 @@ pub async fn handle_merge(
                 .bind(team_id)
                 .bind(op.internal_id)
                 .bind(primary_person.internal_id)
-                .execute(pool)
+                .execute(&mut *tx)
                 .await?;
             }
         }
     }
 
-    mark_identified(pool, primary_person.internal_id).await?;
+    mark_identified_tx(&mut tx, primary_person.internal_id).await?;
+
+    tx.commit().await?;
 
     Ok(MergeResponse {
         person_id: primary_person.person_id,
     })
-}
-
-// ---------------------------------------------------------------------------
-// Helper: mark a person as identified.
-// ---------------------------------------------------------------------------
-
-pub async fn mark_identified(pool: &PgPool, internal_id: i64) -> DbResult<()> {
-    sqlx::query("UPDATE persons SET is_identified = true WHERE id = $1 AND NOT is_identified")
-        .bind(internal_id)
-        .execute(pool)
-        .await?;
-    Ok(())
 }

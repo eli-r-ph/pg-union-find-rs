@@ -38,6 +38,10 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// Transaction batch size for bulk seeding (warm-up & merge precreation).
+/// Balances WAL-sync amortisation against transaction size.
+const SEED_TX_BATCH: usize = 500;
+
 // ---------------------------------------------------------------------------
 // A team-scoped distinct_id used throughout the benchmark.
 // ---------------------------------------------------------------------------
@@ -131,7 +135,27 @@ fn pick_primary_for_team<'a>(
 }
 
 // ---------------------------------------------------------------------------
+// Batched seeding helper — runs identify_tx for a slice of (team_id, did)
+// pairs inside a single transaction (one WAL sync per batch).
+// ---------------------------------------------------------------------------
+
+async fn seed_batch(pool: &PgPool, items: &[(i64, String)]) -> Vec<String> {
+    let mut tx = pool.begin().await.expect("begin tx");
+    let mut person_ids = Vec::with_capacity(items.len());
+    for (team_id, did) in items {
+        let resp = db::identify_tx(&mut tx, *team_id, did)
+            .await
+            .expect("identify_tx in seed batch");
+        person_ids.push(resp.person_id);
+    }
+    tx.commit().await.expect("commit seed batch");
+    person_ids
+}
+
+// ---------------------------------------------------------------------------
 // Phase 1: warm-up — create N persons distributed round-robin across teams.
+//
+// Batched in groups of SEED_TX_BATCH to amortise WAL syncs.
 // ---------------------------------------------------------------------------
 
 struct WarmupResult {
@@ -146,25 +170,34 @@ async fn phase_warm(
     n: usize,
     team_ids: &[i64],
 ) -> WarmupResult {
-    println!("Phase 1: warming up with {n} persons across {} teams...", team_ids.len());
+    println!(
+        "Phase 1: warming up with {n} persons across {} teams (tx batch {SEED_TX_BATCH})...",
+        team_ids.len()
+    );
     let t0 = Instant::now();
 
     let mut all_primaries = Vec::with_capacity(n);
     let mut primaries_by_team: HashMap<i64, Vec<String>> = HashMap::new();
 
-    for i in 0..n {
-        let team_id = team_ids[i % team_ids.len()];
-        let did = format!("primary-{i}");
+    // Build the full list of (team_id, distinct_id) pairs up front, then
+    // process in transaction-sized chunks.
+    let pairs: Vec<(i64, String)> = (0..n)
+        .map(|i| (team_ids[i % team_ids.len()], format!("primary-{i}")))
+        .collect();
 
-        db::handle_identify(pool, team_id, &did)
-            .await
-            .expect("precreate identify failed");
+    for chunk in pairs.chunks(SEED_TX_BATCH) {
+        seed_batch(pool, chunk).await;
 
-        all_primaries.push(ScopedId {
-            team_id,
-            distinct_id: did.clone(),
-        });
-        primaries_by_team.entry(team_id).or_default().push(did);
+        for (team_id, did) in chunk {
+            all_primaries.push(ScopedId {
+                team_id: *team_id,
+                distinct_id: did.clone(),
+            });
+            primaries_by_team
+                .entry(*team_id)
+                .or_default()
+                .push(did.clone());
+        }
     }
 
     let elapsed = t0.elapsed();
@@ -246,26 +279,30 @@ async fn phase_merge(
     println!("Phase 3: merging {n} distinct_ids in batches of {batch_size}...");
     let mut rng = rand::rng();
 
-    // Pre-create merge distinct_ids, each assigned to a team round-robin.
-    println!("  pre-creating {n} merge distinct_ids...");
+    // Pre-create merge distinct_ids in batched transactions.
+    println!("  pre-creating {n} merge distinct_ids (tx batch {SEED_TX_BATCH})...");
     let t_pre = Instant::now();
+
+    let pairs: Vec<(i64, String)> = (0..n)
+        .map(|i| (team_ids[i % team_ids.len()], format!("merge-{i}")))
+        .collect();
 
     let mut merge_by_team: HashMap<i64, Vec<String>> = HashMap::new();
     let mut all_merge_ids = Vec::with_capacity(n);
 
-    for i in 0..n {
-        let team_id = team_ids[i % team_ids.len()];
-        let did = format!("merge-{i}");
+    for chunk in pairs.chunks(SEED_TX_BATCH) {
+        seed_batch(pool, chunk).await;
 
-        db::handle_identify(pool, team_id, &did)
-            .await
-            .expect("precreate merge distinct_id failed");
-
-        merge_by_team.entry(team_id).or_default().push(did.clone());
-        all_merge_ids.push(ScopedId {
-            team_id,
-            distinct_id: did,
-        });
+        for (team_id, did) in chunk {
+            merge_by_team
+                .entry(*team_id)
+                .or_default()
+                .push(did.clone());
+            all_merge_ids.push(ScopedId {
+                team_id: *team_id,
+                distinct_id: did.clone(),
+            });
+        }
     }
     println!("  pre-created in {:.2?}", t_pre.elapsed());
 
