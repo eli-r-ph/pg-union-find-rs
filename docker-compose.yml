@@ -7,6 +7,14 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: union_find
+    command:
+      - postgres
+      - -c
+      - wal_compression=lz4
+      - -c
+      - commit_delay=10
+      - -c
+      - commit_siblings=5
     volumes:
       - pgdata:/var/lib/postgresql/data
 
