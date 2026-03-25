@@ -10,10 +10,10 @@ use crate::models::{
 // Resolved person — returned by the recursive CTE
 // ---------------------------------------------------------------------------
 
-struct ResolvedPerson {
-    person_id: String,
-    internal_id: i64,
-    is_identified: bool,
+pub struct ResolvedPerson {
+    pub person_id: String,
+    pub internal_id: i64,
+    pub is_identified: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -55,7 +55,7 @@ pub async fn worker_loop(pool: PgPool, mut rx: mpsc::Receiver<DbOp>) {
 // Returns None when the distinct_id is unknown to the system.
 // ---------------------------------------------------------------------------
 
-async fn resolve(
+pub async fn resolve(
     pool: &PgPool,
     team_id: i64,
     distinct_id: &str,
@@ -97,7 +97,7 @@ async fn resolve(
 // /identify — get-or-create a person for a single distinct_id.
 // ---------------------------------------------------------------------------
 
-async fn handle_identify(
+pub async fn handle_identify(
     pool: &PgPool,
     team_id: i64,
     distinct_id: &str,
@@ -155,7 +155,7 @@ async fn handle_identify(
 // The is_identified check gates on the *unknown/source* person.
 // ---------------------------------------------------------------------------
 
-async fn handle_create_alias(
+pub async fn handle_create_alias(
     pool: &PgPool,
     team_id: i64,
     known: &str,
@@ -237,7 +237,7 @@ async fn handle_create_alias(
 // Replicates PostHog $merge_dangerously behaviour.
 // ---------------------------------------------------------------------------
 
-async fn handle_merge(
+pub async fn handle_merge(
     pool: &PgPool,
     team_id: i64,
     primary: &str,
@@ -294,7 +294,7 @@ async fn handle_merge(
 // Helper: mark a person as identified.
 // ---------------------------------------------------------------------------
 
-async fn mark_identified(pool: &PgPool, internal_id: i64) -> DbResult<()> {
+pub async fn mark_identified(pool: &PgPool, internal_id: i64) -> DbResult<()> {
     sqlx::query("UPDATE persons SET is_identified = true WHERE id = $1 AND NOT is_identified")
         .bind(internal_id)
         .execute(pool)

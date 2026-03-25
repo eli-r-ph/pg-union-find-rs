@@ -1,14 +1,11 @@
-mod db;
-mod handlers;
-mod models;
-
 use std::net::SocketAddr;
 
 use axum::{Router, routing::{get, post}};
 use sqlx::postgres::PgPoolOptions;
 use tokio::sync::mpsc;
 
-use handlers::AppState;
+use pg_union_find_rs::{db, handlers};
+use pg_union_find_rs::handlers::AppState;
 
 #[tokio::main]
 async fn main() {
@@ -22,7 +19,6 @@ async fn main() {
         .await
         .expect("failed to connect to database");
 
-    // Run migrations from the embedded SQL files.
     sqlx::migrate!("./migrations")
         .run(&pool)
         .await
