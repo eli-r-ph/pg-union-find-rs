@@ -90,11 +90,13 @@ pub async fn resolve_tx(
     .fetch_optional(&mut *conn)
     .await?;
 
-    Ok(row.map(|(person_id, internal_id, is_identified)| ResolvedPerson {
-        person_id,
-        internal_id,
-        is_identified,
-    }))
+    Ok(
+        row.map(|(person_id, internal_id, is_identified)| ResolvedPerson {
+            person_id,
+            internal_id,
+            is_identified,
+        }),
+    )
 }
 
 pub async fn identify_tx(

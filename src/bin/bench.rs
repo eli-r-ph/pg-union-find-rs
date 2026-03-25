@@ -120,13 +120,11 @@ fn pick_primary_for_team<'a>(
     hot_by_team: &'a HashMap<i64, Vec<String>>,
     primaries_by_team: &'a HashMap<i64, Vec<String>>,
 ) -> &'a str {
-    let use_hot = rng.random_bool(0.8);
-    if use_hot {
-        if let Some(hot) = hot_by_team.get(&team_id) {
-            if !hot.is_empty() {
-                return &hot[rng.random_range(0..hot.len())];
-            }
-        }
+    if rng.random_bool(0.8)
+        && let Some(hot) = hot_by_team.get(&team_id)
+        && !hot.is_empty()
+    {
+        return &hot[rng.random_range(0..hot.len())];
     }
     let team_prims = primaries_by_team
         .get(&team_id)
@@ -165,11 +163,7 @@ struct WarmupResult {
     hot_by_team: HashMap<i64, Vec<String>>,
 }
 
-async fn phase_warm(
-    pool: &PgPool,
-    n: usize,
-    team_ids: &[i64],
-) -> WarmupResult {
+async fn phase_warm(pool: &PgPool, n: usize, team_ids: &[i64]) -> WarmupResult {
     println!(
         "Phase 1: warming up with {n} persons across {} teams (tx batch {SEED_TX_BATCH})...",
         team_ids.len()
@@ -294,10 +288,7 @@ async fn phase_merge(
         seed_batch(pool, chunk).await;
 
         for (team_id, did) in chunk {
-            merge_by_team
-                .entry(*team_id)
-                .or_default()
-                .push(did.clone());
+            merge_by_team.entry(*team_id).or_default().push(did.clone());
             all_merge_ids.push(ScopedId {
                 team_id: *team_id,
                 distinct_id: did.clone(),
@@ -311,8 +302,7 @@ async fn phase_merge(
 
     for (&team_id, dids) in &merge_by_team {
         for chunk in dids.chunks(batch_size) {
-            let primary =
-                pick_primary_for_team(&mut rng, team_id, hot_by_team, primaries_by_team);
+            let primary = pick_primary_for_team(&mut rng, team_id, hot_by_team, primaries_by_team);
             let others: Vec<String> = chunk.to_vec();
 
             let t0 = Instant::now();
@@ -380,9 +370,8 @@ async fn main() {
     println!("  BENCH_READS = {n_reads}");
     println!();
 
-    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://postgres:postgres@localhost:54320/union_find".into()
-    });
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:54320/union_find".into());
 
     let pool = PgPoolOptions::new()
         .max_connections(2)
