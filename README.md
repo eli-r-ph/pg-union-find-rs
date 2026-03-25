@@ -118,3 +118,70 @@ Reads achieved 3,639 ops/s with p50=259µs, but PG-side execution was only 0.072
 4. **Hot-set bias is invisible at this scale.** The 80/20 hot-set model is good, but at 100% buffer cache hit rate it creates no differentiation. At larger scales (millions of persons) it would matter.
 
 5. **No mixed read/write workload.** Real systems do reads and writes concurrently. The phased approach means reads never compete with writes for connections or locks.
+
+---
+
+## Production Scalability Assessment
+
+Could this system handle **100M persons, 1B distinct_ids, and 100s of requests/second** on production Postgres?
+
+**Short answer: not without significant changes.** The architecture is correct but several things break down at that scale.
+
+### The Recursive CTE Doesn't Scale with Chain Depth
+
+The resolve query does one B-tree index lookup per override hop. At benchmark scale (300K rows, 128MB shared_buffers) this runs in 0.072ms with 100% cache hits. At production scale:
+
+- `distinct_ids` with 1B rows: the PK index on `(team_id, distinct_id)` VARCHAR(200) would be **100–300 GB**. Each B-tree lookup traverses 4–5 levels of 8KB pages.
+- `person_overrides` with tens of millions of rows: each recursive iteration does another B-tree traversal.
+- A chain of depth 100 = 100 sequential index lookups. If even a few pages are uncached, you're hitting SSD at ~0.1ms per I/O. A single cold resolve at depth 100 could take **10–50ms**.
+
+At 500 RPS, you'd be doing 5,000–50,000 random index lookups/second just for resolves. When the working set exceeds RAM, this falls apart.
+
+**The fundamental problem:** this is a linked-list traversal, not a true union-find. Real union-find achieves amortized O(α(n)) ≈ O(1) via **path compression** — after resolving A→B→C→D, you rewrite A→D, B→D, C→D directly. This implementation never compresses paths, so chains grow monotonically.
+
+### Index Sizes vs Memory
+
+At production scale, rough sizes:
+
+| Table | Rows | Est. Table + Index Size |
+|-------|------|------------------------|
+| `persons` | 100M | ~15 GB table + ~25 GB indexes |
+| `distinct_ids` | 1B | ~100 GB table + ~150 GB indexes |
+| `person_overrides` | 50–100M | ~5 GB table + ~5 GB indexes |
+
+Total: **~300 GB**. Even with 32 GB `shared_buffers` (typical production), cache hit rate would plummet from the 100% seen in benchmarks to maybe 10–30% for cold paths. The hot-set would stay cached, but the long tail would hammer disk.
+
+### The Serial Worker Bottleneck
+
+Each team's requests serialize through one worker. If a popular team generates 50 RPS and each op takes 10ms (realistic at scale with uncached reads), that worker maxes out at 100 ops/s — barely enough, and any latency spike cascades.
+
+### The N+1 Merge Pattern
+
+A merge batch of 10 does ~22 queries (1 resolve for primary + 10 resolves + 10 inserts + 1 update) inside one transaction. At depth-100 chains, each resolve does 100 index lookups. A single merge batch could trigger **1,000+ index lookups** and hold a transaction open for 100ms+, blocking all other operations for that team.
+
+### What Would Need to Change for Production
+
+1. **Path compression (critical).** After resolving A→B→C→D, rewrite all intermediate overrides to point directly to the root (A→D, B→D, C→D). This is the core of union-find and bounds effective chain depth to ~1–2 for the vast majority of lookups. Could be done eagerly (during each resolve) or lazily (background flattening job).
+
+2. **Materialized canonical mapping.** Maintain a `canonical_person_id` directly on `distinct_ids`. Reads become a single index lookup. Writes update all affected rows eagerly (fan-out on merge).
+
+3. **Caching layer.** Redis/memcached in front of PG for resolved person IDs. With 80/20 hot-set patterns, a cache with 10M entries would handle 95%+ of reads.
+
+4. **Batch resolve.** Replace per-element `resolve_tx` with a single `WHERE (team_id, distinct_id) IN (...)` + set-based override traversal. Reduces round-trips from N+1 to 2.
+
+5. **Index optimization.** The `persons` PK is `(team_id, person_id)` on VARCHAR(200), but the internal bigint `id` is what everything references. Making `id` the PK and using a UNIQUE constraint on `(team_id, person_id)` only for the upsert path would shrink the primary index dramatically.
+
+6. **Partitioning.** Hash-partitioning `distinct_ids` by `team_id` would keep individual partition indexes small enough to stay cached for active teams.
+
+### Summary
+
+| Concern | Status at Target Scale |
+|---------|----------------------|
+| Read latency (cold) | Breaks — O(depth) random I/O per resolve |
+| Read latency (hot) | OK if cached, but cache hit rate drops |
+| Write throughput | Marginal — serial workers + N+1 pattern |
+| Override chain growth | Unbounded — no path compression |
+| Index sizes vs RAM | ~300 GB vs 32 GB shared_buffers |
+| Correctness | Sound — team_id serialization prevents races |
+
+The correctness model (team_id sharding, override chain with recursive CTE) is solid. To serve 100M/1B scale at 100s RPS, the system needs **path compression** (to bound chain depth), a **caching layer** (to avoid hitting PG on every read), and **batch query patterns** (to reduce per-request round-trips).
