@@ -8,13 +8,14 @@
 //!   Phase 4 — Read:     resolve N_READS random non-primary distinct_ids through override chains
 //!
 //! Tune via env vars (defaults in parentheses):
-//!   BENCH_TEAMS   (auto: N_WARM/1000) — number of team_ids to distribute across
-//!   BENCH_WARM    (100_000)           — phase 1 person count
-//!   BENCH_ALIAS   (100_000)           — phase 2 alias count
-//!   BENCH_MERGE   (100_000)           — phase 3 merge distinct_id count
-//!   BENCH_BATCH   (10)                — phase 3 sub-batch size
-//!   BENCH_READS   (1_000_000)         — phase 4 read count
-//!   BENCH_DB_POOL (50)                — max DB connections for the benchmark pool
+//!   BENCH_TEAMS       (auto: N_WARM/1000) — number of team_ids to distribute across
+//!   BENCH_WARM        (100_000)           — phase 1 person count
+//!   BENCH_ALIAS       (100_000)           — phase 2 alias count
+//!   BENCH_MERGE       (100_000)           — phase 3 merge distinct_id count
+//!   BENCH_BATCH       (10)                — phase 3 sub-batch size
+//!   BENCH_CHAIN_DEPTH (100)               — phase 3b: max override chain depth
+//!   BENCH_READS       (1_000_000)         — phase 4 read count
+//!   BENCH_DB_POOL     (50)                — max DB connections for the benchmark pool
 //!
 //! Run:
 //!   cargo run --release --bin bench
@@ -23,6 +24,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use rand::Rng;
+use rand::seq::SliceRandom;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 
@@ -234,11 +236,7 @@ struct AliasOp {
     unknown: String,
 }
 
-fn pregen_alias_ops(
-    n: usize,
-    all_primaries: &[ScopedId],
-    hot_set: &[ScopedId],
-) -> Vec<AliasOp> {
+fn pregen_alias_ops(n: usize, all_primaries: &[ScopedId], hot_set: &[ScopedId]) -> Vec<AliasOp> {
     let mut rng = rand::rng();
     (0..n)
         .map(|i| {
@@ -300,10 +298,7 @@ fn pregen_merge(
     let mut all_merge_ids = Vec::with_capacity(n);
 
     for (team_id, did) in &seed_pairs {
-        merge_by_team
-            .entry(*team_id)
-            .or_default()
-            .push(did.clone());
+        merge_by_team.entry(*team_id).or_default().push(did.clone());
         all_merge_ids.push(ScopedId {
             team_id: *team_id,
             distinct_id: did.clone(),
@@ -313,8 +308,7 @@ fn pregen_merge(
     let mut ops = Vec::with_capacity(n / batch_size + 1);
     for (&team_id, dids) in &merge_by_team {
         for chunk in dids.chunks(batch_size) {
-            let primary =
-                pick_primary_for_team(&mut rng, team_id, hot_by_team, primaries_by_team);
+            let primary = pick_primary_for_team(&mut rng, team_id, hot_by_team, primaries_by_team);
             ops.push(MergeOp {
                 team_id,
                 primary: primary.to_owned(),
@@ -352,6 +346,151 @@ async fn phase_merge(pool: &PgPool, pregen: &MergePregen) {
     }
 
     print_stats("merge (per batch)", &compute_stats(latencies));
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3b: chain deepening — merge primaries into each other to create
+// override chains of realistic, varying depths.
+//
+// Runs AFTER phases 2 and 3 so that both alias and merge distinct_ids
+// (which already point to primaries) inherit the deeper chains — every
+// read in phase 4 traverses the recursive CTE at a realistic depth.
+//
+// Chain length distribution is log-uniform: length = ceil(max_depth^U)
+// where U ~ Uniform(0,1).  This produces many short chains with a heavy
+// tail, plus one guaranteed max-depth chain per team.
+//
+// Example distribution with max_depth=100:
+//   ~35% of chains ≤  5 hops
+//   ~50% of chains ≤ 10 hops
+//   ~85% of chains ≤ 50 hops
+//   ~2-3% of chains ≥ 90 hops
+//   +1 guaranteed chain of exactly 100 per team
+// ---------------------------------------------------------------------------
+
+/// Partition `n_primaries` primaries into chains whose lengths follow a
+/// log-uniform distribution capped at `max_depth`. One chain per team is
+/// guaranteed to hit `max_depth` (if enough primaries exist).
+fn generate_chain_lengths(rng: &mut impl Rng, n_primaries: usize, max_depth: usize) -> Vec<usize> {
+    if max_depth <= 1 || n_primaries <= 1 {
+        return vec![1; n_primaries];
+    }
+
+    let mut lengths = Vec::new();
+    let mut remaining = n_primaries;
+    let ln_max = (max_depth as f64).ln();
+
+    if remaining >= max_depth {
+        lengths.push(max_depth);
+        remaining -= max_depth;
+    }
+
+    while remaining > 0 {
+        let u: f64 = rng.random();
+        let len = ((u * ln_max).exp().ceil() as usize).clamp(1, remaining.min(max_depth));
+        lengths.push(len);
+        remaining -= len;
+    }
+
+    lengths
+}
+
+async fn phase_chain_deepen(
+    pool: &PgPool,
+    max_depth: usize,
+    primaries_by_team: &HashMap<i64, Vec<String>>,
+) {
+    if max_depth <= 1 {
+        println!("Phase 3b: chain deepening skipped (max_depth=1)\n");
+        return;
+    }
+
+    let mut rng = rand::rng();
+
+    // Plan chains for every team: shuffle primaries so hot-set members
+    // land at random positions within chains, then partition into chains
+    // of log-uniform length.
+    let mut team_plans: Vec<(i64, Vec<Vec<String>>)> = Vec::new();
+    let mut total_chains = 0usize;
+    let mut total_links = 0usize;
+    let mut max_actual = 0usize;
+    let mut depth_counts: Vec<usize> = vec![0; max_depth + 1];
+
+    for (&team_id, prims) in primaries_by_team {
+        let mut shuffled = prims.clone();
+        shuffled.shuffle(&mut rng);
+
+        let chain_lengths = generate_chain_lengths(&mut rng, shuffled.len(), max_depth);
+
+        let mut offset = 0;
+        let mut chains = Vec::with_capacity(chain_lengths.len());
+        for len in &chain_lengths {
+            let chain: Vec<String> = shuffled[offset..offset + len].to_vec();
+            offset += len;
+            if chain.len() > 1 {
+                total_links += chain.len() - 1;
+                if chain.len() > max_actual {
+                    max_actual = chain.len();
+                }
+            }
+            depth_counts[chain.len().saturating_sub(1)] += 1;
+            chains.push(chain);
+        }
+        total_chains += chains.len();
+        team_plans.push((team_id, chains));
+    }
+
+    println!(
+        "Phase 3b: deepening override chains (max depth {max_depth}, \
+         {total_chains} chains, {total_links} link ops, deepest {max_actual})..."
+    );
+
+    // Print depth distribution in buckets.
+    let buckets: &[(usize, usize)] = &[
+        (0, 0),
+        (1, 1),
+        (2, 4),
+        (5, 9),
+        (10, 24),
+        (25, 49),
+        (50, 99),
+        (100, max_depth),
+    ];
+    println!("  chain depth distribution (override hops):");
+    for &(lo, hi) in buckets {
+        if lo > max_depth {
+            break;
+        }
+        let hi = hi.min(max_depth);
+        let count: usize = depth_counts[lo..=hi].iter().sum();
+        if count > 0 {
+            if lo == hi {
+                println!("    depth {lo:>6}: {count} chains");
+            } else {
+                println!("    depth {lo:>3}-{hi:<3}: {count} chains");
+            }
+        }
+    }
+
+    let t0 = Instant::now();
+    let mut latencies = Vec::with_capacity(total_links);
+
+    for (team_id, chains) in &team_plans {
+        for chain in chains {
+            for i in 0..chain.len().saturating_sub(1) {
+                let t_op = Instant::now();
+                db::handle_merge(pool, *team_id, &chain[i + 1], &[chain[i].clone()])
+                    .await
+                    .expect("chain deepen merge failed");
+                latencies.push(t_op.elapsed());
+            }
+        }
+    }
+
+    if !latencies.is_empty() {
+        print_stats("chain deepen", &compute_stats(latencies));
+    }
+    println!("  total chain deepening wall time: {:.2?}\n", t0.elapsed());
 }
 
 // ---------------------------------------------------------------------------
@@ -398,6 +537,7 @@ async fn main() {
     let n_alias = env_usize("BENCH_ALIAS", 100_000);
     let n_merge = env_usize("BENCH_MERGE", 100_000);
     let batch_size = env_usize("BENCH_BATCH", 10);
+    let chain_depth = env_usize("BENCH_CHAIN_DEPTH", 100);
     let n_reads = env_usize("BENCH_READS", 1_000_000);
     let n_teams = env_usize("BENCH_TEAMS", std::cmp::max(1, n_warm / 1000));
     let db_pool_size = env_usize("BENCH_DB_POOL", 50);
@@ -405,13 +545,14 @@ async fn main() {
     let team_ids: Vec<i64> = (1..=n_teams as i64).collect();
 
     println!("=== Union-Find Benchmark ===");
-    println!("  BENCH_TEAMS   = {n_teams}");
-    println!("  BENCH_WARM    = {n_warm}");
-    println!("  BENCH_ALIAS   = {n_alias}");
-    println!("  BENCH_MERGE   = {n_merge}");
-    println!("  BENCH_BATCH   = {batch_size}");
-    println!("  BENCH_READS   = {n_reads}");
-    println!("  BENCH_DB_POOL = {db_pool_size}");
+    println!("  BENCH_TEAMS       = {n_teams}");
+    println!("  BENCH_WARM        = {n_warm}");
+    println!("  BENCH_ALIAS       = {n_alias}");
+    println!("  BENCH_MERGE       = {n_merge}");
+    println!("  BENCH_BATCH       = {batch_size}");
+    println!("  BENCH_CHAIN_DEPTH = {chain_depth}");
+    println!("  BENCH_READS       = {n_reads}");
+    println!("  BENCH_DB_POOL     = {db_pool_size}");
     println!();
 
     let database_url = std::env::var("DATABASE_URL")
@@ -474,6 +615,10 @@ async fn main() {
 
     // Phase 3: merge benchmark (state accumulates on top of phases 1+2)
     phase_merge(&pool, &merge_pregen).await;
+
+    // Phase 3b: chain deepening — merge primaries into each other to build
+    // realistic override chain depths for the read phase.
+    phase_chain_deepen(&pool, chain_depth, &warm.primaries_by_team).await;
 
     // Phase 4: read benchmark — resolve alias and merge distinct_ids through override chains.
     phase_read(&pool, &lookup_ids, &read_indices).await;

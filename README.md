@@ -36,6 +36,7 @@ Tunable via env vars (defaults in parentheses):
 | `BENCH_ALIAS` | 100,000 | Phase 2 alias count |
 | `BENCH_MERGE` | 100,000 | Phase 3 merge distinct_id count |
 | `BENCH_BATCH` | 10 | Phase 3 sub-batch size |
+| `BENCH_CHAIN_DEPTH` | 100 | Phase 3b max override chain depth |
 | `BENCH_READS` | 1,000,000 | Phase 4 read count |
 | `BENCH_DB_POOL` | 50 | Max DB connections |
 
