@@ -8,12 +8,13 @@
 //!   Phase 4 — Read:     resolve N_READS random non-primary distinct_ids through override chains
 //!
 //! Tune via env vars (defaults in parentheses):
-//!   BENCH_TEAMS  (auto: N_WARM/1000) — number of team_ids to distribute across
-//!   BENCH_WARM   (100_000)           — phase 1 person count
-//!   BENCH_ALIAS  (100_000)           — phase 2 alias count
-//!   BENCH_MERGE  (100_000)           — phase 3 merge distinct_id count
-//!   BENCH_BATCH  (10)                — phase 3 sub-batch size
-//!   BENCH_READS  (1_000_000)         — phase 4 read count
+//!   BENCH_TEAMS   (auto: N_WARM/1000) — number of team_ids to distribute across
+//!   BENCH_WARM    (100_000)           — phase 1 person count
+//!   BENCH_ALIAS   (100_000)           — phase 2 alias count
+//!   BENCH_MERGE   (100_000)           — phase 3 merge distinct_id count
+//!   BENCH_BATCH   (10)                — phase 3 sub-batch size
+//!   BENCH_READS   (1_000_000)         — phase 4 read count
+//!   BENCH_DB_POOL (50)                — max DB connections for the benchmark pool
 //!
 //! Run:
 //!   cargo run --release --bin bench
@@ -227,107 +228,148 @@ async fn phase_warm(pool: &PgPool, n: usize, team_ids: &[i64]) -> WarmupResult {
 // Phase 2: alias benchmark
 // ---------------------------------------------------------------------------
 
-async fn phase_alias(
-    pool: &PgPool,
+struct AliasOp {
+    team_id: i64,
+    known: String,
+    unknown: String,
+}
+
+fn pregen_alias_ops(
     n: usize,
     all_primaries: &[ScopedId],
     hot_set: &[ScopedId],
-) -> Vec<ScopedId> {
-    println!("Phase 2: aliasing {n} new distinct_ids...");
+) -> Vec<AliasOp> {
     let mut rng = rand::rng();
-    let mut latencies = Vec::with_capacity(n);
-    let mut alias_ids = Vec::with_capacity(n);
+    (0..n)
+        .map(|i| {
+            let primary = pick_primary(&mut rng, all_primaries, hot_set);
+            AliasOp {
+                team_id: primary.team_id,
+                known: primary.distinct_id.clone(),
+                unknown: format!("alias-{i}"),
+            }
+        })
+        .collect()
+}
 
-    for i in 0..n {
-        let primary = pick_primary(&mut rng, all_primaries, hot_set);
-        let alias_id = format!("alias-{i}");
+async fn phase_alias(pool: &PgPool, ops: &[AliasOp]) {
+    println!("Phase 2: aliasing {} new distinct_ids...", ops.len());
+    let mut latencies = Vec::with_capacity(ops.len());
 
+    for op in ops {
         let t0 = Instant::now();
-        db::handle_create_alias(pool, primary.team_id, &primary.distinct_id, &alias_id)
+        db::handle_create_alias(pool, op.team_id, &op.known, &op.unknown)
             .await
             .expect("create_alias failed");
         latencies.push(t0.elapsed());
-
-        alias_ids.push(ScopedId {
-            team_id: primary.team_id,
-            distinct_id: alias_id,
-        });
     }
 
     print_stats("create_alias", &compute_stats(latencies));
-    alias_ids
 }
 
 // ---------------------------------------------------------------------------
 // Phase 3: merge benchmark
 // ---------------------------------------------------------------------------
 
-async fn phase_merge(
-    pool: &PgPool,
+struct MergeOp {
+    team_id: i64,
+    primary: String,
+    others: Vec<String>,
+}
+
+struct MergePregen {
+    seed_pairs: Vec<(i64, String)>,
+    ops: Vec<MergeOp>,
+    all_merge_ids: Vec<ScopedId>,
+}
+
+fn pregen_merge(
     n: usize,
     batch_size: usize,
     team_ids: &[i64],
     primaries_by_team: &HashMap<i64, Vec<String>>,
     hot_by_team: &HashMap<i64, Vec<String>>,
-) -> Vec<ScopedId> {
-    println!("Phase 3: merging {n} distinct_ids in batches of {batch_size}...");
+) -> MergePregen {
     let mut rng = rand::rng();
 
-    // Pre-create merge distinct_ids in batched transactions.
-    println!("  pre-creating {n} merge distinct_ids (tx batch {SEED_TX_BATCH})...");
-    let t_pre = Instant::now();
-
-    let pairs: Vec<(i64, String)> = (0..n)
+    let seed_pairs: Vec<(i64, String)> = (0..n)
         .map(|i| (team_ids[i % team_ids.len()], format!("merge-{i}")))
         .collect();
 
     let mut merge_by_team: HashMap<i64, Vec<String>> = HashMap::new();
     let mut all_merge_ids = Vec::with_capacity(n);
 
-    for chunk in pairs.chunks(SEED_TX_BATCH) {
-        seed_batch(pool, chunk).await;
+    for (team_id, did) in &seed_pairs {
+        merge_by_team
+            .entry(*team_id)
+            .or_default()
+            .push(did.clone());
+        all_merge_ids.push(ScopedId {
+            team_id: *team_id,
+            distinct_id: did.clone(),
+        });
+    }
 
-        for (team_id, did) in chunk {
-            merge_by_team.entry(*team_id).or_default().push(did.clone());
-            all_merge_ids.push(ScopedId {
-                team_id: *team_id,
-                distinct_id: did.clone(),
+    let mut ops = Vec::with_capacity(n / batch_size + 1);
+    for (&team_id, dids) in &merge_by_team {
+        for chunk in dids.chunks(batch_size) {
+            let primary =
+                pick_primary_for_team(&mut rng, team_id, hot_by_team, primaries_by_team);
+            ops.push(MergeOp {
+                team_id,
+                primary: primary.to_owned(),
+                others: chunk.to_vec(),
             });
         }
     }
-    println!("  pre-created in {:.2?}", t_pre.elapsed());
 
-    // Merge in sub-batches, grouped by team so each batch targets one team.
-    let mut latencies = Vec::with_capacity(n / batch_size + 1);
+    MergePregen {
+        seed_pairs,
+        ops,
+        all_merge_ids,
+    }
+}
 
-    for (&team_id, dids) in &merge_by_team {
-        for chunk in dids.chunks(batch_size) {
-            let primary = pick_primary_for_team(&mut rng, team_id, hot_by_team, primaries_by_team);
-            let others: Vec<String> = chunk.to_vec();
+async fn phase_merge(pool: &PgPool, pregen: &MergePregen) {
+    let n = pregen.seed_pairs.len();
+    let n_ops = pregen.ops.len();
+    println!("Phase 3: merging {n} distinct_ids in {n_ops} batches...");
 
-            let t0 = Instant::now();
-            db::handle_merge(pool, team_id, primary, &others)
-                .await
-                .expect("merge failed");
-            latencies.push(t0.elapsed());
-        }
+    println!("  seeding {n} merge distinct_ids (tx batch {SEED_TX_BATCH})...");
+    let t_pre = Instant::now();
+    for chunk in pregen.seed_pairs.chunks(SEED_TX_BATCH) {
+        seed_batch(pool, chunk).await;
+    }
+    println!("  seeded in {:.2?}", t_pre.elapsed());
+
+    let mut latencies = Vec::with_capacity(n_ops);
+    for op in &pregen.ops {
+        let t0 = Instant::now();
+        db::handle_merge(pool, op.team_id, &op.primary, &op.others)
+            .await
+            .expect("merge failed");
+        latencies.push(t0.elapsed());
     }
 
     print_stats("merge (per batch)", &compute_stats(latencies));
-    all_merge_ids
 }
 
 // ---------------------------------------------------------------------------
 // Phase 4: read benchmark
 // ---------------------------------------------------------------------------
 
-async fn phase_read(pool: &PgPool, n: usize, lookup_ids: &[ScopedId]) {
-    println!("Phase 4: reading {n} random non-primary distinct_ids...");
+fn pregen_read_indices(n: usize, pool_size: usize) -> Vec<usize> {
     let mut rng = rand::rng();
+    (0..n).map(|_| rng.random_range(0..pool_size)).collect()
+}
+
+async fn phase_read(pool: &PgPool, lookup_ids: &[ScopedId], indices: &[usize]) {
+    let n = indices.len();
+    println!("Phase 4: reading {n} random non-primary distinct_ids...");
     let mut latencies = Vec::with_capacity(n);
 
-    for _ in 0..n {
-        let sid = &lookup_ids[rng.random_range(0..lookup_ids.len())];
+    for &idx in indices {
+        let sid = &lookup_ids[idx];
 
         let t0 = Instant::now();
         let resolved = db::resolve(pool, sid.team_id, &sid.distinct_id)
@@ -358,23 +400,25 @@ async fn main() {
     let batch_size = env_usize("BENCH_BATCH", 10);
     let n_reads = env_usize("BENCH_READS", 1_000_000);
     let n_teams = env_usize("BENCH_TEAMS", std::cmp::max(1, n_warm / 1000));
+    let db_pool_size = env_usize("BENCH_DB_POOL", 50);
 
     let team_ids: Vec<i64> = (1..=n_teams as i64).collect();
 
     println!("=== Union-Find Benchmark ===");
-    println!("  BENCH_TEAMS = {n_teams}");
-    println!("  BENCH_WARM  = {n_warm}");
-    println!("  BENCH_ALIAS = {n_alias}");
-    println!("  BENCH_MERGE = {n_merge}");
-    println!("  BENCH_BATCH = {batch_size}");
-    println!("  BENCH_READS = {n_reads}");
+    println!("  BENCH_TEAMS   = {n_teams}");
+    println!("  BENCH_WARM    = {n_warm}");
+    println!("  BENCH_ALIAS   = {n_alias}");
+    println!("  BENCH_MERGE   = {n_merge}");
+    println!("  BENCH_BATCH   = {batch_size}");
+    println!("  BENCH_READS   = {n_reads}");
+    println!("  BENCH_DB_POOL = {db_pool_size}");
     println!();
 
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:54320/union_find".into());
 
     let pool = PgPoolOptions::new()
-        .max_connections(2)
+        .max_connections(db_pool_size as u32)
         .connect(&database_url)
         .await
         .expect("failed to connect to database");
@@ -390,27 +434,49 @@ async fn main() {
         .await
         .expect("failed to truncate");
 
-    // Phase 1: warm-up
+    // Phase 1: warm-up (seeding, not latency-benchmarked)
     let warm = phase_warm(&pool, n_warm, &team_ids).await;
 
-    // Phase 2: alias benchmark
-    let alias_ids = phase_alias(&pool, n_alias, &warm.all_primaries, &warm.hot_set).await;
+    // Pregenerate all operation data so timed loops measure only DB work.
+    let t_pregen = Instant::now();
 
-    // Phase 3: merge benchmark (state accumulates on top of phases 1+2)
-    let merge_ids = phase_merge(
-        &pool,
+    let alias_ops = pregen_alias_ops(n_alias, &warm.all_primaries, &warm.hot_set);
+    let merge_pregen = pregen_merge(
         n_merge,
         batch_size,
         &team_ids,
         &warm.primaries_by_team,
         &warm.hot_by_team,
-    )
-    .await;
+    );
+
+    // Build the read lookup pool from alias + merge distinct_ids.
+    let mut lookup_ids: Vec<ScopedId> = alias_ops
+        .iter()
+        .map(|op| ScopedId {
+            team_id: op.team_id,
+            distinct_id: op.unknown.clone(),
+        })
+        .collect();
+    lookup_ids.extend(merge_pregen.all_merge_ids.iter().cloned());
+
+    let read_indices = pregen_read_indices(n_reads, lookup_ids.len());
+
+    println!(
+        "pregenerated {} alias + {} merge + {} read ops in {:.2?}\n",
+        alias_ops.len(),
+        merge_pregen.ops.len(),
+        read_indices.len(),
+        t_pregen.elapsed(),
+    );
+
+    // Phase 2: alias benchmark
+    phase_alias(&pool, &alias_ops).await;
+
+    // Phase 3: merge benchmark (state accumulates on top of phases 1+2)
+    phase_merge(&pool, &merge_pregen).await;
 
     // Phase 4: read benchmark — resolve alias and merge distinct_ids through override chains.
-    let mut lookup_ids = alias_ids;
-    lookup_ids.extend(merge_ids);
-    phase_read(&pool, n_reads, &lookup_ids).await;
+    phase_read(&pool, &lookup_ids, &read_indices).await;
 
     println!("=== Done ===");
 }
