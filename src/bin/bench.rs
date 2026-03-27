@@ -1,15 +1,18 @@
 //! Benchmark harness for the union-find service.
 //!
-//! Exercises the DB layer directly (no HTTP overhead) through four phases:
+//! Exercises the DB layer directly (no HTTP overhead) through five phases:
 //!
-//!   Phase 1 — Warm-up:  create N_WARM persons via /create across N_TEAMS
-//!   Phase 2 — Alias:    create N_ALIAS new distinct_ids, alias each to an existing person
-//!   Phase 3 — Merge:    create N_MERGE new distinct_ids, merge in sub-batches
-//!   Phase 4 — Read:     resolve N_READS random non-primary distinct_ids through union_find chains
+//!   Phase 1  — Warm-up:  batch-seed N_WARM persons via identify_tx across N_TEAMS
+//!   Phase 1b — Create:   benchmark N_CREATE individual handle_create calls (80% new, 20% existing)
+//!   Phase 2  — Alias:    run N_ALIAS alias ops (85% Case 1a, 5% Case 2a, 5% src==dest, 5% Case 3)
+//!   Phase 3  — Merge:    seed N_MERGE distinct_ids, then merge in sub-batches
+//!   Phase 3b — Deepen:   merge primaries into each other for realistic chain depths
+//!   Phase 4  — Read:     resolve N_READS random distinct_ids through union_find chains
 //!
 //! Tune via env vars (defaults in parentheses):
 //!   BENCH_TEAMS       (auto: N_WARM/1000) — number of team_ids to distribute across
 //!   BENCH_WARM        (100_000)           — phase 1 person count
+//!   BENCH_CREATE      (50_000)            — phase 1b create count
 //!   BENCH_ALIAS       (100_000)           — phase 2 alias count
 //!   BENCH_MERGE       (100_000)           — phase 3 merge distinct_id count
 //!   BENCH_BATCH       (10)                — phase 3 sub-batch size
@@ -217,6 +220,69 @@ async fn phase_warm(pool: &PgPool, n: usize, team_ids: &[i64]) -> WarmupResult {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 1b: /create latency benchmark — individual handle_create calls.
+// ---------------------------------------------------------------------------
+
+struct CreatePregen {
+    ops: Vec<ScopedId>,
+    new_ids: Vec<ScopedId>,
+}
+
+fn pregen_create_ops(
+    n: usize,
+    all_primaries: &[ScopedId],
+    hot_set: &[ScopedId],
+    team_ids: &[i64],
+) -> CreatePregen {
+    let mut rng = rand::rng();
+    let n_new = n * 4 / 5; // 80% create path
+    let n_get = n - n_new; // 20% get path (existing primaries)
+
+    let mut ops = Vec::with_capacity(n);
+    let mut new_ids = Vec::with_capacity(n_new);
+
+    for i in 0..n_new {
+        let team_id = team_ids[i % team_ids.len()];
+        let did = format!("create-{i}");
+        new_ids.push(ScopedId {
+            team_id,
+            distinct_id: did.clone(),
+        });
+        ops.push(ScopedId {
+            team_id,
+            distinct_id: did,
+        });
+    }
+
+    for _ in 0..n_get {
+        let primary = pick_primary(&mut rng, all_primaries, hot_set);
+        ops.push(primary.clone());
+    }
+
+    ops.shuffle(&mut rng);
+
+    CreatePregen { ops, new_ids }
+}
+
+async fn phase_create(pool: &PgPool, ops: &[ScopedId]) {
+    println!(
+        "Phase 1b: benchmarking {} handle_create calls...",
+        ops.len()
+    );
+    let mut latencies = Vec::with_capacity(ops.len());
+
+    for op in ops {
+        let t0 = Instant::now();
+        db::handle_create(pool, op.team_id, &op.distinct_id)
+            .await
+            .expect("handle_create failed");
+        latencies.push(t0.elapsed());
+    }
+
+    print_stats("create", &compute_stats(latencies));
+}
+
+// ---------------------------------------------------------------------------
 // Phase 2: alias benchmark
 // ---------------------------------------------------------------------------
 
@@ -226,13 +292,13 @@ struct AliasOp {
     dest: String,
 }
 
-/// Pregenerate alias operations covering three of the four alias cases:
-///   - ~90% Case 1a: src (primary) exists, dest is new
-///   - ~5%  Case 2a: both exist, same person (src == dest are the same primary)
+/// Pregenerate alias operations covering four code paths:
+///   - ~85% Case 1a: src (primary) exists, dest is new
+///   - ~5%  Case 2a: both exist, same person (primary + alias-{i} from Case 1a)
+///   - ~5%  src==dest: get-or-create via the identify_tx shortcut
 ///   - ~5%  Case 3:  neither exists (both src and dest are fresh)
 struct AliasPregen {
     ops: Vec<AliasOp>,
-    fresh_dest_ids: Vec<ScopedId>,
 }
 
 fn pregen_alias_ops(
@@ -243,13 +309,14 @@ fn pregen_alias_ops(
 ) -> AliasPregen {
     let mut rng = rand::rng();
     let n_case2a = n / 20; // 5%
+    let n_srceqdest = n / 20; // 5%
     let n_case3 = n / 20; // 5%
-    let n_case1a = n - n_case2a - n_case3;
+    let n_case1a = n - n_case2a - n_srceqdest - n_case3;
 
     let mut ops = Vec::with_capacity(n);
-    let mut fresh_dest_ids = Vec::new();
 
-    // Case 1a: src exists (primary), dest is new
+    // Case 1a: src exists (primary), dest is new — must run first so Case 2a
+    // can reference the (primary, alias-{i}) pairs created here.
     for i in 0..n_case1a {
         let primary = pick_primary(&mut rng, all_primaries, hot_set);
         ops.push(AliasOp {
@@ -259,8 +326,20 @@ fn pregen_alias_ops(
         });
     }
 
-    // Case 2a: both exist, same person (use same primary for both — no-op)
+    // Case 2a: both exist, same person — pick a random Case 1a op and re-use
+    // its (primary, alias-{i}) pair so both distinct_ids exist in the DB and
+    // share the same person. This exercises the two-root-comparison no-op path.
     for _ in 0..n_case2a {
+        let donor = &ops[rng.random_range(0..n_case1a)];
+        ops.push(AliasOp {
+            team_id: donor.team_id,
+            src: donor.src.clone(),
+            dest: donor.dest.clone(),
+        });
+    }
+
+    // src==dest: get-or-create via the identify_tx shortcut
+    for _ in 0..n_srceqdest {
         let primary = pick_primary(&mut rng, all_primaries, hot_set);
         ops.push(AliasOp {
             team_id: primary.team_id,
@@ -272,23 +351,14 @@ fn pregen_alias_ops(
     // Case 3: neither exists — both are fresh distinct_ids
     for i in 0..n_case3 {
         let team_id = team_ids[rng.random_range(0..team_ids.len())];
-        let src_id = format!("fresh-src-{i}");
-        let dest_id = format!("fresh-dest-{i}");
-        fresh_dest_ids.push(ScopedId {
-            team_id,
-            distinct_id: dest_id.clone(),
-        });
         ops.push(AliasOp {
             team_id,
-            src: src_id,
-            dest: dest_id,
+            src: format!("fresh-src-{i}"),
+            dest: format!("fresh-dest-{i}"),
         });
     }
 
-    AliasPregen {
-        ops,
-        fresh_dest_ids,
-    }
+    AliasPregen { ops }
 }
 
 async fn phase_alias(pool: &PgPool, ops: &[AliasOp]) {
@@ -556,6 +626,7 @@ async fn phase_read(pool: &PgPool, lookup_ids: &[ScopedId], indices: &[usize]) {
 #[tokio::main]
 async fn main() {
     let n_warm = env_usize("BENCH_WARM", 100_000);
+    let n_create = env_usize("BENCH_CREATE", 50_000);
     let n_alias = env_usize("BENCH_ALIAS", 100_000);
     let n_merge = env_usize("BENCH_MERGE", 100_000);
     let batch_size = env_usize("BENCH_BATCH", 10);
@@ -569,6 +640,7 @@ async fn main() {
     println!("=== Union-Find Benchmark ===");
     println!("  BENCH_TEAMS       = {n_teams}");
     println!("  BENCH_WARM        = {n_warm}");
+    println!("  BENCH_CREATE      = {n_create}");
     println!("  BENCH_ALIAS       = {n_alias}");
     println!("  BENCH_MERGE       = {n_merge}");
     println!("  BENCH_BATCH       = {batch_size}");
@@ -602,6 +674,7 @@ async fn main() {
     // Pregenerate all operation data so timed loops measure only DB work.
     let t_pregen = Instant::now();
 
+    let create_pregen = pregen_create_ops(n_create, &warm.all_primaries, &warm.hot_set, &team_ids);
     let alias_pregen = pregen_alias_ops(n_alias, &warm.all_primaries, &warm.hot_set, &team_ids);
     let merge_pregen = pregen_merge(
         n_merge,
@@ -611,30 +684,39 @@ async fn main() {
         &warm.hot_by_team,
     );
 
-    // Build read lookup pool from alias dest distinct_ids (Case 1a only —
-    // Case 2a are no-ops on existing primaries, Case 3 fresh dests are added
-    // separately below).
-    let mut lookup_ids: Vec<ScopedId> = alias_pregen
-        .ops
-        .iter()
-        .filter(|op| op.src != op.dest) // skip Case 2a no-ops
-        .map(|op| ScopedId {
-            team_id: op.team_id,
-            distinct_id: op.dest.clone(),
-        })
-        .collect();
-    lookup_ids.extend(alias_pregen.fresh_dest_ids.iter().cloned());
+    // Build read lookup pool: collect resolvable distinct_ids from every phase.
+    let mut lookup_ids: Vec<ScopedId> = Vec::new();
+    for op in &alias_pregen.ops {
+        if op.src != op.dest {
+            lookup_ids.push(ScopedId {
+                team_id: op.team_id,
+                distinct_id: op.dest.clone(),
+            });
+            // Case 3 fresh-src-{i} is also resolvable after the alias runs
+            if !op.src.starts_with("primary-") {
+                lookup_ids.push(ScopedId {
+                    team_id: op.team_id,
+                    distinct_id: op.src.clone(),
+                });
+            }
+        }
+    }
+    lookup_ids.extend(create_pregen.new_ids.iter().cloned());
     lookup_ids.extend(merge_pregen.all_merge_ids.iter().cloned());
 
     let read_indices = pregen_read_indices(n_reads, lookup_ids.len());
 
     println!(
-        "pregenerated {} alias + {} merge + {} read ops in {:.2?}\n",
+        "pregenerated {} create + {} alias + {} merge + {} read ops in {:.2?}\n",
+        create_pregen.ops.len(),
         alias_pregen.ops.len(),
         merge_pregen.ops.len(),
         read_indices.len(),
         t_pregen.elapsed(),
     );
+
+    // Phase 1b: create latency benchmark
+    phase_create(&pool, &create_pregen.ops).await;
 
     // Phase 2: alias benchmark
     phase_alias(&pool, &alias_pregen.ops).await;
