@@ -66,8 +66,8 @@ pub async fn identify(
     let team_id = req.team_id;
     let op = DbOp::Alias {
         team_id,
-        src: req.primary,
-        dest: req.anonymous,
+        target: req.target,
+        source: req.anonymous,
         reply: reply_tx,
     };
 
@@ -103,8 +103,8 @@ pub async fn alias(
     let team_id = req.team_id;
     let op = DbOp::Alias {
         team_id,
-        src: req.primary,
-        dest: req.alias,
+        target: req.target,
+        source: req.alias,
         reply: reply_tx,
     };
 
@@ -140,8 +140,8 @@ pub async fn merge(
     let team_id = req.team_id;
     let op = DbOp::Merge {
         team_id,
-        src: req.src,
-        dests: req.dests,
+        target: req.target,
+        sources: req.sources,
         reply: reply_tx,
     };
 

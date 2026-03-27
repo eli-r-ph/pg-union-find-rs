@@ -4,9 +4,9 @@
 //!
 //!   Phase 1  — Warm-up:  batch-seed N_WARM persons via identify_tx across N_TEAMS
 //!   Phase 1b — Create:   benchmark N_CREATE individual handle_create calls (80% new, 20% existing)
-//!   Phase 2  — Alias:    run N_ALIAS alias ops (85% Case 1a, 5% Case 2a, 5% src==dest, 5% Case 3)
+//!   Phase 2  — Alias:    run N_ALIAS alias ops (85% Case 1a, 5% Case 2a, 5% target==source, 5% Case 3)
 //!   Phase 3  — Merge:    seed N_MERGE distinct_ids, then merge in sub-batches
-//!   Phase 3b — Deepen:   merge primaries into each other for realistic chain depths
+//!   Phase 3b — Deepen:   merge targets into each other for realistic chain depths
 //!   Phase 4  — Read:     resolve N_READS random distinct_ids through union_find chains
 //!
 //! Tune via env vars (defaults in parentheses):
@@ -102,27 +102,27 @@ fn print_stats(label: &str, stats: &Stats) {
 }
 
 // ---------------------------------------------------------------------------
-// Pick a primary with 80/20 hot-set bias.
+// Pick a target with 80/20 hot-set bias.
 // ---------------------------------------------------------------------------
 
-fn pick_primary<'a>(
+fn pick_target<'a>(
     rng: &mut impl Rng,
-    all_primaries: &'a [ScopedId],
+    all_targets: &'a [ScopedId],
     hot_set: &'a [ScopedId],
 ) -> &'a ScopedId {
     if rng.random_bool(0.8) {
         &hot_set[rng.random_range(0..hot_set.len())]
     } else {
-        &all_primaries[rng.random_range(0..all_primaries.len())]
+        &all_targets[rng.random_range(0..all_targets.len())]
     }
 }
 
-/// Pick a primary that belongs to a specific team.
-fn pick_primary_for_team<'a>(
+/// Pick a target that belongs to a specific team.
+fn pick_target_for_team<'a>(
     rng: &mut impl Rng,
     team_id: i64,
     hot_by_team: &'a HashMap<i64, Vec<String>>,
-    primaries_by_team: &'a HashMap<i64, Vec<String>>,
+    targets_by_team: &'a HashMap<i64, Vec<String>>,
 ) -> &'a str {
     if rng.random_bool(0.8)
         && let Some(hot) = hot_by_team.get(&team_id)
@@ -130,10 +130,8 @@ fn pick_primary_for_team<'a>(
     {
         return &hot[rng.random_range(0..hot.len())];
     }
-    let team_prims = primaries_by_team
-        .get(&team_id)
-        .expect("team has no primaries");
-    &team_prims[rng.random_range(0..team_prims.len())]
+    let team_tgts = targets_by_team.get(&team_id).expect("team has no targets");
+    &team_tgts[rng.random_range(0..team_tgts.len())]
 }
 
 // ---------------------------------------------------------------------------
@@ -156,9 +154,9 @@ async fn seed_batch(pool: &PgPool, items: &[(i64, String)]) {
 // ---------------------------------------------------------------------------
 
 struct WarmupResult {
-    all_primaries: Vec<ScopedId>,
+    all_targets: Vec<ScopedId>,
     hot_set: Vec<ScopedId>,
-    primaries_by_team: HashMap<i64, Vec<String>>,
+    targets_by_team: HashMap<i64, Vec<String>>,
     hot_by_team: HashMap<i64, Vec<String>>,
 }
 
@@ -169,8 +167,8 @@ async fn phase_warm(pool: &PgPool, n: usize, team_ids: &[i64]) -> WarmupResult {
     );
     let t0 = Instant::now();
 
-    let mut all_primaries = Vec::with_capacity(n);
-    let mut primaries_by_team: HashMap<i64, Vec<String>> = HashMap::new();
+    let mut all_targets = Vec::with_capacity(n);
+    let mut targets_by_team: HashMap<i64, Vec<String>> = HashMap::new();
 
     let pairs: Vec<(i64, String)> = (0..n)
         .map(|i| (team_ids[i % team_ids.len()], format!("primary-{i}")))
@@ -180,11 +178,11 @@ async fn phase_warm(pool: &PgPool, n: usize, team_ids: &[i64]) -> WarmupResult {
         seed_batch(pool, chunk).await;
 
         for (team_id, did) in chunk {
-            all_primaries.push(ScopedId {
+            all_targets.push(ScopedId {
                 team_id: *team_id,
                 distinct_id: did.clone(),
             });
-            primaries_by_team
+            targets_by_team
                 .entry(*team_id)
                 .or_default()
                 .push(did.clone());
@@ -200,7 +198,7 @@ async fn phase_warm(pool: &PgPool, n: usize, team_ids: &[i64]) -> WarmupResult {
     let mut rng = rand::rng();
     let hot_count = std::cmp::max(1, n / 5);
     let hot_set: Vec<ScopedId> = (0..hot_count)
-        .map(|_| all_primaries[rng.random_range(0..all_primaries.len())].clone())
+        .map(|_| all_targets[rng.random_range(0..all_targets.len())].clone())
         .collect();
 
     let mut hot_by_team: HashMap<i64, Vec<String>> = HashMap::new();
@@ -212,9 +210,9 @@ async fn phase_warm(pool: &PgPool, n: usize, team_ids: &[i64]) -> WarmupResult {
     }
 
     WarmupResult {
-        all_primaries,
+        all_targets,
         hot_set,
-        primaries_by_team,
+        targets_by_team,
         hot_by_team,
     }
 }
@@ -230,13 +228,13 @@ struct CreatePregen {
 
 fn pregen_create_ops(
     n: usize,
-    all_primaries: &[ScopedId],
+    all_targets: &[ScopedId],
     hot_set: &[ScopedId],
     team_ids: &[i64],
 ) -> CreatePregen {
     let mut rng = rand::rng();
     let n_new = n * 4 / 5; // 80% create path
-    let n_get = n - n_new; // 20% get path (existing primaries)
+    let n_get = n - n_new; // 20% get path (existing targets)
 
     let mut ops = Vec::with_capacity(n);
     let mut new_ids = Vec::with_capacity(n_new);
@@ -255,8 +253,8 @@ fn pregen_create_ops(
     }
 
     for _ in 0..n_get {
-        let primary = pick_primary(&mut rng, all_primaries, hot_set);
-        ops.push(primary.clone());
+        let target = pick_target(&mut rng, all_targets, hot_set);
+        ops.push(target.clone());
     }
 
     ops.shuffle(&mut rng);
@@ -288,63 +286,63 @@ async fn phase_create(pool: &PgPool, ops: &[ScopedId]) {
 
 struct AliasOp {
     team_id: i64,
-    src: String,
-    dest: String,
+    target: String,
+    source: String,
 }
 
 /// Pregenerate alias operations covering four code paths:
-///   - ~85% Case 1a: src (primary) exists, dest is new
-///   - ~5%  Case 2a: both exist, same person (primary + alias-{i} from Case 1a)
-///   - ~5%  src==dest: get-or-create via the identify_tx shortcut
-///   - ~5%  Case 3:  neither exists (both src and dest are fresh)
+///   - ~85% Case 1a: target exists, source is new
+///   - ~5%  Case 2a: both exist, same person (target + alias-{i} from Case 1a)
+///   - ~5%  target==source: get-or-create via the identify_tx shortcut
+///   - ~5%  Case 3:  neither exists (both target and source are fresh)
 struct AliasPregen {
     ops: Vec<AliasOp>,
 }
 
 fn pregen_alias_ops(
     n: usize,
-    all_primaries: &[ScopedId],
+    all_targets: &[ScopedId],
     hot_set: &[ScopedId],
     team_ids: &[i64],
 ) -> AliasPregen {
     let mut rng = rand::rng();
     let n_case2a = n / 20; // 5%
-    let n_srceqdest = n / 20; // 5%
+    let n_tgt_eq_src = n / 20; // 5%
     let n_case3 = n / 20; // 5%
-    let n_case1a = n - n_case2a - n_srceqdest - n_case3;
+    let n_case1a = n - n_case2a - n_tgt_eq_src - n_case3;
 
     let mut ops = Vec::with_capacity(n);
 
-    // Case 1a: src exists (primary), dest is new — must run first so Case 2a
-    // can reference the (primary, alias-{i}) pairs created here.
+    // Case 1a: target exists, source is new — must run first so Case 2a
+    // can reference the (target, alias-{i}) pairs created here.
     for i in 0..n_case1a {
-        let primary = pick_primary(&mut rng, all_primaries, hot_set);
+        let tgt = pick_target(&mut rng, all_targets, hot_set);
         ops.push(AliasOp {
-            team_id: primary.team_id,
-            src: primary.distinct_id.clone(),
-            dest: format!("alias-{i}"),
+            team_id: tgt.team_id,
+            target: tgt.distinct_id.clone(),
+            source: format!("alias-{i}"),
         });
     }
 
     // Case 2a: both exist, same person — pick a random Case 1a op and re-use
-    // its (primary, alias-{i}) pair so both distinct_ids exist in the DB and
-    // share the same person. This exercises the two-root-comparison no-op path.
+    // its (target, alias-{i}) pair so both distinct_ids exist in the DB and
+    // share the same person.
     for _ in 0..n_case2a {
         let donor = &ops[rng.random_range(0..n_case1a)];
         ops.push(AliasOp {
             team_id: donor.team_id,
-            src: donor.src.clone(),
-            dest: donor.dest.clone(),
+            target: donor.target.clone(),
+            source: donor.source.clone(),
         });
     }
 
-    // src==dest: get-or-create via the identify_tx shortcut
-    for _ in 0..n_srceqdest {
-        let primary = pick_primary(&mut rng, all_primaries, hot_set);
+    // target==source: get-or-create via the identify_tx shortcut
+    for _ in 0..n_tgt_eq_src {
+        let tgt = pick_target(&mut rng, all_targets, hot_set);
         ops.push(AliasOp {
-            team_id: primary.team_id,
-            src: primary.distinct_id.clone(),
-            dest: primary.distinct_id.clone(),
+            team_id: tgt.team_id,
+            target: tgt.distinct_id.clone(),
+            source: tgt.distinct_id.clone(),
         });
     }
 
@@ -353,8 +351,8 @@ fn pregen_alias_ops(
         let team_id = team_ids[rng.random_range(0..team_ids.len())];
         ops.push(AliasOp {
             team_id,
-            src: format!("fresh-src-{i}"),
-            dest: format!("fresh-dest-{i}"),
+            target: format!("fresh-tgt-{i}"),
+            source: format!("fresh-src-{i}"),
         });
     }
 
@@ -370,7 +368,7 @@ async fn phase_alias(pool: &PgPool, ops: &[AliasOp]) {
 
     for op in ops {
         let t0 = Instant::now();
-        db::handle_alias(pool, op.team_id, &op.src, &op.dest)
+        db::handle_alias(pool, op.team_id, &op.target, &op.source)
             .await
             .expect("alias failed");
         latencies.push(t0.elapsed());
@@ -385,8 +383,8 @@ async fn phase_alias(pool: &PgPool, ops: &[AliasOp]) {
 
 struct MergeOp {
     team_id: i64,
-    src: String,
-    dests: Vec<String>,
+    target: String,
+    sources: Vec<String>,
 }
 
 struct MergePregen {
@@ -399,7 +397,7 @@ fn pregen_merge(
     n: usize,
     batch_size: usize,
     team_ids: &[i64],
-    primaries_by_team: &HashMap<i64, Vec<String>>,
+    targets_by_team: &HashMap<i64, Vec<String>>,
     hot_by_team: &HashMap<i64, Vec<String>>,
 ) -> MergePregen {
     let mut rng = rand::rng();
@@ -422,11 +420,11 @@ fn pregen_merge(
     let mut ops = Vec::with_capacity(n / batch_size + 1);
     for (&team_id, dids) in &merge_by_team {
         for chunk in dids.chunks(batch_size) {
-            let src = pick_primary_for_team(&mut rng, team_id, hot_by_team, primaries_by_team);
+            let tgt = pick_target_for_team(&mut rng, team_id, hot_by_team, targets_by_team);
             ops.push(MergeOp {
                 team_id,
-                src: src.to_owned(),
-                dests: chunk.to_vec(),
+                target: tgt.to_owned(),
+                sources: chunk.to_vec(),
             });
         }
     }
@@ -453,7 +451,7 @@ async fn phase_merge(pool: &PgPool, pregen: &MergePregen) {
     let mut latencies = Vec::with_capacity(n_ops);
     for op in &pregen.ops {
         let t0 = Instant::now();
-        db::handle_merge(pool, op.team_id, &op.src, &op.dests)
+        db::handle_merge(pool, op.team_id, &op.target, &op.sources)
             .await
             .expect("merge failed");
         latencies.push(t0.elapsed());
@@ -463,17 +461,17 @@ async fn phase_merge(pool: &PgPool, pregen: &MergePregen) {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 3b: chain deepening — merge primaries into each other to create
+// Phase 3b: chain deepening — merge targets into each other to create
 // union_find chains of realistic, varying depths.
 // ---------------------------------------------------------------------------
 
-fn generate_chain_lengths(rng: &mut impl Rng, n_primaries: usize, max_depth: usize) -> Vec<usize> {
-    if max_depth <= 1 || n_primaries <= 1 {
-        return vec![1; n_primaries];
+fn generate_chain_lengths(rng: &mut impl Rng, n_targets: usize, max_depth: usize) -> Vec<usize> {
+    if max_depth <= 1 || n_targets <= 1 {
+        return vec![1; n_targets];
     }
 
     let mut lengths = Vec::new();
-    let mut remaining = n_primaries;
+    let mut remaining = n_targets;
     let ln_max = (max_depth as f64).ln();
 
     if remaining >= max_depth {
@@ -494,7 +492,7 @@ fn generate_chain_lengths(rng: &mut impl Rng, n_primaries: usize, max_depth: usi
 async fn phase_chain_deepen(
     pool: &PgPool,
     max_depth: usize,
-    primaries_by_team: &HashMap<i64, Vec<String>>,
+    targets_by_team: &HashMap<i64, Vec<String>>,
 ) {
     if max_depth <= 1 {
         println!("Phase 3b: chain deepening skipped (max_depth=1)\n");
@@ -509,8 +507,8 @@ async fn phase_chain_deepen(
     let mut max_actual = 0usize;
     let mut depth_counts: Vec<usize> = vec![0; max_depth + 1];
 
-    for (&team_id, prims) in primaries_by_team {
-        let mut shuffled = prims.clone();
+    for (&team_id, tgts) in targets_by_team {
+        let mut shuffled = tgts.clone();
         shuffled.shuffle(&mut rng);
 
         let chain_lengths = generate_chain_lengths(&mut rng, shuffled.len(), max_depth);
@@ -674,29 +672,29 @@ async fn main() {
     // Pregenerate all operation data so timed loops measure only DB work.
     let t_pregen = Instant::now();
 
-    let create_pregen = pregen_create_ops(n_create, &warm.all_primaries, &warm.hot_set, &team_ids);
-    let alias_pregen = pregen_alias_ops(n_alias, &warm.all_primaries, &warm.hot_set, &team_ids);
+    let create_pregen = pregen_create_ops(n_create, &warm.all_targets, &warm.hot_set, &team_ids);
+    let alias_pregen = pregen_alias_ops(n_alias, &warm.all_targets, &warm.hot_set, &team_ids);
     let merge_pregen = pregen_merge(
         n_merge,
         batch_size,
         &team_ids,
-        &warm.primaries_by_team,
+        &warm.targets_by_team,
         &warm.hot_by_team,
     );
 
     // Build read lookup pool: collect resolvable distinct_ids from every phase.
     let mut lookup_ids: Vec<ScopedId> = Vec::new();
     for op in &alias_pregen.ops {
-        if op.src != op.dest {
+        if op.target != op.source {
             lookup_ids.push(ScopedId {
                 team_id: op.team_id,
-                distinct_id: op.dest.clone(),
+                distinct_id: op.source.clone(),
             });
-            // Case 3 fresh-src-{i} is also resolvable after the alias runs
-            if !op.src.starts_with("primary-") {
+            // Case 3 fresh-tgt-{i} is also resolvable after the alias runs
+            if !op.target.starts_with("primary-") {
                 lookup_ids.push(ScopedId {
                     team_id: op.team_id,
-                    distinct_id: op.src.clone(),
+                    distinct_id: op.target.clone(),
                 });
             }
         }
@@ -725,7 +723,7 @@ async fn main() {
     phase_merge(&pool, &merge_pregen).await;
 
     // Phase 3b: chain deepening
-    phase_chain_deepen(&pool, chain_depth, &warm.primaries_by_team).await;
+    phase_chain_deepen(&pool, chain_depth, &warm.targets_by_team).await;
 
     // Phase 4: read benchmark
     phase_read(&pool, &lookup_ids, &read_indices).await;

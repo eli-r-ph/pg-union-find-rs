@@ -154,6 +154,15 @@ pub async fn all_root_person_ids(pool: &PgPool, team_id: i64) -> Vec<i64> {
     .unwrap()
 }
 
+/// Check is_identified for a person_id.
+pub async fn is_person_identified(pool: &PgPool, person_id: i64) -> bool {
+    sqlx::query_scalar::<_, bool>("SELECT is_identified FROM person_mapping WHERE person_id = $1")
+        .bind(person_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
 /// Check if a person_id exists in person_mapping.
 pub async fn person_exists(pool: &PgPool, person_id: i64) -> bool {
     sqlx::query_scalar::<_, bool>(

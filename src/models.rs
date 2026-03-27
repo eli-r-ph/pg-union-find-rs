@@ -14,37 +14,40 @@ pub struct CreateRequest {
 #[derive(Debug, Serialize)]
 pub struct CreateResponse {
     pub person_uuid: String,
+    pub is_identified: bool,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct IdentifyRequest {
     pub team_id: i64,
+    pub target: String,
     pub anonymous: String,
-    pub primary: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct AliasRequest {
     pub team_id: i64,
-    pub primary: String,
+    pub target: String,
     pub alias: String,
 }
 
 #[derive(Debug, Serialize)]
 pub struct AliasResponse {
     pub person_uuid: String,
+    pub is_identified: bool,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct MergeRequest {
     pub team_id: i64,
-    pub src: String,
-    pub dests: Vec<String>,
+    pub target: String,
+    pub sources: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct MergeResponse {
     pub person_uuid: String,
+    pub is_identified: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -88,14 +91,14 @@ pub enum DbOp {
     },
     Alias {
         team_id: i64,
-        src: String,
-        dest: String,
+        target: String,
+        source: String,
         reply: oneshot::Sender<DbResult<AliasResponse>>,
     },
     Merge {
         team_id: i64,
-        src: String,
-        dests: Vec<String>,
+        target: String,
+        sources: Vec<String>,
         reply: oneshot::Sender<DbResult<MergeResponse>>,
     },
 }
