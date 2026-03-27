@@ -3,9 +3,7 @@ use sqlx::postgres::PgConnection;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::models::{
-    CreateAliasResponse, DbError, DbOp, DbResult, IdentifyResponse, MergeResponse,
-};
+use crate::models::{AliasResponse, DbError, DbOp, DbResult, IdentifyResponse, MergeResponse};
 
 // ---------------------------------------------------------------------------
 // Resolved person — returned by the recursive CTE
@@ -30,13 +28,13 @@ pub async fn worker_loop(pool: PgPool, mut rx: mpsc::Receiver<DbOp>) {
             } => {
                 let _ = reply.send(handle_identify(&pool, team_id, &distinct_id).await);
             }
-            DbOp::CreateAlias {
+            DbOp::Alias {
                 team_id,
                 src,
                 dest,
                 reply,
             } => {
-                let _ = reply.send(handle_create_alias(&pool, team_id, &src, &dest).await);
+                let _ = reply.send(handle_alias(&pool, team_id, &src, &dest).await);
             }
             DbOp::Merge {
                 team_id,
@@ -253,8 +251,8 @@ async fn insert_did_and_link(
     Ok(new_pk)
 }
 
-/// /create_alias — merge two distinct_ids, matching PostHog's $identify and
-/// $create_alias semantics.
+/// /alias — merge two distinct_ids, matching PostHog's $identify and
+/// $create_alias / $identify semantics.
 ///
 /// Handles 4 cases:
 ///   1a. src exists, dest doesn't → link dest into src's chain
@@ -262,12 +260,12 @@ async fn insert_did_and_link(
 ///   2a. both exist, same person  → no-op
 ///   2b. both exist, diff persons → reject (caller must use /merge)
 ///   3.  neither exists           → create person with both distinct_ids
-pub async fn handle_create_alias(
+pub async fn handle_alias(
     pool: &PgPool,
     team_id: i64,
     src: &str,
     dest: &str,
-) -> DbResult<CreateAliasResponse> {
+) -> DbResult<AliasResponse> {
     let mut tx = pool.begin().await?;
 
     let src_pk = lookup_did(&mut tx, team_id, src).await?;
@@ -355,13 +353,13 @@ pub async fn handle_create_alias(
 
     tx.commit().await?;
 
-    Ok(CreateAliasResponse { person_uuid })
+    Ok(AliasResponse { person_uuid })
 }
 
 /// /merge — merge N dest distinct_ids into src's person ($merge_dangerously).
 ///
 /// For each dest:
-///   - If dest doesn't exist: create mapping + link to src (like create_alias).
+///   - If dest doesn't exist: create mapping + link to src (like alias).
 ///   - If dest exists and already shares src's person: skip.
 ///   - If dest exists with a different person: re-point dest's root to src's person.
 pub async fn handle_merge(

@@ -226,7 +226,7 @@ struct AliasOp {
     dest: String,
 }
 
-/// Pregenerate alias operations covering three of the four create_alias cases:
+/// Pregenerate alias operations covering three of the four alias cases:
 ///   - ~90% Case 1a: src (primary) exists, dest is new
 ///   - ~5%  Case 2a: both exist, same person (src == dest are the same primary)
 ///   - ~5%  Case 3:  neither exists (both src and dest are fresh)
@@ -297,13 +297,13 @@ async fn phase_alias(pool: &PgPool, ops: &[AliasOp]) {
 
     for op in ops {
         let t0 = Instant::now();
-        db::handle_create_alias(pool, op.team_id, &op.src, &op.dest)
+        db::handle_alias(pool, op.team_id, &op.src, &op.dest)
             .await
-            .expect("create_alias failed");
+            .expect("alias failed");
         latencies.push(t0.elapsed());
     }
 
-    print_stats("create_alias", &compute_stats(latencies));
+    print_stats("alias", &compute_stats(latencies));
 }
 
 // ---------------------------------------------------------------------------

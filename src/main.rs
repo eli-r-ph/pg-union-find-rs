@@ -62,7 +62,7 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(handlers::health))
         .route("/identify", post(handlers::identify))
-        .route("/create_alias", post(handlers::create_alias))
+        .route("/alias", post(handlers::alias))
         .route("/merge", post(handlers::merge))
         .with_state(state);
 

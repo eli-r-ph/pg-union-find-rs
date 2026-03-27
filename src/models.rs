@@ -17,14 +17,14 @@ pub struct IdentifyResponse {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct CreateAliasRequest {
+pub struct AliasRequest {
     pub team_id: i64,
     pub src: String,
     pub dest: String,
 }
 
 #[derive(Debug, Serialize)]
-pub struct CreateAliasResponse {
+pub struct AliasResponse {
     pub person_uuid: String,
 }
 
@@ -79,11 +79,11 @@ pub enum DbOp {
         distinct_id: String,
         reply: oneshot::Sender<DbResult<IdentifyResponse>>,
     },
-    CreateAlias {
+    Alias {
         team_id: i64,
         src: String,
         dest: String,
-        reply: oneshot::Sender<DbResult<CreateAliasResponse>>,
+        reply: oneshot::Sender<DbResult<AliasResponse>>,
     },
     Merge {
         team_id: i64,

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::models::{CreateAliasRequest, DbError, DbOp, IdentifyRequest, MergeRequest};
+use crate::models::{AliasRequest, DbError, DbOp, IdentifyRequest, MergeRequest};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -54,17 +54,17 @@ pub async fn identify(
 }
 
 // ---------------------------------------------------------------------------
-// POST /create_alias
+// POST /alias
 // ---------------------------------------------------------------------------
 
-pub async fn create_alias(
+pub async fn alias(
     State(state): State<AppState>,
-    Json(req): Json<CreateAliasRequest>,
+    Json(req): Json<AliasRequest>,
 ) -> impl IntoResponse {
     let (reply_tx, reply_rx) = oneshot::channel();
 
     let team_id = req.team_id;
-    let op = DbOp::CreateAlias {
+    let op = DbOp::Alias {
         team_id,
         src: req.src,
         dest: req.dest,

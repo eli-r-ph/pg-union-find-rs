@@ -6,7 +6,7 @@ A Postgres-backed union-find service for person/distinct_id resolution, modeled 
 
 - **Three tables:** `person_mapping`, `distinct_id_mappings`, `union_find` — the union_find table forms a linked chain of distinct_id PKs traversed by a recursive CTE. Root rows carry the `person_id`.
 - **Worker pool:** HTTP handlers partition operations by `team_id` into N bounded channels, serializing same-team writes while different teams run in parallel.
-- **Endpoints:** `/identify` (get-or-create person), `/create_alias` (link a new distinct_id to an existing one), `/merge` (force-merge N distinct_ids).
+- **Endpoints:** `/identify` (get-or-create person), `/alias` (merge two distinct_ids), `/merge` (force-merge N distinct_ids).
 
 ### Schema
 
@@ -24,7 +24,7 @@ union_find:           (team_id, current) PK, next (nullable), person_id (nullabl
 
 - **Read (resolve):** Look up distinct_id PK, walk union_find chain via recursive CTE to root, join person_mapping to return `person_uuid`.
 - **`/identify`:** Get-or-create. If distinct_id exists, resolve it. Otherwise create `person_mapping` + `distinct_id_mappings` + `union_find` root row.
-- **`/create_alias`:** Merge two distinct_ids (models PostHog's `$identify` and `$create_alias`). Handles 4 cases:
+- **`/alias`:** Merge two distinct_ids (models PostHog's `$identify` and `$create_alias`). Handles 4 cases:
   - One exists, the other doesn't: link the new one into the existing chain.
   - Both exist, same person: no-op.
   - Both exist, different persons: reject (caller must use `/merge`).
