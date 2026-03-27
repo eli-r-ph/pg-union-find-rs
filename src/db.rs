@@ -225,9 +225,43 @@ pub async fn handle_identify(
     Ok(result)
 }
 
-/// /create_alias — link dest to src's chain.
+/// Insert a new distinct_id_mappings row and a union_find link row pointing
+/// at an existing chain member. Returns the new distinct_id_mappings PK.
+async fn insert_did_and_link(
+    conn: &mut PgConnection,
+    team_id: i64,
+    distinct_id: &str,
+    next_pk: i64,
+) -> DbResult<i64> {
+    let new_pk: i64 = sqlx::query_scalar(
+        "INSERT INTO distinct_id_mappings (team_id, distinct_id) VALUES ($1, $2) RETURNING id",
+    )
+    .bind(team_id)
+    .bind(distinct_id)
+    .fetch_one(&mut *conn)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO union_find (team_id, current, next, person_id) VALUES ($1, $2, $3, NULL)",
+    )
+    .bind(team_id)
+    .bind(new_pk)
+    .bind(next_pk)
+    .execute(&mut *conn)
+    .await?;
+
+    Ok(new_pk)
+}
+
+/// /create_alias — merge two distinct_ids, matching PostHog's $identify and
+/// $create_alias semantics.
 ///
-/// src must exist; dest must NOT exist (already identified → reject).
+/// Handles 4 cases:
+///   1a. src exists, dest doesn't → link dest into src's chain
+///   1b. dest exists, src doesn't → link src into dest's chain
+///   2a. both exist, same person  → no-op
+///   2b. both exist, diff persons → reject (caller must use /merge)
+///   3.  neither exists           → create person with both distinct_ids
 pub async fn handle_create_alias(
     pool: &PgPool,
     team_id: i64,
@@ -236,42 +270,92 @@ pub async fn handle_create_alias(
 ) -> DbResult<CreateAliasResponse> {
     let mut tx = pool.begin().await?;
 
-    let src_pk = lookup_did(&mut tx, team_id, src)
-        .await?
-        .ok_or_else(|| DbError::NotFound(format!("src distinct_id '{src}' not found")))?;
+    let src_pk = lookup_did(&mut tx, team_id, src).await?;
+    let dest_pk = lookup_did(&mut tx, team_id, dest).await?;
 
-    if lookup_did(&mut tx, team_id, dest).await?.is_some() {
-        return Err(DbError::AlreadyIdentified(format!(
-            "dest distinct_id '{dest}' is already identified"
-        )));
-    }
+    let person_uuid = match (src_pk, dest_pk) {
+        // Case 1a: src exists, dest doesn't — link dest to src's chain
+        (Some(spk), None) => {
+            insert_did_and_link(&mut tx, team_id, dest, spk).await?;
+            resolve_by_pk(&mut tx, team_id, spk)
+                .await?
+                .ok_or_else(|| DbError::Internal("src chain has no root".into()))?
+                .person_uuid
+        }
 
-    let dest_pk: i64 = sqlx::query_scalar(
-        "INSERT INTO distinct_id_mappings (team_id, distinct_id) VALUES ($1, $2) RETURNING id",
-    )
-    .bind(team_id)
-    .bind(dest)
-    .fetch_one(&mut *tx)
-    .await?;
+        // Case 1b: dest exists, src doesn't — link src to dest's chain
+        (None, Some(dpk)) => {
+            insert_did_and_link(&mut tx, team_id, src, dpk).await?;
+            resolve_by_pk(&mut tx, team_id, dpk)
+                .await?
+                .ok_or_else(|| DbError::Internal("dest chain has no root".into()))?
+                .person_uuid
+        }
 
-    sqlx::query(
-        "INSERT INTO union_find (team_id, current, next, person_id) VALUES ($1, $2, $3, NULL)",
-    )
-    .bind(team_id)
-    .bind(dest_pk)
-    .bind(src_pk)
-    .execute(&mut *tx)
-    .await?;
+        // Case 2: both exist — check if same or different person
+        (Some(spk), Some(dpk)) => {
+            let src_root = resolve_root(&mut tx, team_id, spk)
+                .await?
+                .ok_or_else(|| DbError::Internal("src chain has no root".into()))?;
+            let dest_root = resolve_root(&mut tx, team_id, dpk)
+                .await?
+                .ok_or_else(|| DbError::Internal("dest chain has no root".into()))?;
 
-    let resolved = resolve_by_pk(&mut tx, team_id, src_pk)
-        .await?
-        .ok_or_else(|| DbError::Internal("src chain has no root".into()))?;
+            if src_root.1 == dest_root.1 {
+                // Case 2a: same person — no-op
+                resolve_by_pk(&mut tx, team_id, spk)
+                    .await?
+                    .ok_or_else(|| DbError::Internal("src chain has no root".into()))?
+                    .person_uuid
+            } else {
+                // Case 2b: different persons — reject, caller must use /merge
+                return Err(DbError::AlreadyIdentified(
+                    "both distinct_ids exist with different persons; use /merge to force".into(),
+                ));
+            }
+        }
+
+        // Case 3: neither exists — create person with both distinct_ids
+        (None, None) => {
+            let person_uuid = Uuid::new_v4().to_string();
+
+            let person_id: i64 = sqlx::query_scalar(
+                "INSERT INTO person_mapping (team_id, person_uuid) VALUES ($1, $2) \
+                 RETURNING person_id",
+            )
+            .bind(team_id)
+            .bind(&person_uuid)
+            .fetch_one(&mut *tx)
+            .await?;
+
+            let src_new_pk: i64 = sqlx::query_scalar(
+                "INSERT INTO distinct_id_mappings (team_id, distinct_id) VALUES ($1, $2) \
+                 RETURNING id",
+            )
+            .bind(team_id)
+            .bind(src)
+            .fetch_one(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                "INSERT INTO union_find (team_id, current, next, person_id) \
+                 VALUES ($1, $2, NULL, $3)",
+            )
+            .bind(team_id)
+            .bind(src_new_pk)
+            .bind(person_id)
+            .execute(&mut *tx)
+            .await?;
+
+            insert_did_and_link(&mut tx, team_id, dest, src_new_pk).await?;
+
+            person_uuid
+        }
+    };
 
     tx.commit().await?;
 
-    Ok(CreateAliasResponse {
-        person_uuid: resolved.person_uuid,
-    })
+    Ok(CreateAliasResponse { person_uuid })
 }
 
 /// /merge — merge N dest distinct_ids into src's person ($merge_dangerously).
@@ -303,24 +387,7 @@ pub async fn handle_merge(
 
         match dest_pk {
             None => {
-                let new_pk: i64 = sqlx::query_scalar(
-                    "INSERT INTO distinct_id_mappings (team_id, distinct_id) \
-                     VALUES ($1, $2) RETURNING id",
-                )
-                .bind(team_id)
-                .bind(dest.as_str())
-                .fetch_one(&mut *tx)
-                .await?;
-
-                sqlx::query(
-                    "INSERT INTO union_find (team_id, current, next, person_id) \
-                     VALUES ($1, $2, $3, NULL)",
-                )
-                .bind(team_id)
-                .bind(new_pk)
-                .bind(src_pk)
-                .execute(&mut *tx)
-                .await?;
+                insert_did_and_link(&mut tx, team_id, dest, src_pk).await?;
             }
             Some(dpk) => {
                 let root = resolve_root(&mut tx, team_id, dpk).await?;

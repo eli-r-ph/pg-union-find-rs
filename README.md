@@ -24,8 +24,12 @@ union_find:           (team_id, current) PK, next (nullable), person_id (nullabl
 
 - **Read (resolve):** Look up distinct_id PK, walk union_find chain via recursive CTE to root, join person_mapping to return `person_uuid`.
 - **`/identify`:** Get-or-create. If distinct_id exists, resolve it. Otherwise create `person_mapping` + `distinct_id_mappings` + `union_find` root row.
-- **`/create_alias`:** Link dest to src. src must exist; dest must not. Creates `distinct_id_mappings` row for dest and a `union_find` link row (`current=dest, next=src`).
-- **`/merge`:** For each dest: if new, create link to src; if existing, re-point dest's chain root to src's person.
+- **`/create_alias`:** Merge two distinct_ids (models PostHog's `$identify` and `$create_alias`). Handles 4 cases:
+  - One exists, the other doesn't: link the new one into the existing chain.
+  - Both exist, same person: no-op.
+  - Both exist, different persons: reject (caller must use `/merge`).
+  - Neither exists: create a new person with both distinct_ids.
+- **`/merge`:** Force-merge N dests into src (`$merge_dangerously`). For each dest: if new, create link to src; if existing with a different person, re-point dest's chain root to src's person.
 
 ## Running
 

@@ -226,22 +226,73 @@ struct AliasOp {
     dest: String,
 }
 
-fn pregen_alias_ops(n: usize, all_primaries: &[ScopedId], hot_set: &[ScopedId]) -> Vec<AliasOp> {
+/// Pregenerate alias operations covering three of the four create_alias cases:
+///   - ~90% Case 1a: src (primary) exists, dest is new
+///   - ~5%  Case 2a: both exist, same person (src == dest are the same primary)
+///   - ~5%  Case 3:  neither exists (both src and dest are fresh)
+struct AliasPregen {
+    ops: Vec<AliasOp>,
+    fresh_dest_ids: Vec<ScopedId>,
+}
+
+fn pregen_alias_ops(
+    n: usize,
+    all_primaries: &[ScopedId],
+    hot_set: &[ScopedId],
+    team_ids: &[i64],
+) -> AliasPregen {
     let mut rng = rand::rng();
-    (0..n)
-        .map(|i| {
-            let primary = pick_primary(&mut rng, all_primaries, hot_set);
-            AliasOp {
-                team_id: primary.team_id,
-                src: primary.distinct_id.clone(),
-                dest: format!("alias-{i}"),
-            }
-        })
-        .collect()
+    let n_case2a = n / 20; // 5%
+    let n_case3 = n / 20; // 5%
+    let n_case1a = n - n_case2a - n_case3;
+
+    let mut ops = Vec::with_capacity(n);
+    let mut fresh_dest_ids = Vec::new();
+
+    // Case 1a: src exists (primary), dest is new
+    for i in 0..n_case1a {
+        let primary = pick_primary(&mut rng, all_primaries, hot_set);
+        ops.push(AliasOp {
+            team_id: primary.team_id,
+            src: primary.distinct_id.clone(),
+            dest: format!("alias-{i}"),
+        });
+    }
+
+    // Case 2a: both exist, same person (use same primary for both — no-op)
+    for _ in 0..n_case2a {
+        let primary = pick_primary(&mut rng, all_primaries, hot_set);
+        ops.push(AliasOp {
+            team_id: primary.team_id,
+            src: primary.distinct_id.clone(),
+            dest: primary.distinct_id.clone(),
+        });
+    }
+
+    // Case 3: neither exists — both are fresh distinct_ids
+    for i in 0..n_case3 {
+        let team_id = team_ids[rng.random_range(0..team_ids.len())];
+        let src_id = format!("fresh-src-{i}");
+        let dest_id = format!("fresh-dest-{i}");
+        fresh_dest_ids.push(ScopedId {
+            team_id,
+            distinct_id: dest_id.clone(),
+        });
+        ops.push(AliasOp {
+            team_id,
+            src: src_id,
+            dest: dest_id,
+        });
+    }
+
+    AliasPregen {
+        ops,
+        fresh_dest_ids,
+    }
 }
 
 async fn phase_alias(pool: &PgPool, ops: &[AliasOp]) {
-    println!("Phase 2: aliasing {} new distinct_ids...", ops.len());
+    println!("Phase 2: aliasing {} distinct_ids (mixed cases)...", ops.len());
     let mut latencies = Vec::with_capacity(ops.len());
 
     for op in ops {
@@ -548,7 +599,7 @@ async fn main() {
     // Pregenerate all operation data so timed loops measure only DB work.
     let t_pregen = Instant::now();
 
-    let alias_ops = pregen_alias_ops(n_alias, &warm.all_primaries, &warm.hot_set);
+    let alias_pregen = pregen_alias_ops(n_alias, &warm.all_primaries, &warm.hot_set, &team_ids);
     let merge_pregen = pregen_merge(
         n_merge,
         batch_size,
@@ -557,27 +608,33 @@ async fn main() {
         &warm.hot_by_team,
     );
 
-    let mut lookup_ids: Vec<ScopedId> = alias_ops
+    // Build read lookup pool from alias dest distinct_ids (Case 1a only —
+    // Case 2a are no-ops on existing primaries, Case 3 fresh dests are added
+    // separately below).
+    let mut lookup_ids: Vec<ScopedId> = alias_pregen
+        .ops
         .iter()
+        .filter(|op| op.src != op.dest) // skip Case 2a no-ops
         .map(|op| ScopedId {
             team_id: op.team_id,
             distinct_id: op.dest.clone(),
         })
         .collect();
+    lookup_ids.extend(alias_pregen.fresh_dest_ids.iter().cloned());
     lookup_ids.extend(merge_pregen.all_merge_ids.iter().cloned());
 
     let read_indices = pregen_read_indices(n_reads, lookup_ids.len());
 
     println!(
         "pregenerated {} alias + {} merge + {} read ops in {:.2?}\n",
-        alias_ops.len(),
+        alias_pregen.ops.len(),
         merge_pregen.ops.len(),
         read_indices.len(),
         t_pregen.elapsed(),
     );
 
     // Phase 2: alias benchmark
-    phase_alias(&pool, &alias_ops).await;
+    phase_alias(&pool, &alias_pregen.ops).await;
 
     // Phase 3: merge benchmark
     phase_merge(&pool, &merge_pregen).await;
