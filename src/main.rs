@@ -61,6 +61,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/health", get(handlers::health))
+        .route("/create", post(handlers::create))
         .route("/identify", post(handlers::identify))
         .route("/alias", post(handlers::alias))
         .route("/merge", post(handlers::merge))

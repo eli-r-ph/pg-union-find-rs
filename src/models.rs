@@ -6,21 +6,28 @@ use tokio::sync::oneshot;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
-pub struct IdentifyRequest {
+pub struct CreateRequest {
     pub team_id: i64,
     pub distinct_id: String,
 }
 
 #[derive(Debug, Serialize)]
-pub struct IdentifyResponse {
+pub struct CreateResponse {
     pub person_uuid: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct IdentifyRequest {
+    pub team_id: i64,
+    pub anonymous: String,
+    pub primary: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct AliasRequest {
     pub team_id: i64,
-    pub src: String,
-    pub dest: String,
+    pub primary: String,
+    pub alias: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -74,10 +81,10 @@ impl From<sqlx::Error> for DbError {
 pub type DbResult<T> = Result<T, DbError>;
 
 pub enum DbOp {
-    Identify {
+    Create {
         team_id: i64,
         distinct_id: String,
-        reply: oneshot::Sender<DbResult<IdentifyResponse>>,
+        reply: oneshot::Sender<DbResult<CreateResponse>>,
     },
     Alias {
         team_id: i64,

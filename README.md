@@ -6,7 +6,7 @@ A Postgres-backed union-find service for person/distinct_id resolution, modeled 
 
 - **Three tables:** `person_mapping`, `distinct_id_mappings`, `union_find` — the union_find table forms a linked chain of distinct_id PKs traversed by a recursive CTE. Root rows carry the `person_id`.
 - **Worker pool:** HTTP handlers partition operations by `team_id` into N bounded channels, serializing same-team writes while different teams run in parallel.
-- **Endpoints:** `/identify` (get-or-create person), `/alias` (merge two distinct_ids), `/merge` (force-merge N distinct_ids).
+- **Endpoints:** `/create` (get-or-create person), `/identify` (link anonymous to primary), `/alias` (link alias to primary), `/merge` (force-merge N distinct_ids).
 
 ### Schema
 
@@ -23,13 +23,15 @@ union_find:           (team_id, current) PK, next (nullable), person_id (nullabl
 ### Operations
 
 - **Read (resolve):** Look up distinct_id PK, walk union_find chain via recursive CTE to root, join person_mapping to return `person_uuid`.
-- **`/identify`:** Get-or-create. If distinct_id exists, resolve it. Otherwise create `person_mapping` + `distinct_id_mappings` + `union_find` root row.
-- **`/alias`:** Merge two distinct_ids (models PostHog's `$identify` and `$create_alias`). Handles 4 cases:
+- **`/create`** `{ team_id, distinct_id }`: Get-or-create a person for a single distinct_id. If the distinct_id exists, returns the resolved person. Otherwise creates `person_mapping` + `distinct_id_mappings` + `union_find` root row.
+- **`/identify`** `{ team_id, primary, anonymous }`: Link an anonymous distinct_id to a primary. Routes to the same 4-case merge logic as `/alias`. When `primary == anonymous`, acts as get-or-create for that single distinct_id.
+- **`/alias`** `{ team_id, primary, alias }`: Link an alias distinct_id to a primary. Handles 4 cases:
   - One exists, the other doesn't: link the new one into the existing chain.
   - Both exist, same person: no-op.
   - Both exist, different persons: reject (caller must use `/merge`).
   - Neither exists: create a new person with both distinct_ids.
-- **`/merge`:** Force-merge N dests into src (`$merge_dangerously`). For each dest: if new, create link to src; if existing with a different person, re-point dest's chain root to src's person.
+  - When `primary == alias`, acts as get-or-create for that single distinct_id.
+- **`/merge`** `{ team_id, src, dests }`: Force-merge N dests into src (`$merge_dangerously`). For each dest: if new, create link to src; if existing with a different person, re-point dest's chain root to src's person.
 
 ## Running
 

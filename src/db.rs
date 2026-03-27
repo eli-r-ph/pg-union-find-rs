@@ -3,7 +3,7 @@ use sqlx::postgres::PgConnection;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::models::{AliasResponse, DbError, DbOp, DbResult, IdentifyResponse, MergeResponse};
+use crate::models::{AliasResponse, CreateResponse, DbError, DbOp, DbResult, MergeResponse};
 
 // ---------------------------------------------------------------------------
 // Resolved person — returned by the recursive CTE
@@ -21,12 +21,12 @@ pub struct ResolvedPerson {
 pub async fn worker_loop(pool: PgPool, mut rx: mpsc::Receiver<DbOp>) {
     while let Some(op) = rx.recv().await {
         match op {
-            DbOp::Identify {
+            DbOp::Create {
                 team_id,
                 distinct_id,
                 reply,
             } => {
-                let _ = reply.send(handle_identify(&pool, team_id, &distinct_id).await);
+                let _ = reply.send(handle_create(&pool, team_id, &distinct_id).await);
             }
             DbOp::Alias {
                 team_id,
@@ -156,15 +156,14 @@ pub async fn resolve_tx(
 
 /// Get-or-create: if the distinct_id exists, resolve it; otherwise create a
 /// new person_mapping + distinct_id_mappings + union_find root row.
+/// Returns the person_uuid string so callers can wrap it in any response type.
 pub async fn identify_tx(
     conn: &mut PgConnection,
     team_id: i64,
     distinct_id: &str,
-) -> DbResult<IdentifyResponse> {
+) -> DbResult<String> {
     if let Some(resolved) = resolve_tx(&mut *conn, team_id, distinct_id).await? {
-        return Ok(IdentifyResponse {
-            person_uuid: resolved.person_uuid,
-        });
+        return Ok(resolved.person_uuid);
     }
 
     let person_uuid = Uuid::new_v4().to_string();
@@ -194,7 +193,7 @@ pub async fn identify_tx(
     .execute(&mut *conn)
     .await?;
 
-    Ok(IdentifyResponse { person_uuid })
+    Ok(person_uuid)
 }
 
 // ---------------------------------------------------------------------------
@@ -211,16 +210,16 @@ pub async fn resolve(
     resolve_tx(&mut conn, team_id, distinct_id).await
 }
 
-/// /identify — get-or-create a person for a single distinct_id.
-pub async fn handle_identify(
+/// /create — get-or-create a person for a single distinct_id.
+pub async fn handle_create(
     pool: &PgPool,
     team_id: i64,
     distinct_id: &str,
-) -> DbResult<IdentifyResponse> {
+) -> DbResult<CreateResponse> {
     let mut tx = pool.begin().await?;
-    let result = identify_tx(&mut tx, team_id, distinct_id).await?;
+    let person_uuid = identify_tx(&mut tx, team_id, distinct_id).await?;
     tx.commit().await?;
-    Ok(result)
+    Ok(CreateResponse { person_uuid })
 }
 
 /// Insert a new distinct_id_mappings row and a union_find link row pointing
@@ -266,6 +265,13 @@ pub async fn handle_alias(
     src: &str,
     dest: &str,
 ) -> DbResult<AliasResponse> {
+    if src == dest {
+        let mut tx = pool.begin().await?;
+        let person_uuid = identify_tx(&mut tx, team_id, src).await?;
+        tx.commit().await?;
+        return Ok(AliasResponse { person_uuid });
+    }
+
     let mut tx = pool.begin().await?;
 
     let src_pk = lookup_did(&mut tx, team_id, src).await?;

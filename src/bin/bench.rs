@@ -2,7 +2,7 @@
 //!
 //! Exercises the DB layer directly (no HTTP overhead) through four phases:
 //!
-//!   Phase 1 — Warm-up:  create N_WARM persons via /identify across N_TEAMS
+//!   Phase 1 — Warm-up:  create N_WARM persons via /create across N_TEAMS
 //!   Phase 2 — Alias:    create N_ALIAS new distinct_ids, alias each to an existing person
 //!   Phase 3 — Merge:    create N_MERGE new distinct_ids, merge in sub-batches
 //!   Phase 4 — Read:     resolve N_READS random non-primary distinct_ids through union_find chains
