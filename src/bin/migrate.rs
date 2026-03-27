@@ -9,23 +9,36 @@ use sqlx::postgres::PgPoolOptions;
 
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "migrate=info".parse().unwrap()),
+        )
+        .init();
+
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:54320/union_find".into());
 
-    println!("connecting to {database_url}");
+    tracing::info!("connecting to database");
 
     let pool = PgPoolOptions::new()
         .max_connections(1)
         .connect(&database_url)
         .await
-        .expect("failed to connect to database");
+        .unwrap_or_else(|e| {
+            tracing::error!(%e, "failed to connect to database");
+            std::process::exit(1);
+        });
 
-    println!("running migrations...");
+    tracing::info!("running migrations...");
 
     sqlx::migrate!("./migrations")
         .run(&pool)
         .await
-        .expect("migration failed");
+        .unwrap_or_else(|e| {
+            tracing::error!(%e, "migration failed");
+            std::process::exit(1);
+        });
 
-    println!("migrations complete");
+    tracing::info!("migrations complete");
 }

@@ -7,8 +7,16 @@ use crate::models::{AliasResponse, CreateResponse, DbError, DbOp, DbResult, Merg
 
 // ---------------------------------------------------------------------------
 // Distinct ID validation — reject obviously-bad IDs before they hit the DB.
-// Mirrors PostHog's isDistinctIdIllegal blocklist.
+// Mirrors PostHog's isDistinctIdIllegal blocklist, plus character and length
+// restrictions to prevent log injection, storage abuse, and garbage data.
 // ---------------------------------------------------------------------------
+
+const MAX_DISTINCT_ID_LEN: usize = 200;
+
+const ILLEGAL_CHARS: &[char] = &[
+    '\'', '"', '`',  // quotes
+    '\\', // backslash
+];
 
 const CASE_INSENSITIVE_ILLEGAL: &[&str] = &[
     "anonymous",
@@ -34,30 +42,21 @@ const CASE_SENSITIVE_ILLEGAL: &[&str] = &[
 ];
 
 fn is_illegal_distinct_id(id: &str) -> bool {
-    let trimmed = id.trim();
-    if trimmed.is_empty() {
+    if id.trim().is_empty() {
+        return true;
+    }
+    if id.len() > MAX_DISTINCT_ID_LEN {
+        return true;
+    }
+    if id
+        .chars()
+        .any(|c| c.is_control() || ILLEGAL_CHARS.contains(&c))
+    {
         return true;
     }
 
-    fn strip_quotes(s: &str) -> &str {
-        if (s.starts_with('\'') && s.ends_with('\'')) || (s.starts_with('"') && s.ends_with('"')) {
-            &s[1..s.len() - 1]
-        } else {
-            s
-        }
-    }
-
-    let bare = strip_quotes(id);
-    let lower = bare.to_lowercase();
-
-    if CASE_INSENSITIVE_ILLEGAL.contains(&lower.as_str()) {
-        return true;
-    }
-    if CASE_SENSITIVE_ILLEGAL.contains(&bare) {
-        return true;
-    }
-
-    false
+    let lower = id.to_lowercase();
+    CASE_INSENSITIVE_ILLEGAL.contains(&lower.as_str()) || CASE_SENSITIVE_ILLEGAL.contains(&id)
 }
 
 fn validate_distinct_id(id: &str) -> DbResult<()> {
@@ -542,7 +541,7 @@ pub async fn handle_alias(
 /// For each source:
 ///   - If source doesn't exist: create mapping + link to target.
 ///   - If source exists and already shares target's person: skip.
-///   - If source exists with a different person: re-point source's root to target's person.
+///   - If source exists with a different person: link source's root into target's tree.
 pub async fn handle_merge(
     pool: &PgPool,
     team_id: i64,
