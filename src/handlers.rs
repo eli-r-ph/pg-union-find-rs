@@ -66,8 +66,8 @@ pub async fn create_alias(
     let team_id = req.team_id;
     let op = DbOp::CreateAlias {
         team_id,
-        known: req.known,
-        unknown: req.unknown,
+        src: req.src,
+        dest: req.dest,
         reply: reply_tx,
     };
 
@@ -103,8 +103,8 @@ pub async fn merge(
     let team_id = req.team_id;
     let op = DbOp::Merge {
         team_id,
-        primary: req.primary,
-        others: req.others,
+        src: req.src,
+        dests: req.dests,
         reply: reply_tx,
     };
 
@@ -128,7 +128,7 @@ pub async fn merge(
 }
 
 // ---------------------------------------------------------------------------
-// POST /health — lightweight DB ping (bypasses the worker channel)
+// GET /health — lightweight check (bypasses the worker channel)
 // ---------------------------------------------------------------------------
 
 pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
@@ -145,6 +145,7 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
 fn db_error_response(e: DbError) -> axum::response::Response {
     let (status, msg) = match &e {
         DbError::NotFound(m) => (StatusCode::NOT_FOUND, m.clone()),
+        DbError::AlreadyIdentified(m) => (StatusCode::CONFLICT, m.clone()),
         DbError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m.clone()),
     };
     (status, Json(serde_json::json!({"error": msg}))).into_response()

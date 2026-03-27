@@ -5,7 +5,7 @@
 //!   Phase 1 — Warm-up:  create N_WARM persons via /identify across N_TEAMS
 //!   Phase 2 — Alias:    create N_ALIAS new distinct_ids, alias each to an existing person
 //!   Phase 3 — Merge:    create N_MERGE new distinct_ids, merge in sub-batches
-//!   Phase 4 — Read:     resolve N_READS random non-primary distinct_ids through override chains
+//!   Phase 4 — Read:     resolve N_READS random non-primary distinct_ids through union_find chains
 //!
 //! Tune via env vars (defaults in parentheses):
 //!   BENCH_TEAMS       (auto: N_WARM/1000) — number of team_ids to distribute across
@@ -42,7 +42,6 @@ fn env_usize(key: &str, default: usize) -> usize {
 }
 
 /// Transaction batch size for bulk seeding (warm-up & merge precreation).
-/// Balances WAL-sync amortisation against transaction size.
 const SEED_TX_BATCH: usize = 500;
 
 // ---------------------------------------------------------------------------
@@ -115,8 +114,7 @@ fn pick_primary<'a>(
     }
 }
 
-/// Pick a primary that belongs to a specific team. Falls back to any primary
-/// in the team if the hot set has none for it.
+/// Pick a primary that belongs to a specific team.
 fn pick_primary_for_team<'a>(
     rng: &mut impl Rng,
     team_id: i64,
@@ -140,23 +138,18 @@ fn pick_primary_for_team<'a>(
 // pairs inside a single transaction (one WAL sync per batch).
 // ---------------------------------------------------------------------------
 
-async fn seed_batch(pool: &PgPool, items: &[(i64, String)]) -> Vec<String> {
+async fn seed_batch(pool: &PgPool, items: &[(i64, String)]) {
     let mut tx = pool.begin().await.expect("begin tx");
-    let mut person_ids = Vec::with_capacity(items.len());
     for (team_id, did) in items {
-        let resp = db::identify_tx(&mut tx, *team_id, did)
+        db::identify_tx(&mut tx, *team_id, did)
             .await
             .expect("identify_tx in seed batch");
-        person_ids.push(resp.person_id);
     }
     tx.commit().await.expect("commit seed batch");
-    person_ids
 }
 
 // ---------------------------------------------------------------------------
 // Phase 1: warm-up — create N persons distributed round-robin across teams.
-//
-// Batched in groups of SEED_TX_BATCH to amortise WAL syncs.
 // ---------------------------------------------------------------------------
 
 struct WarmupResult {
@@ -176,8 +169,6 @@ async fn phase_warm(pool: &PgPool, n: usize, team_ids: &[i64]) -> WarmupResult {
     let mut all_primaries = Vec::with_capacity(n);
     let mut primaries_by_team: HashMap<i64, Vec<String>> = HashMap::new();
 
-    // Build the full list of (team_id, distinct_id) pairs up front, then
-    // process in transaction-sized chunks.
     let pairs: Vec<(i64, String)> = (0..n)
         .map(|i| (team_ids[i % team_ids.len()], format!("primary-{i}")))
         .collect();
@@ -203,7 +194,6 @@ async fn phase_warm(pool: &PgPool, n: usize, team_ids: &[i64]) -> WarmupResult {
         n as f64 / elapsed.as_secs_f64()
     );
 
-    // Hot set: 20% of primaries chosen at random.
     let mut rng = rand::rng();
     let hot_count = std::cmp::max(1, n / 5);
     let hot_set: Vec<ScopedId> = (0..hot_count)
@@ -232,8 +222,8 @@ async fn phase_warm(pool: &PgPool, n: usize, team_ids: &[i64]) -> WarmupResult {
 
 struct AliasOp {
     team_id: i64,
-    known: String,
-    unknown: String,
+    src: String,
+    dest: String,
 }
 
 fn pregen_alias_ops(n: usize, all_primaries: &[ScopedId], hot_set: &[ScopedId]) -> Vec<AliasOp> {
@@ -243,8 +233,8 @@ fn pregen_alias_ops(n: usize, all_primaries: &[ScopedId], hot_set: &[ScopedId]) 
             let primary = pick_primary(&mut rng, all_primaries, hot_set);
             AliasOp {
                 team_id: primary.team_id,
-                known: primary.distinct_id.clone(),
-                unknown: format!("alias-{i}"),
+                src: primary.distinct_id.clone(),
+                dest: format!("alias-{i}"),
             }
         })
         .collect()
@@ -256,7 +246,7 @@ async fn phase_alias(pool: &PgPool, ops: &[AliasOp]) {
 
     for op in ops {
         let t0 = Instant::now();
-        db::handle_create_alias(pool, op.team_id, &op.known, &op.unknown)
+        db::handle_create_alias(pool, op.team_id, &op.src, &op.dest)
             .await
             .expect("create_alias failed");
         latencies.push(t0.elapsed());
@@ -271,8 +261,8 @@ async fn phase_alias(pool: &PgPool, ops: &[AliasOp]) {
 
 struct MergeOp {
     team_id: i64,
-    primary: String,
-    others: Vec<String>,
+    src: String,
+    dests: Vec<String>,
 }
 
 struct MergePregen {
@@ -308,11 +298,11 @@ fn pregen_merge(
     let mut ops = Vec::with_capacity(n / batch_size + 1);
     for (&team_id, dids) in &merge_by_team {
         for chunk in dids.chunks(batch_size) {
-            let primary = pick_primary_for_team(&mut rng, team_id, hot_by_team, primaries_by_team);
+            let src = pick_primary_for_team(&mut rng, team_id, hot_by_team, primaries_by_team);
             ops.push(MergeOp {
                 team_id,
-                primary: primary.to_owned(),
-                others: chunk.to_vec(),
+                src: src.to_owned(),
+                dests: chunk.to_vec(),
             });
         }
     }
@@ -339,7 +329,7 @@ async fn phase_merge(pool: &PgPool, pregen: &MergePregen) {
     let mut latencies = Vec::with_capacity(n_ops);
     for op in &pregen.ops {
         let t0 = Instant::now();
-        db::handle_merge(pool, op.team_id, &op.primary, &op.others)
+        db::handle_merge(pool, op.team_id, &op.src, &op.dests)
             .await
             .expect("merge failed");
         latencies.push(t0.elapsed());
@@ -350,27 +340,9 @@ async fn phase_merge(pool: &PgPool, pregen: &MergePregen) {
 
 // ---------------------------------------------------------------------------
 // Phase 3b: chain deepening — merge primaries into each other to create
-// override chains of realistic, varying depths.
-//
-// Runs AFTER phases 2 and 3 so that both alias and merge distinct_ids
-// (which already point to primaries) inherit the deeper chains — every
-// read in phase 4 traverses the recursive CTE at a realistic depth.
-//
-// Chain length distribution is log-uniform: length = ceil(max_depth^U)
-// where U ~ Uniform(0,1).  This produces many short chains with a heavy
-// tail, plus one guaranteed max-depth chain per team.
-//
-// Example distribution with max_depth=100:
-//   ~35% of chains ≤  5 hops
-//   ~50% of chains ≤ 10 hops
-//   ~85% of chains ≤ 50 hops
-//   ~2-3% of chains ≥ 90 hops
-//   +1 guaranteed chain of exactly 100 per team
+// union_find chains of realistic, varying depths.
 // ---------------------------------------------------------------------------
 
-/// Partition `n_primaries` primaries into chains whose lengths follow a
-/// log-uniform distribution capped at `max_depth`. One chain per team is
-/// guaranteed to hit `max_depth` (if enough primaries exist).
 fn generate_chain_lengths(rng: &mut impl Rng, n_primaries: usize, max_depth: usize) -> Vec<usize> {
     if max_depth <= 1 || n_primaries <= 1 {
         return vec![1; n_primaries];
@@ -407,9 +379,6 @@ async fn phase_chain_deepen(
 
     let mut rng = rand::rng();
 
-    // Plan chains for every team: shuffle primaries so hot-set members
-    // land at random positions within chains, then partition into chains
-    // of log-uniform length.
     let mut team_plans: Vec<(i64, Vec<Vec<String>>)> = Vec::new();
     let mut total_chains = 0usize;
     let mut total_links = 0usize;
@@ -441,11 +410,10 @@ async fn phase_chain_deepen(
     }
 
     println!(
-        "Phase 3b: deepening override chains (max depth {max_depth}, \
+        "Phase 3b: deepening union_find chains (max depth {max_depth}, \
          {total_chains} chains, {total_links} link ops, deepest {max_actual})..."
     );
 
-    // Print depth distribution in buckets.
     let buckets: &[(usize, usize)] = &[
         (0, 0),
         (1, 1),
@@ -456,7 +424,7 @@ async fn phase_chain_deepen(
         (50, 99),
         (100, max_depth),
     ];
-    println!("  chain depth distribution (override hops):");
+    println!("  chain depth distribution (union_find hops):");
     for &(lo, hi) in buckets {
         if lo > max_depth {
             break;
@@ -564,13 +532,12 @@ async fn main() {
         .await
         .expect("failed to connect to database");
 
-    // Run migrations then clean slate.
     sqlx::migrate!("./migrations")
         .run(&pool)
         .await
         .expect("failed to run migrations");
 
-    sqlx::query("TRUNCATE persons, distinct_ids, person_overrides")
+    sqlx::query("TRUNCATE person_mapping, distinct_id_mappings, union_find")
         .execute(&pool)
         .await
         .expect("failed to truncate");
@@ -590,12 +557,11 @@ async fn main() {
         &warm.hot_by_team,
     );
 
-    // Build the read lookup pool from alias + merge distinct_ids.
     let mut lookup_ids: Vec<ScopedId> = alias_ops
         .iter()
         .map(|op| ScopedId {
             team_id: op.team_id,
-            distinct_id: op.unknown.clone(),
+            distinct_id: op.dest.clone(),
         })
         .collect();
     lookup_ids.extend(merge_pregen.all_merge_ids.iter().cloned());
@@ -613,14 +579,13 @@ async fn main() {
     // Phase 2: alias benchmark
     phase_alias(&pool, &alias_ops).await;
 
-    // Phase 3: merge benchmark (state accumulates on top of phases 1+2)
+    // Phase 3: merge benchmark
     phase_merge(&pool, &merge_pregen).await;
 
-    // Phase 3b: chain deepening — merge primaries into each other to build
-    // realistic override chain depths for the read phase.
+    // Phase 3b: chain deepening
     phase_chain_deepen(&pool, chain_depth, &warm.primaries_by_team).await;
 
-    // Phase 4: read benchmark — resolve alias and merge distinct_ids through override chains.
+    // Phase 4: read benchmark
     phase_read(&pool, &lookup_ids, &read_indices).await;
 
     println!("=== Done ===");

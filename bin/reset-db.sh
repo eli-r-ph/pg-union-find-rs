@@ -31,6 +31,6 @@ if [ "$MODE" = full ]; then
 else
   echo "==> Truncating application tables..."
   PGPASSWORD=postgres psql -h "$PG_HOST" -p "$PG_PORT" -U postgres -d union_find \
-    -c "TRUNCATE persons, distinct_ids, person_overrides;"
+    -c "TRUNCATE person_mapping, distinct_id_mappings, union_find;"
   echo "==> Done. Database is ready for another benchmark run."
 fi

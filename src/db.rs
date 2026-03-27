@@ -12,9 +12,8 @@ use crate::models::{
 // ---------------------------------------------------------------------------
 
 pub struct ResolvedPerson {
-    pub person_id: String,
-    pub internal_id: i64,
-    pub is_identified: bool,
+    pub person_uuid: String,
+    pub person_id: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -33,19 +32,19 @@ pub async fn worker_loop(pool: PgPool, mut rx: mpsc::Receiver<DbOp>) {
             }
             DbOp::CreateAlias {
                 team_id,
-                known,
-                unknown,
+                src,
+                dest,
                 reply,
             } => {
-                let _ = reply.send(handle_create_alias(&pool, team_id, &known, &unknown).await);
+                let _ = reply.send(handle_create_alias(&pool, team_id, &src, &dest).await);
             }
             DbOp::Merge {
                 team_id,
-                primary,
-                others,
+                src,
+                dests,
                 reply,
             } => {
-                let _ = reply.send(handle_merge(&pool, team_id, &primary, &others).await);
+                let _ = reply.send(handle_merge(&pool, team_id, &src, &dests).await);
             }
         }
     }
@@ -53,52 +52,112 @@ pub async fn worker_loop(pool: PgPool, mut rx: mpsc::Receiver<DbOp>) {
 
 // ---------------------------------------------------------------------------
 // Transaction-level primitives.
-//
-// These operate on a bare PgConnection (or a Transaction deref'd to one) so
-// callers can group multiple calls into a single commit.  The public API
-// functions below wrap each operation in its own transaction.
 // ---------------------------------------------------------------------------
 
-pub async fn resolve_tx(
+/// Look up a distinct_id's internal PK from distinct_id_mappings.
+async fn lookup_did(
     conn: &mut PgConnection,
     team_id: i64,
     distinct_id: &str,
-) -> DbResult<Option<ResolvedPerson>> {
-    let row = sqlx::query_as::<_, (String, i64, bool)>(
-        r#"
-        WITH RECURSIVE resolve(pid, depth) AS (
-            SELECT d.person_id, 0
-            FROM distinct_ids d
-            WHERE d.team_id = $1 AND d.distinct_id = $2
-
-            UNION ALL
-
-            SELECT o.override_person_id, r.depth + 1
-            FROM resolve r
-            JOIN person_overrides o
-              ON o.team_id = $1 AND o.old_person_id = r.pid
-        )
-        SELECT p.person_id, r.pid AS internal_id, p.is_identified
-        FROM resolve r
-        JOIN persons p ON p.id = r.pid
-        ORDER BY r.depth DESC
-        LIMIT 1
-        "#,
+) -> DbResult<Option<i64>> {
+    let row: Option<(i64,)> = sqlx::query_as(
+        "SELECT id FROM distinct_id_mappings WHERE team_id = $1 AND distinct_id = $2",
     )
     .bind(team_id)
     .bind(distinct_id)
     .fetch_optional(&mut *conn)
     .await?;
-
-    Ok(
-        row.map(|(person_id, internal_id, is_identified)| ResolvedPerson {
-            person_id,
-            internal_id,
-            is_identified,
-        }),
-    )
+    Ok(row.map(|(id,)| id))
 }
 
+/// Walk the union_find chain from a distinct_id PK to the root, returning
+/// the root's person_id and the corresponding person_uuid.
+async fn resolve_by_pk(
+    conn: &mut PgConnection,
+    team_id: i64,
+    did_pk: i64,
+) -> DbResult<Option<ResolvedPerson>> {
+    let row = sqlx::query_as::<_, (String, i64)>(
+        r#"
+        WITH RECURSIVE walk(node, depth) AS (
+            SELECT $2::bigint, 0
+
+            UNION ALL
+
+            SELECT uf.next, w.depth + 1
+            FROM walk w
+            JOIN union_find uf
+              ON uf.team_id = $1 AND uf.current = w.node AND uf.person_id IS NULL
+            WHERE w.depth < 1000
+        )
+        SELECT pm.person_uuid, uf.person_id
+        FROM union_find uf
+        JOIN person_mapping pm ON pm.person_id = uf.person_id
+        WHERE uf.team_id = $1
+          AND uf.current = (SELECT node FROM walk ORDER BY depth DESC LIMIT 1)
+        "#,
+    )
+    .bind(team_id)
+    .bind(did_pk)
+    .fetch_optional(&mut *conn)
+    .await?;
+
+    Ok(row.map(|(person_uuid, person_id)| ResolvedPerson {
+        person_uuid,
+        person_id,
+    }))
+}
+
+/// Walk the union_find chain from a distinct_id PK to the root, returning
+/// the root's (team_id, current) composite key and person_id.
+async fn resolve_root(
+    conn: &mut PgConnection,
+    team_id: i64,
+    did_pk: i64,
+) -> DbResult<Option<(i64, i64)>> {
+    let row = sqlx::query_as::<_, (i64, i64)>(
+        r#"
+        WITH RECURSIVE walk(node, depth) AS (
+            SELECT $2::bigint, 0
+
+            UNION ALL
+
+            SELECT uf.next, w.depth + 1
+            FROM walk w
+            JOIN union_find uf
+              ON uf.team_id = $1 AND uf.current = w.node AND uf.person_id IS NULL
+            WHERE w.depth < 1000
+        )
+        SELECT uf.current, uf.person_id
+        FROM union_find uf
+        WHERE uf.team_id = $1
+          AND uf.current = (SELECT node FROM walk ORDER BY depth DESC LIMIT 1)
+          AND uf.person_id IS NOT NULL
+        "#,
+    )
+    .bind(team_id)
+    .bind(did_pk)
+    .fetch_optional(&mut *conn)
+    .await?;
+
+    Ok(row)
+}
+
+/// Resolve a distinct_id string all the way to a ResolvedPerson.
+pub async fn resolve_tx(
+    conn: &mut PgConnection,
+    team_id: i64,
+    distinct_id: &str,
+) -> DbResult<Option<ResolvedPerson>> {
+    let did_pk = match lookup_did(&mut *conn, team_id, distinct_id).await? {
+        Some(pk) => pk,
+        None => return Ok(None),
+    };
+    resolve_by_pk(&mut *conn, team_id, did_pk).await
+}
+
+/// Get-or-create: if the distinct_id exists, resolve it; otherwise create a
+/// new person_mapping + distinct_id_mappings + union_find root row.
 pub async fn identify_tx(
     conn: &mut PgConnection,
     team_id: i64,
@@ -106,61 +165,45 @@ pub async fn identify_tx(
 ) -> DbResult<IdentifyResponse> {
     if let Some(resolved) = resolve_tx(&mut *conn, team_id, distinct_id).await? {
         return Ok(IdentifyResponse {
-            person_id: resolved.person_id,
+            person_uuid: resolved.person_uuid,
         });
     }
 
-    let person_id_str = Uuid::new_v4().to_string();
+    let person_uuid = Uuid::new_v4().to_string();
 
-    let internal_id: i64 = sqlx::query_scalar(
-        r#"
-        INSERT INTO persons (team_id, person_id, is_identified)
-        VALUES ($1, $2, false)
-        ON CONFLICT (team_id, person_id) DO NOTHING
-        RETURNING id
-        "#,
+    let person_id: i64 = sqlx::query_scalar(
+        "INSERT INTO person_mapping (team_id, person_uuid) VALUES ($1, $2) RETURNING person_id",
     )
     .bind(team_id)
-    .bind(&person_id_str)
-    .fetch_optional(&mut *conn)
-    .await?
-    .unwrap_or_else(|| {
-        panic!("UUID collision for person_id {person_id_str}");
-    });
+    .bind(&person_uuid)
+    .fetch_one(&mut *conn)
+    .await?;
 
-    sqlx::query(
-        r#"
-        INSERT INTO distinct_ids (team_id, distinct_id, person_id)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (team_id, distinct_id) DO NOTHING
-        "#,
+    let did_pk: i64 = sqlx::query_scalar(
+        "INSERT INTO distinct_id_mappings (team_id, distinct_id) VALUES ($1, $2) RETURNING id",
     )
     .bind(team_id)
     .bind(distinct_id)
-    .bind(internal_id)
+    .fetch_one(&mut *conn)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO union_find (team_id, current, next, person_id) VALUES ($1, $2, NULL, $3)",
+    )
+    .bind(team_id)
+    .bind(did_pk)
+    .bind(person_id)
     .execute(&mut *conn)
     .await?;
 
-    Ok(IdentifyResponse {
-        person_id: person_id_str,
-    })
-}
-
-async fn mark_identified_tx(conn: &mut PgConnection, internal_id: i64) -> DbResult<()> {
-    sqlx::query("UPDATE persons SET is_identified = true WHERE id = $1 AND NOT is_identified")
-        .bind(internal_id)
-        .execute(&mut *conn)
-        .await?;
-    Ok(())
+    Ok(IdentifyResponse { person_uuid })
 }
 
 // ---------------------------------------------------------------------------
-// Public API — each operation wrapped in an explicit transaction so all
-// statements share a single WAL sync / commit.
+// Public API — each operation wrapped in an explicit transaction.
 // ---------------------------------------------------------------------------
 
-/// Resolve a distinct_id to its canonical person through the override chain.
-/// Single read — no transaction needed.
+/// Resolve a distinct_id to its canonical person through the union_find chain.
 pub async fn resolve(
     pool: &PgPool,
     team_id: i64,
@@ -182,147 +225,133 @@ pub async fn handle_identify(
     Ok(result)
 }
 
-// ---------------------------------------------------------------------------
-// /create_alias — merge two distinct_ids, respecting is_identified.
-//
-// Replicates PostHog $identify / $create_alias behaviour:
-//   known  = PostHog "target" (mergeIntoDistinctId)  — person that survives
-//   unknown = PostHog "source" (otherPersonDistinctId) — person that is absorbed
-//
-// The is_identified check gates on the *unknown/source* person.
-// ---------------------------------------------------------------------------
-
+/// /create_alias — link dest to src's chain.
+///
+/// src must exist; dest must NOT exist (already identified → reject).
 pub async fn handle_create_alias(
     pool: &PgPool,
     team_id: i64,
-    known: &str,
-    unknown: &str,
+    src: &str,
+    dest: &str,
 ) -> DbResult<CreateAliasResponse> {
     let mut tx = pool.begin().await?;
 
-    let known_person = resolve_tx(&mut tx, team_id, known)
+    let src_pk = lookup_did(&mut tx, team_id, src)
         .await?
-        .ok_or_else(|| DbError::NotFound(format!("known distinct_id '{known}' not found")))?;
+        .ok_or_else(|| DbError::NotFound(format!("src distinct_id '{src}' not found")))?;
 
-    let unknown_person = resolve_tx(&mut tx, team_id, unknown).await?;
+    if lookup_did(&mut tx, team_id, dest).await?.is_some() {
+        return Err(DbError::AlreadyIdentified(format!(
+            "dest distinct_id '{dest}' is already identified"
+        )));
+    }
 
-    let result = match unknown_person {
-        None => {
-            sqlx::query(
-                "INSERT INTO distinct_ids (team_id, distinct_id, person_id)
-                 VALUES ($1, $2, $3)
-                 ON CONFLICT (team_id, distinct_id) DO NOTHING",
-            )
-            .bind(team_id)
-            .bind(unknown)
-            .bind(known_person.internal_id)
-            .execute(&mut *tx)
-            .await?;
+    let dest_pk: i64 = sqlx::query_scalar(
+        "INSERT INTO distinct_id_mappings (team_id, distinct_id) VALUES ($1, $2) RETURNING id",
+    )
+    .bind(team_id)
+    .bind(dest)
+    .fetch_one(&mut *tx)
+    .await?;
 
-            mark_identified_tx(&mut tx, known_person.internal_id).await?;
+    sqlx::query(
+        "INSERT INTO union_find (team_id, current, next, person_id) VALUES ($1, $2, $3, NULL)",
+    )
+    .bind(team_id)
+    .bind(dest_pk)
+    .bind(src_pk)
+    .execute(&mut *tx)
+    .await?;
 
-            CreateAliasResponse {
-                person_id: known_person.person_id,
-                refused: false,
-            }
-        }
-        Some(unk) if unk.internal_id == known_person.internal_id => {
-            mark_identified_tx(&mut tx, known_person.internal_id).await?;
-
-            CreateAliasResponse {
-                person_id: known_person.person_id,
-                refused: false,
-            }
-        }
-        Some(unk) if unk.is_identified => {
-            // Source person is already identified — refuse merge.
-            // Matches PostHog's isMergeAllowed: $create_alias / $identify won't
-            // merge a person that is already identified.
-            CreateAliasResponse {
-                person_id: known_person.person_id,
-                refused: true,
-            }
-        }
-        Some(unk) => {
-            sqlx::query(
-                "INSERT INTO person_overrides (team_id, old_person_id, override_person_id)
-                 VALUES ($1, $2, $3)
-                 ON CONFLICT (team_id, old_person_id) DO NOTHING",
-            )
-            .bind(team_id)
-            .bind(unk.internal_id)
-            .bind(known_person.internal_id)
-            .execute(&mut *tx)
-            .await?;
-
-            mark_identified_tx(&mut tx, known_person.internal_id).await?;
-
-            CreateAliasResponse {
-                person_id: known_person.person_id,
-                refused: false,
-            }
-        }
-    };
+    let resolved = resolve_by_pk(&mut tx, team_id, src_pk)
+        .await?
+        .ok_or_else(|| DbError::Internal("src chain has no root".into()))?;
 
     tx.commit().await?;
-    Ok(result)
+
+    Ok(CreateAliasResponse {
+        person_uuid: resolved.person_uuid,
+    })
 }
 
-// ---------------------------------------------------------------------------
-// /merge — merge N distinct_ids into a primary, ignoring is_identified.
-//
-// Replicates PostHog $merge_dangerously behaviour.
-// ---------------------------------------------------------------------------
-
+/// /merge — merge N dest distinct_ids into src's person ($merge_dangerously).
+///
+/// For each dest:
+///   - If dest doesn't exist: create mapping + link to src (like create_alias).
+///   - If dest exists and already shares src's person: skip.
+///   - If dest exists with a different person: re-point dest's root to src's person.
 pub async fn handle_merge(
     pool: &PgPool,
     team_id: i64,
-    primary: &str,
-    others: &[String],
+    src: &str,
+    dests: &[String],
 ) -> DbResult<MergeResponse> {
     let mut tx = pool.begin().await?;
 
-    let primary_person = resolve_tx(&mut tx, team_id, primary)
+    let src_pk = lookup_did(&mut tx, team_id, src)
         .await?
-        .ok_or_else(|| DbError::NotFound(format!("primary distinct_id '{primary}' not found")))?;
+        .ok_or_else(|| DbError::NotFound(format!("src distinct_id '{src}' not found")))?;
 
-    for other in others {
-        let other_person = resolve_tx(&mut tx, team_id, other).await?;
+    let src_resolved = resolve_by_pk(&mut tx, team_id, src_pk)
+        .await?
+        .ok_or_else(|| DbError::Internal("src chain has no root".into()))?;
 
-        match other_person {
+    let src_person_id = src_resolved.person_id;
+
+    for dest in dests {
+        let dest_pk = lookup_did(&mut tx, team_id, dest).await?;
+
+        match dest_pk {
             None => {
-                sqlx::query(
-                    "INSERT INTO distinct_ids (team_id, distinct_id, person_id)
-                     VALUES ($1, $2, $3)
-                     ON CONFLICT (team_id, distinct_id) DO NOTHING",
+                let new_pk: i64 = sqlx::query_scalar(
+                    "INSERT INTO distinct_id_mappings (team_id, distinct_id) \
+                     VALUES ($1, $2) RETURNING id",
                 )
                 .bind(team_id)
-                .bind(other.as_str())
-                .bind(primary_person.internal_id)
+                .bind(dest.as_str())
+                .fetch_one(&mut *tx)
+                .await?;
+
+                sqlx::query(
+                    "INSERT INTO union_find (team_id, current, next, person_id) \
+                     VALUES ($1, $2, $3, NULL)",
+                )
+                .bind(team_id)
+                .bind(new_pk)
+                .bind(src_pk)
                 .execute(&mut *tx)
                 .await?;
             }
-            Some(op) if op.internal_id == primary_person.internal_id => {}
-            Some(op) => {
-                sqlx::query(
-                    "INSERT INTO person_overrides (team_id, old_person_id, override_person_id)
-                     VALUES ($1, $2, $3)
-                     ON CONFLICT (team_id, old_person_id) DO NOTHING",
-                )
-                .bind(team_id)
-                .bind(op.internal_id)
-                .bind(primary_person.internal_id)
-                .execute(&mut *tx)
-                .await?;
+            Some(dpk) => {
+                let root = resolve_root(&mut tx, team_id, dpk).await?;
+                match root {
+                    Some((root_current, root_person)) if root_person == src_person_id => {
+                        let _ = root_current;
+                    }
+                    Some((root_current, _old_person)) => {
+                        sqlx::query(
+                            "UPDATE union_find SET person_id = $3 \
+                             WHERE team_id = $1 AND current = $2",
+                        )
+                        .bind(team_id)
+                        .bind(root_current)
+                        .bind(src_person_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                    None => {
+                        return Err(DbError::Internal(format!(
+                            "dest '{dest}' exists but chain has no root"
+                        )));
+                    }
+                }
             }
         }
     }
 
-    mark_identified_tx(&mut tx, primary_person.internal_id).await?;
-
     tx.commit().await?;
 
     Ok(MergeResponse {
-        person_id: primary_person.person_id,
+        person_uuid: src_resolved.person_uuid,
     })
 }
