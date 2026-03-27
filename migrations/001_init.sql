@@ -31,3 +31,5 @@ CREATE TABLE union_find (
     person_id  BIGINT,           -- references person_mapping.person_id (non-NULL = root)
     PRIMARY KEY (team_id, current)
 );
+
+CREATE INDEX idx_uf_person ON union_find (team_id, person_id) WHERE person_id IS NOT NULL;

@@ -399,7 +399,7 @@ pub async fn handle_merge(
                     Some((root_current, root_person)) if root_person == src_person_id => {
                         let _ = root_current;
                     }
-                    Some((root_current, _old_person)) => {
+                    Some((root_current, old_person)) => {
                         sqlx::query(
                             "UPDATE union_find SET person_id = $3 \
                              WHERE team_id = $1 AND current = $2",
@@ -409,6 +409,24 @@ pub async fn handle_merge(
                         .bind(src_person_id)
                         .execute(&mut *tx)
                         .await?;
+
+                        let still_referenced: bool = sqlx::query_scalar(
+                            "SELECT EXISTS(\
+                               SELECT 1 FROM union_find \
+                               WHERE team_id = $1 AND person_id = $2\
+                             )",
+                        )
+                        .bind(team_id)
+                        .bind(old_person)
+                        .fetch_one(&mut *tx)
+                        .await?;
+
+                        if !still_referenced {
+                            sqlx::query("DELETE FROM person_mapping WHERE person_id = $1")
+                                .bind(old_person)
+                                .execute(&mut *tx)
+                                .await?;
+                        }
                     }
                     None => {
                         return Err(DbError::Internal(format!(

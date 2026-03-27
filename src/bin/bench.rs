@@ -292,7 +292,10 @@ fn pregen_alias_ops(
 }
 
 async fn phase_alias(pool: &PgPool, ops: &[AliasOp]) {
-    println!("Phase 2: aliasing {} distinct_ids (mixed cases)...", ops.len());
+    println!(
+        "Phase 2: aliasing {} distinct_ids (mixed cases)...",
+        ops.len()
+    );
     let mut latencies = Vec::with_capacity(ops.len());
 
     for op in ops {
