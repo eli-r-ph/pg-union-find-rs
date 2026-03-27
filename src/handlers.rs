@@ -183,6 +183,7 @@ fn db_error_response(e: DbError) -> axum::response::Response {
     let (status, msg) = match &e {
         DbError::NotFound(m) => (StatusCode::NOT_FOUND, m.clone()),
         DbError::AlreadyIdentified(m) => (StatusCode::CONFLICT, m.clone()),
+        DbError::IllegalDistinctId(m) => (StatusCode::BAD_REQUEST, m.clone()),
         DbError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m.clone()),
     };
     (status, Json(serde_json::json!({"error": msg}))).into_response()

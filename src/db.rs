@@ -6,6 +6,70 @@ use uuid::Uuid;
 use crate::models::{AliasResponse, CreateResponse, DbError, DbOp, DbResult, MergeResponse};
 
 // ---------------------------------------------------------------------------
+// Distinct ID validation — reject obviously-bad IDs before they hit the DB.
+// Mirrors PostHog's isDistinctIdIllegal blocklist.
+// ---------------------------------------------------------------------------
+
+const CASE_INSENSITIVE_ILLEGAL: &[&str] = &[
+    "anonymous",
+    "guest",
+    "distinctid",
+    "distinct_id",
+    "id",
+    "not_authenticated",
+    "email",
+    "undefined",
+    "true",
+    "false",
+];
+
+const CASE_SENSITIVE_ILLEGAL: &[&str] = &[
+    "[object Object]",
+    "NaN",
+    "None",
+    "none",
+    "null",
+    "0",
+    "undefined",
+];
+
+fn is_illegal_distinct_id(id: &str) -> bool {
+    let trimmed = id.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+
+    fn strip_quotes(s: &str) -> &str {
+        if (s.starts_with('\'') && s.ends_with('\'')) || (s.starts_with('"') && s.ends_with('"')) {
+            &s[1..s.len() - 1]
+        } else {
+            s
+        }
+    }
+
+    let bare = strip_quotes(id);
+    let lower = bare.to_lowercase();
+
+    if CASE_INSENSITIVE_ILLEGAL.contains(&lower.as_str()) {
+        return true;
+    }
+    if CASE_SENSITIVE_ILLEGAL.contains(&bare) {
+        return true;
+    }
+
+    false
+}
+
+fn validate_distinct_id(id: &str) -> DbResult<()> {
+    if is_illegal_distinct_id(id) {
+        return Err(DbError::IllegalDistinctId(format!(
+            "'{id}' is not a valid distinct_id"
+        )));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Resolved person — returned by the recursive CTE
 // ---------------------------------------------------------------------------
 
@@ -213,22 +277,25 @@ async fn set_identified(conn: &mut PgConnection, person_id: i64) -> DbResult<()>
     Ok(())
 }
 
-/// Re-point a root's person_id and clean up orphaned person_mapping rows.
-/// Used by both handle_alias (Case 2b) and handle_merge.
-async fn repoint_root(
+/// Link a source root into the target's tree, converting it from a root to a
+/// non-root. This properly merges the two union-find components so that all
+/// nodes formerly reachable from the source root now resolve through the target
+/// tree. Cleans up the orphaned person_mapping row if no other root still
+/// references it.
+async fn link_root_to_target(
     conn: &mut PgConnection,
     team_id: i64,
-    root_current: i64,
+    source_root_current: i64,
     old_person: i64,
-    new_person: i64,
+    target_pk: i64,
 ) -> DbResult<()> {
     sqlx::query(
-        "UPDATE union_find SET person_id = $3 \
+        "UPDATE union_find SET person_id = NULL, next = $3 \
          WHERE team_id = $1 AND current = $2",
     )
     .bind(team_id)
-    .bind(root_current)
-    .bind(new_person)
+    .bind(source_root_current)
+    .bind(target_pk)
     .execute(&mut *conn)
     .await?;
 
@@ -275,6 +342,7 @@ pub async fn handle_create(
     team_id: i64,
     distinct_id: &str,
 ) -> DbResult<CreateResponse> {
+    validate_distinct_id(distinct_id)?;
     let mut tx = pool.begin().await?;
     identify_tx(&mut tx, team_id, distinct_id).await?;
     let resolved = resolve_tx(&mut tx, team_id, distinct_id)
@@ -336,6 +404,9 @@ pub async fn handle_alias(
     target: &str,
     source: &str,
 ) -> DbResult<AliasResponse> {
+    validate_distinct_id(target)?;
+    validate_distinct_id(source)?;
+
     if target == source {
         let mut tx = pool.begin().await?;
         let person_uuid = identify_tx(&mut tx, team_id, target).await?;
@@ -407,15 +478,9 @@ pub async fn handle_alias(
                     ));
                 }
 
-                // Merge source into target
-                repoint_root(
-                    &mut tx,
-                    team_id,
-                    source_root.0,
-                    source_root.1,
-                    target_root.1,
-                )
-                .await?;
+                // Merge source into target by linking source's root
+                // into the target's tree as a non-root node.
+                link_root_to_target(&mut tx, team_id, source_root.0, source_root.1, tpk).await?;
 
                 set_identified(&mut tx, target_root.1).await?;
                 resolve_by_pk(&mut tx, team_id, tpk)
@@ -484,6 +549,11 @@ pub async fn handle_merge(
     target: &str,
     sources: &[String],
 ) -> DbResult<MergeResponse> {
+    validate_distinct_id(target)?;
+    for src in sources {
+        validate_distinct_id(src)?;
+    }
+
     let mut tx = pool.begin().await?;
 
     let target_pk = lookup_did(&mut tx, team_id, target)
@@ -510,7 +580,7 @@ pub async fn handle_merge(
                         let _ = root_current;
                     }
                     Some((root_current, old_person)) => {
-                        repoint_root(&mut tx, team_id, root_current, old_person, target_person_id)
+                        link_root_to_target(&mut tx, team_id, root_current, old_person, target_pk)
                             .await?;
                     }
                     None => {

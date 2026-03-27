@@ -24,14 +24,14 @@ union_find:           (team_id, current) PK, next (nullable), person_id (nullabl
 
 - **Read (resolve):** Look up distinct_id PK, walk union_find chain via recursive CTE to root, join person_mapping to return `person_uuid`.
 - **`/create`** `{ team_id, distinct_id }`: Get-or-create a person for a single distinct_id. If the distinct_id exists, returns the resolved person. Otherwise creates `person_mapping` + `distinct_id_mappings` + `union_find` root row.
-- **`/identify`** `{ team_id, primary, anonymous }`: Link an anonymous distinct_id to a primary. Routes to the same 4-case merge logic as `/alias`. When `primary == anonymous`, acts as get-or-create for that single distinct_id.
-- **`/alias`** `{ team_id, primary, alias }`: Link an alias distinct_id to a primary. Handles 4 cases:
+- **`/identify`** `{ team_id, target, anonymous }`: Link an anonymous distinct_id to a target (`$identify`). Routes to the same 4-case merge logic as `/alias`. When `target == anonymous`, acts as get-or-create for that single distinct_id.
+- **`/alias`** `{ team_id, target, alias }`: Link an alias distinct_id to a target (`$create_alias`). Handles 4 cases:
   - One exists, the other doesn't: link the new one into the existing chain.
   - Both exist, same person: no-op.
-  - Both exist, different persons: reject (caller must use `/merge`).
+  - Both exist, different persons: merge if the source (anonymous/alias) person is unidentified; reject with 409 if it is already identified (caller must use `/merge` to force).
   - Neither exists: create a new person with both distinct_ids.
-  - When `primary == alias`, acts as get-or-create for that single distinct_id.
-- **`/merge`** `{ team_id, src, dests }`: Force-merge N dests into src (`$merge_dangerously`). For each dest: if new, create link to src; if existing with a different person, re-point dest's chain root to src's person.
+  - When `target == alias`, acts as get-or-create for that single distinct_id.
+- **`/merge`** `{ team_id, target, sources }`: Force-merge N sources into target (`$merge_dangerously`). Ignores `is_identified` — always merges. For each source: if new, create link to target; if existing with a different person, link source's tree into target's tree.
 
 ## Running
 

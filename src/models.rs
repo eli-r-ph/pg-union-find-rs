@@ -58,6 +58,7 @@ pub struct MergeResponse {
 pub enum DbError {
     NotFound(String),
     AlreadyIdentified(String),
+    IllegalDistinctId(String),
     Internal(String),
 }
 
@@ -66,6 +67,7 @@ impl std::fmt::Display for DbError {
         match self {
             DbError::NotFound(msg) => write!(f, "not found: {msg}"),
             DbError::AlreadyIdentified(msg) => write!(f, "already identified: {msg}"),
+            DbError::IllegalDistinctId(msg) => write!(f, "illegal distinct_id: {msg}"),
             DbError::Internal(msg) => write!(f, "internal: {msg}"),
         }
     }

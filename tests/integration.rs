@@ -530,49 +530,96 @@ async fn merge_target_in_sources() {
 }
 
 #[tokio::test]
-async fn merge_repoint_preserves_shared_person() {
+async fn merge_chain_all_ids_follow() {
     let pool = test_pool().await;
     let t = next_team_id();
 
-    let person_a = db::handle_create(&pool, t, "a").await.unwrap();
+    db::handle_create(&pool, t, "a").await.unwrap();
     db::handle_create(&pool, t, "b").await.unwrap();
-    db::handle_create(&pool, t, "c").await.unwrap();
+    let person_c = db::handle_create(&pool, t, "c").await.unwrap();
 
+    // Step 1: merge b into a — b's tree is now linked into a's tree
     db::handle_merge(&pool, t, "a", &["b".into()])
         .await
         .unwrap();
 
-    let person_a_id = get_root_person_id(&pool, t, "a").await.unwrap();
-    let person_b_root_pid = get_root_person_id(&pool, t, "b").await.unwrap();
-    assert_eq!(
-        person_a_id, person_b_root_pid,
-        "both roots should reference person A"
-    );
+    let resolved_a = db::resolve(&pool, t, "a").await.unwrap().unwrap();
+    let resolved_b = db::resolve(&pool, t, "b").await.unwrap().unwrap();
+    assert_eq!(resolved_a.person_uuid, resolved_b.person_uuid);
 
+    // Step 2: merge a into c — since b is part of a's tree, b should
+    // also resolve to c's person after this.
     db::handle_merge(&pool, t, "c", &["a".into()])
         .await
         .unwrap();
 
-    assert!(
-        person_exists(&pool, person_a_id).await,
-        "person A must survive because b's root still references it"
-    );
-
     let resolved_a = db::resolve(&pool, t, "a").await.unwrap().unwrap();
     let resolved_b = db::resolve(&pool, t, "b").await.unwrap().unwrap();
+    let resolved_c = db::resolve(&pool, t, "c").await.unwrap().unwrap();
+
     assert_eq!(
-        resolved_a.person_uuid,
-        db::resolve(&pool, t, "c")
-            .await
-            .unwrap()
-            .unwrap()
-            .person_uuid
+        resolved_a.person_uuid, person_c.person_uuid,
+        "a should resolve to c's person"
     );
     assert_eq!(
-        resolved_b.person_uuid, person_a.person_uuid,
-        "b still resolves to original person A"
+        resolved_b.person_uuid, person_c.person_uuid,
+        "b should follow the chain through a to c's person"
+    );
+    assert_eq!(resolved_c.person_uuid, person_c.person_uuid);
+
+    assert_eq!(
+        count_person_mappings(&pool, t).await,
+        1,
+        "only c's person should remain"
     );
 
+    assert_all_invariants(&pool, t).await;
+}
+
+/// Verify that a longer chain of merges (a<-b, a<-c, then d<-a) correctly
+/// moves all previously merged distinct_ids to the final target.
+#[tokio::test]
+async fn merge_chain_deep_transitive() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    db::handle_create(&pool, t, "a").await.unwrap();
+    db::handle_create(&pool, t, "b").await.unwrap();
+    db::handle_create(&pool, t, "c").await.unwrap();
+    let person_d = db::handle_create(&pool, t, "d").await.unwrap();
+
+    db::handle_merge(&pool, t, "a", &["b".into(), "c".into()])
+        .await
+        .unwrap();
+
+    // a, b, c all share a person
+    for did in &["a", "b", "c"] {
+        let r = db::resolve(&pool, t, did).await.unwrap().unwrap();
+        assert_eq!(
+            r.person_uuid,
+            db::resolve(&pool, t, "a")
+                .await
+                .unwrap()
+                .unwrap()
+                .person_uuid,
+            "{did} should resolve to a's person after first merge"
+        );
+    }
+
+    // Now merge a into d — all of a's tree (including b and c) should follow
+    db::handle_merge(&pool, t, "d", &["a".into()])
+        .await
+        .unwrap();
+
+    for did in &["a", "b", "c", "d"] {
+        let r = db::resolve(&pool, t, did).await.unwrap().unwrap();
+        assert_eq!(
+            r.person_uuid, person_d.person_uuid,
+            "{did} should resolve to d's person after second merge"
+        );
+    }
+
+    assert_eq!(count_person_mappings(&pool, t).await, 1);
     assert_all_invariants(&pool, t).await;
 }
 
@@ -803,5 +850,92 @@ async fn invariants_after_complex_operations() {
             root.person_id.is_some(),
             "chain for {did} should terminate at a root"
         );
+    }
+}
+
+// ===========================================================================
+// G. Illegal distinct_id validation
+// ===========================================================================
+
+#[tokio::test]
+async fn create_rejects_illegal_ids() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    for bad_id in &[
+        "",
+        "  ",
+        "anonymous",
+        "null",
+        "undefined",
+        "0",
+        "NaN",
+        "[object Object]",
+    ] {
+        let result = db::handle_create(&pool, t, bad_id).await;
+        assert!(result.is_err(), "expected create to reject '{bad_id}'");
+        match result.unwrap_err() {
+            DbError::IllegalDistinctId(_) => {}
+            other => panic!("expected IllegalDistinctId for '{bad_id}', got: {other}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn alias_rejects_illegal_ids() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    db::handle_create(&pool, t, "legit").await.unwrap();
+
+    let result = db::handle_alias(&pool, t, "legit", "null").await;
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        DbError::IllegalDistinctId(_) => {}
+        other => panic!("expected IllegalDistinctId, got: {other}"),
+    }
+
+    let result = db::handle_alias(&pool, t, "guest", "legit").await;
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        DbError::IllegalDistinctId(_) => {}
+        other => panic!("expected IllegalDistinctId, got: {other}"),
+    }
+}
+
+#[tokio::test]
+async fn merge_rejects_illegal_ids() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    db::handle_create(&pool, t, "legit").await.unwrap();
+
+    let result = db::handle_merge(&pool, t, "anonymous", &[]).await;
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        DbError::IllegalDistinctId(_) => {}
+        other => panic!("expected IllegalDistinctId, got: {other}"),
+    }
+
+    let result = db::handle_merge(&pool, t, "legit", &["undefined".into()]).await;
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        DbError::IllegalDistinctId(_) => {}
+        other => panic!("expected IllegalDistinctId, got: {other}"),
+    }
+}
+
+#[tokio::test]
+async fn quoted_illegal_ids_rejected() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    for bad_id in &["'null'", "\"null\"", "'anonymous'", "\"undefined\""] {
+        let result = db::handle_create(&pool, t, bad_id).await;
+        assert!(result.is_err(), "expected create to reject {bad_id}");
+        match result.unwrap_err() {
+            DbError::IllegalDistinctId(_) => {}
+            other => panic!("expected IllegalDistinctId for {bad_id}, got: {other}"),
+        }
     }
 }
