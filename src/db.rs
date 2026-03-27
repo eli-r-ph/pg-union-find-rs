@@ -12,6 +12,7 @@ use crate::models::{AliasResponse, CreateResponse, DbError, DbOp, DbResult, Merg
 pub struct ResolvedPerson {
     pub person_uuid: String,
     pub person_id: i64,
+    pub is_identified: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -75,7 +76,7 @@ async fn resolve_by_pk(
     team_id: i64,
     did_pk: i64,
 ) -> DbResult<Option<ResolvedPerson>> {
-    let row = sqlx::query_as::<_, (String, i64)>(
+    let row = sqlx::query_as::<_, (String, i64, bool)>(
         r#"
         WITH RECURSIVE walk(node, depth) AS (
             SELECT $2::bigint, 0
@@ -88,7 +89,7 @@ async fn resolve_by_pk(
               ON uf.team_id = $1 AND uf.current = w.node AND uf.person_id IS NULL
             WHERE w.depth < 1000
         )
-        SELECT pm.person_uuid, uf.person_id
+        SELECT pm.person_uuid, uf.person_id, pm.is_identified
         FROM union_find uf
         JOIN person_mapping pm ON pm.person_id = uf.person_id
         WHERE uf.team_id = $1
@@ -100,10 +101,13 @@ async fn resolve_by_pk(
     .fetch_optional(&mut *conn)
     .await?;
 
-    Ok(row.map(|(person_uuid, person_id)| ResolvedPerson {
-        person_uuid,
-        person_id,
-    }))
+    Ok(
+        row.map(|(person_uuid, person_id, is_identified)| ResolvedPerson {
+            person_uuid,
+            person_id,
+            is_identified,
+        }),
+    )
 }
 
 /// Walk the union_find chain from a distinct_id PK to the root, returning
@@ -264,18 +268,22 @@ pub async fn resolve(
 }
 
 /// /create — get-or-create a person for a single distinct_id.
-/// The person starts with is_identified = false.
+/// New persons start with is_identified = false; existing persons return their
+/// current is_identified status.
 pub async fn handle_create(
     pool: &PgPool,
     team_id: i64,
     distinct_id: &str,
 ) -> DbResult<CreateResponse> {
     let mut tx = pool.begin().await?;
-    let person_uuid = identify_tx(&mut tx, team_id, distinct_id).await?;
+    identify_tx(&mut tx, team_id, distinct_id).await?;
+    let resolved = resolve_tx(&mut tx, team_id, distinct_id)
+        .await?
+        .ok_or_else(|| DbError::Internal("just created but can't resolve".into()))?;
     tx.commit().await?;
     Ok(CreateResponse {
-        person_uuid,
-        is_identified: false,
+        person_uuid: resolved.person_uuid,
+        is_identified: resolved.is_identified,
     })
 }
 

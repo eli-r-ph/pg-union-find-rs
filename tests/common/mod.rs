@@ -3,9 +3,18 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 
-static TEAM_COUNTER: AtomicI64 = AtomicI64::new(10_000);
+static TEAM_COUNTER: AtomicI64 = AtomicI64::new(0);
 
 pub fn next_team_id() -> i64 {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos() as i64
+            * 1_000;
+        TEAM_COUNTER.store(seed, Ordering::Relaxed);
+    });
     TEAM_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
