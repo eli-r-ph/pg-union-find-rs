@@ -50,6 +50,41 @@ pub struct MergeResponse {
     pub is_identified: bool,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ResolveRequest {
+    pub team_id: i64,
+    pub distinct_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ResolveResponse {
+    pub person_uuid: String,
+    pub is_identified: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeletePersonRequest {
+    pub team_id: i64,
+    pub person_uuid: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeletePersonResponse {
+    pub person_uuid: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeleteDistinctIdRequest {
+    pub team_id: i64,
+    pub distinct_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeleteDistinctIdResponse {
+    pub distinct_id: String,
+    pub person_deleted: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Internal error type
 // ---------------------------------------------------------------------------
@@ -102,5 +137,15 @@ pub enum DbOp {
         target: String,
         sources: Vec<String>,
         reply: oneshot::Sender<DbResult<MergeResponse>>,
+    },
+    DeletePerson {
+        team_id: i64,
+        person_uuid: String,
+        reply: oneshot::Sender<DbResult<DeletePersonResponse>>,
+    },
+    DeleteDistinctId {
+        team_id: i64,
+        distinct_id: String,
+        reply: oneshot::Sender<DbResult<DeleteDistinctIdResponse>>,
     },
 }

@@ -1,0 +1,1 @@
+ALTER TABLE union_find ADD COLUMN deleted_at TIMESTAMPTZ;

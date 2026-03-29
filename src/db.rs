@@ -3,7 +3,10 @@ use sqlx::postgres::PgConnection;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::models::{AliasResponse, CreateResponse, DbError, DbOp, DbResult, MergeResponse};
+use crate::models::{
+    AliasResponse, CreateResponse, DbError, DbOp, DbResult, DeleteDistinctIdResponse,
+    DeletePersonResponse, MergeResponse,
+};
 
 // ---------------------------------------------------------------------------
 // Distinct ID validation — reject obviously-bad IDs before they hit the DB.
@@ -108,6 +111,20 @@ pub async fn worker_loop(pool: PgPool, mut rx: mpsc::Receiver<DbOp>) {
             } => {
                 let _ = reply.send(handle_merge(&pool, team_id, &target, &sources).await);
             }
+            DbOp::DeletePerson {
+                team_id,
+                person_uuid,
+                reply,
+            } => {
+                let _ = reply.send(handle_delete_person(&pool, team_id, &person_uuid).await);
+            }
+            DbOp::DeleteDistinctId {
+                team_id,
+                distinct_id,
+                reply,
+            } => {
+                let _ = reply.send(handle_delete_distinct_id(&pool, team_id, &distinct_id).await);
+            }
         }
     }
 }
@@ -130,6 +147,37 @@ async fn lookup_did(
     .fetch_optional(&mut *conn)
     .await?;
     Ok(row.map(|(id,)| id))
+}
+
+/// Splice a node out of its union_find chain. Parents that pointed to this
+/// node inherit its (next, person_id, deleted_at) values via a self-join
+/// UPDATE, then the target node is cleared to a clean orphan state.
+async fn unlink_did(conn: &mut PgConnection, team_id: i64, did_pk: i64) -> DbResult<()> {
+    sqlx::query(
+        "UPDATE union_find AS parent \
+         SET next = target.next, \
+             person_id = target.person_id, \
+             deleted_at = target.deleted_at \
+         FROM (SELECT next, person_id, deleted_at \
+               FROM union_find WHERE team_id = $1 AND current = $2) AS target \
+         WHERE parent.team_id = $1 AND parent.next = $2",
+    )
+    .bind(team_id)
+    .bind(did_pk)
+    .execute(&mut *conn)
+    .await?;
+
+    sqlx::query(
+        "UPDATE union_find \
+         SET next = NULL, person_id = NULL, deleted_at = NULL \
+         WHERE team_id = $1 AND current = $2",
+    )
+    .bind(team_id)
+    .bind(did_pk)
+    .execute(&mut *conn)
+    .await?;
+
+    Ok(())
 }
 
 /// Walk the union_find chain from a distinct_id PK to the root, returning
@@ -157,6 +205,7 @@ async fn resolve_by_pk(
         JOIN person_mapping pm ON pm.person_id = uf.person_id
         WHERE uf.team_id = $1
           AND uf.current = (SELECT node FROM walk ORDER BY depth DESC LIMIT 1)
+          AND pm.deleted_at IS NULL
         "#,
     )
     .bind(team_id)
@@ -198,6 +247,7 @@ async fn resolve_root(
         WHERE uf.team_id = $1
           AND uf.current = (SELECT node FROM walk ORDER BY depth DESC LIMIT 1)
           AND uf.person_id IS NOT NULL
+          AND uf.deleted_at IS NULL
         "#,
     )
     .bind(team_id)
@@ -221,54 +271,207 @@ pub async fn resolve_tx(
     resolve_by_pk(&mut *conn, team_id, did_pk).await
 }
 
-/// Get-or-create: if the distinct_id exists, resolve it; otherwise create a
-/// new person_mapping + distinct_id_mappings + union_find root row.
-/// Returns the person_uuid string so callers can wrap it in any response type.
-/// The person is created with is_identified = false (DB default).
-pub async fn identify_tx(
+// ---------------------------------------------------------------------------
+// Lazy-unlink primitives — used by all write paths to handle distinct_ids
+// that belong to soft-deleted persons.
+// ---------------------------------------------------------------------------
+
+/// Three-state lookup result for a distinct_id.
+enum DidState {
+    NotFound,
+    Orphaned(i64),
+    Live(i64, ResolvedPerson),
+}
+
+/// Check whether a distinct_id is missing, orphaned (exists but its person is
+/// deleted), or live. Orphaned nodes are automatically unlinked from their
+/// dead chain so callers can immediately re-use the did_pk.
+async fn check_did(conn: &mut PgConnection, team_id: i64, distinct_id: &str) -> DbResult<DidState> {
+    let did_pk = match lookup_did(&mut *conn, team_id, distinct_id).await? {
+        Some(pk) => pk,
+        None => return Ok(DidState::NotFound),
+    };
+    match resolve_by_pk(&mut *conn, team_id, did_pk).await? {
+        Some(person) => Ok(DidState::Live(did_pk, person)),
+        None => {
+            unlink_did(&mut *conn, team_id, did_pk).await?;
+            Ok(DidState::Orphaned(did_pk))
+        }
+    }
+}
+
+/// Point an orphaned union_find row into an existing chain.
+async fn link_did(
     conn: &mut PgConnection,
     team_id: i64,
-    distinct_id: &str,
-) -> DbResult<String> {
-    if let Some(resolved) = resolve_tx(&mut *conn, team_id, distinct_id).await? {
-        return Ok(resolved.person_uuid);
-    }
-
-    let person_uuid = Uuid::new_v4().to_string();
-
-    let person_id: i64 = sqlx::query_scalar(
-        "INSERT INTO person_mapping (team_id, person_uuid) VALUES ($1, $2) RETURNING person_id",
-    )
-    .bind(team_id)
-    .bind(&person_uuid)
-    .fetch_one(&mut *conn)
-    .await?;
-
-    let did_pk: i64 = sqlx::query_scalar(
-        "INSERT INTO distinct_id_mappings (team_id, distinct_id) VALUES ($1, $2) RETURNING id",
-    )
-    .bind(team_id)
-    .bind(distinct_id)
-    .fetch_one(&mut *conn)
-    .await?;
-
+    did_pk: i64,
+    next_pk: i64,
+) -> DbResult<()> {
     sqlx::query(
-        "INSERT INTO union_find (team_id, current, next, person_id) VALUES ($1, $2, NULL, $3)",
+        "UPDATE union_find SET next = $3, person_id = NULL, deleted_at = NULL \
+         WHERE team_id = $1 AND current = $2",
+    )
+    .bind(team_id)
+    .bind(did_pk)
+    .bind(next_pk)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Promote an orphaned union_find row to a root for the given person.
+async fn root_did(
+    conn: &mut PgConnection,
+    team_id: i64,
+    did_pk: i64,
+    person_id: i64,
+) -> DbResult<()> {
+    sqlx::query(
+        "UPDATE union_find SET next = NULL, person_id = $3, deleted_at = NULL \
+         WHERE team_id = $1 AND current = $2",
     )
     .bind(team_id)
     .bind(did_pk)
     .bind(person_id)
     .execute(&mut *conn)
     .await?;
-
-    Ok(person_uuid)
+    Ok(())
 }
 
-/// Mark a person as identified (idempotent).
+/// Attach a NotFound or Orphaned distinct_id into an existing chain.
+/// Returns the did_pk (newly created for NotFound, existing for Orphaned).
+async fn attach_did(
+    conn: &mut PgConnection,
+    team_id: i64,
+    distinct_id: &str,
+    state: DidState,
+    next_pk: i64,
+) -> DbResult<i64> {
+    match state {
+        DidState::NotFound => insert_did_and_link(&mut *conn, team_id, distinct_id, next_pk).await,
+        DidState::Orphaned(pk) => {
+            link_did(&mut *conn, team_id, pk, next_pk).await?;
+            Ok(pk)
+        }
+        DidState::Live(..) => Err(DbError::Internal(
+            "attach_did called with Live state".into(),
+        )),
+    }
+}
+
+/// Attach a NotFound or Orphaned distinct_id as a new root.
+/// Returns the did_pk.
+async fn attach_did_as_root(
+    conn: &mut PgConnection,
+    team_id: i64,
+    distinct_id: &str,
+    state: DidState,
+    person_id: i64,
+) -> DbResult<i64> {
+    match state {
+        DidState::NotFound => {
+            let did_pk: i64 = sqlx::query_scalar(
+                "INSERT INTO distinct_id_mappings (team_id, distinct_id) \
+                 VALUES ($1, $2) RETURNING id",
+            )
+            .bind(team_id)
+            .bind(distinct_id)
+            .fetch_one(&mut *conn)
+            .await?;
+
+            sqlx::query(
+                "INSERT INTO union_find (team_id, current, next, person_id) \
+                 VALUES ($1, $2, NULL, $3)",
+            )
+            .bind(team_id)
+            .bind(did_pk)
+            .bind(person_id)
+            .execute(&mut *conn)
+            .await?;
+
+            Ok(did_pk)
+        }
+        DidState::Orphaned(pk) => {
+            root_did(&mut *conn, team_id, pk, person_id).await?;
+            Ok(pk)
+        }
+        DidState::Live(..) => Err(DbError::Internal(
+            "attach_did_as_root called with Live state".into(),
+        )),
+    }
+}
+
+/// Get-or-create: if the distinct_id resolves to a live person, return it.
+/// If the distinct_id is orphaned (person was deleted), unlink it and create
+/// a fresh person reusing the existing did_pk. If the distinct_id doesn't
+/// exist at all, create everything from scratch.
+/// The person is created with is_identified = false (DB default).
+pub async fn identify_tx(
+    conn: &mut PgConnection,
+    team_id: i64,
+    distinct_id: &str,
+) -> DbResult<String> {
+    match check_did(&mut *conn, team_id, distinct_id).await? {
+        DidState::Live(_pk, resolved) => Ok(resolved.person_uuid),
+
+        DidState::NotFound => {
+            let person_uuid = Uuid::new_v4().to_string();
+
+            let person_id: i64 = sqlx::query_scalar(
+                "INSERT INTO person_mapping (team_id, person_uuid) \
+                 VALUES ($1, $2) RETURNING person_id",
+            )
+            .bind(team_id)
+            .bind(&person_uuid)
+            .fetch_one(&mut *conn)
+            .await?;
+
+            let did_pk: i64 = sqlx::query_scalar(
+                "INSERT INTO distinct_id_mappings (team_id, distinct_id) \
+                 VALUES ($1, $2) RETURNING id",
+            )
+            .bind(team_id)
+            .bind(distinct_id)
+            .fetch_one(&mut *conn)
+            .await?;
+
+            sqlx::query(
+                "INSERT INTO union_find (team_id, current, next, person_id) \
+                 VALUES ($1, $2, NULL, $3)",
+            )
+            .bind(team_id)
+            .bind(did_pk)
+            .bind(person_id)
+            .execute(&mut *conn)
+            .await?;
+
+            Ok(person_uuid)
+        }
+
+        DidState::Orphaned(did_pk) => {
+            let person_uuid = Uuid::new_v4().to_string();
+
+            let person_id: i64 = sqlx::query_scalar(
+                "INSERT INTO person_mapping (team_id, person_uuid) \
+                 VALUES ($1, $2) RETURNING person_id",
+            )
+            .bind(team_id)
+            .bind(&person_uuid)
+            .fetch_one(&mut *conn)
+            .await?;
+
+            root_did(&mut *conn, team_id, did_pk, person_id).await?;
+
+            Ok(person_uuid)
+        }
+    }
+}
+
+/// Mark a person as identified (idempotent). Skips soft-deleted persons.
 async fn set_identified(conn: &mut PgConnection, person_id: i64) -> DbResult<()> {
     sqlx::query(
         "UPDATE person_mapping SET is_identified = true \
-         WHERE person_id = $1 AND NOT is_identified",
+         WHERE person_id = $1 AND NOT is_identified AND deleted_at IS NULL",
     )
     .bind(person_id)
     .execute(&mut *conn)
@@ -301,7 +504,7 @@ async fn link_root_to_target(
     let still_referenced: bool = sqlx::query_scalar(
         "SELECT EXISTS(\
            SELECT 1 FROM union_find \
-           WHERE team_id = $1 AND person_id = $2\
+           WHERE team_id = $1 AND person_id = $2 AND deleted_at IS NULL\
          )",
     )
     .bind(team_id)
@@ -384,17 +587,9 @@ async fn insert_did_and_link(
 
 /// /alias and /identify — merge two distinct_ids per PostHog semantics.
 ///
-/// Parameters:
-///   target = the keeper (primary / identified side)
-///   source = the one being absorbed (anonymous / alias side)
-///
-/// Handles 5 cases:
-///   target==source: get-or-create shortcut
-///   1a. target exists, source doesn't → link source into target's chain
-///   1b. source exists, target doesn't → link target into source's chain
-///   2a. both exist, same person       → no-op
-///   2b. both exist, diff persons      → merge if source is unidentified; reject otherwise
-///   3.  neither exists                → create person with both distinct_ids
+/// Uses check_did to transparently handle distinct_ids belonging to deleted
+/// persons (lazy unlink). Orphaned distinct_ids are treated like new ones
+/// but reuse their existing did_pk via attach_did/attach_did_as_root.
 ///
 /// On success, sets is_identified = true on the resulting person.
 pub async fn handle_alias(
@@ -422,75 +617,49 @@ pub async fn handle_alias(
 
     let mut tx = pool.begin().await?;
 
-    let target_pk = lookup_did(&mut tx, team_id, target).await?;
-    let source_pk = lookup_did(&mut tx, team_id, source).await?;
+    let target_state = check_did(&mut tx, team_id, target).await?;
+    let source_state = check_did(&mut tx, team_id, source).await?;
 
-    let person_uuid = match (target_pk, source_pk) {
-        // Case 1a: target exists, source doesn't — link source into target's chain
-        (Some(tpk), None) => {
-            insert_did_and_link(&mut tx, team_id, source, tpk).await?;
-            let resolved = resolve_by_pk(&mut tx, team_id, tpk)
-                .await?
-                .ok_or_else(|| DbError::Internal("target chain has no root".into()))?;
-            set_identified(&mut tx, resolved.person_id).await?;
-            resolved.person_uuid
-        }
-
-        // Case 1b: source exists, target doesn't — link target into source's chain
-        (None, Some(spk)) => {
-            insert_did_and_link(&mut tx, team_id, target, spk).await?;
-            let resolved = resolve_by_pk(&mut tx, team_id, spk)
-                .await?
-                .ok_or_else(|| DbError::Internal("source chain has no root".into()))?;
-            set_identified(&mut tx, resolved.person_id).await?;
-            resolved.person_uuid
-        }
-
-        // Case 2: both exist — check if same or different person
-        (Some(tpk), Some(spk)) => {
-            let target_root = resolve_root(&mut tx, team_id, tpk)
-                .await?
-                .ok_or_else(|| DbError::Internal("target chain has no root".into()))?;
-            let source_root = resolve_root(&mut tx, team_id, spk)
-                .await?
-                .ok_or_else(|| DbError::Internal("source chain has no root".into()))?;
-
-            if target_root.1 == source_root.1 {
-                // Case 2a: same person — no-op, just ensure identified
-                set_identified(&mut tx, target_root.1).await?;
-                resolve_by_pk(&mut tx, team_id, tpk)
-                    .await?
-                    .ok_or_else(|| DbError::Internal("target chain has no root".into()))?
-                    .person_uuid
+    let person_uuid = match (target_state, source_state) {
+        // Both live — compare persons, merge if different
+        (DidState::Live(tpk, t_resolved), DidState::Live(spk, s_resolved)) => {
+            if t_resolved.person_id == s_resolved.person_id {
+                set_identified(&mut tx, t_resolved.person_id).await?;
+                t_resolved.person_uuid
             } else {
-                // Case 2b: different persons — check source's is_identified
-                let source_identified: bool = sqlx::query_scalar(
-                    "SELECT is_identified FROM person_mapping WHERE person_id = $1",
-                )
-                .bind(source_root.1)
-                .fetch_one(&mut *tx)
-                .await?;
-
-                if source_identified {
+                if s_resolved.is_identified {
                     return Err(DbError::AlreadyIdentified(
                         "source person is already identified; use /merge to force".into(),
                     ));
                 }
 
-                // Merge source into target by linking source's root
-                // into the target's tree as a non-root node.
+                let source_root = resolve_root(&mut tx, team_id, spk)
+                    .await?
+                    .ok_or_else(|| DbError::Internal("source chain has no root".into()))?;
+
                 link_root_to_target(&mut tx, team_id, source_root.0, source_root.1, tpk).await?;
 
-                set_identified(&mut tx, target_root.1).await?;
-                resolve_by_pk(&mut tx, team_id, tpk)
-                    .await?
-                    .ok_or_else(|| DbError::Internal("target chain has no root".into()))?
-                    .person_uuid
+                set_identified(&mut tx, t_resolved.person_id).await?;
+                t_resolved.person_uuid
             }
         }
 
-        // Case 3: neither exists — create person with both distinct_ids
-        (None, None) => {
+        // Target live, source not — attach source into target's chain
+        (DidState::Live(tpk, t_resolved), source_state) => {
+            attach_did(&mut tx, team_id, source, source_state, tpk).await?;
+            set_identified(&mut tx, t_resolved.person_id).await?;
+            t_resolved.person_uuid
+        }
+
+        // Source live, target not — attach target into source's chain
+        (target_state, DidState::Live(spk, s_resolved)) => {
+            attach_did(&mut tx, team_id, target, target_state, spk).await?;
+            set_identified(&mut tx, s_resolved.person_id).await?;
+            s_resolved.person_uuid
+        }
+
+        // Neither live — create new person with both distinct_ids
+        (target_state, source_state) => {
             let person_uuid = Uuid::new_v4().to_string();
 
             let person_id: i64 = sqlx::query_scalar(
@@ -502,26 +671,9 @@ pub async fn handle_alias(
             .fetch_one(&mut *tx)
             .await?;
 
-            let target_new_pk: i64 = sqlx::query_scalar(
-                "INSERT INTO distinct_id_mappings (team_id, distinct_id) VALUES ($1, $2) \
-                 RETURNING id",
-            )
-            .bind(team_id)
-            .bind(target)
-            .fetch_one(&mut *tx)
-            .await?;
-
-            sqlx::query(
-                "INSERT INTO union_find (team_id, current, next, person_id) \
-                 VALUES ($1, $2, NULL, $3)",
-            )
-            .bind(team_id)
-            .bind(target_new_pk)
-            .bind(person_id)
-            .execute(&mut *tx)
-            .await?;
-
-            insert_did_and_link(&mut tx, team_id, source, target_new_pk).await?;
+            let target_pk =
+                attach_did_as_root(&mut tx, team_id, target, target_state, person_id).await?;
+            attach_did(&mut tx, team_id, source, source_state, target_pk).await?;
 
             person_uuid
         }
@@ -538,10 +690,8 @@ pub async fn handle_alias(
 /// /merge — merge N source distinct_ids into target's person ($merge_dangerously).
 /// Ignores is_identified — always merges. Sets is_identified = true on the result.
 ///
-/// For each source:
-///   - If source doesn't exist: create mapping + link to target.
-///   - If source exists and already shares target's person: skip.
-///   - If source exists with a different person: link source's root into target's tree.
+/// Uses check_did for the target and each source so that distinct_ids belonging
+/// to deleted persons are lazily unlinked and handled transparently.
 pub async fn handle_merge(
     pool: &PgPool,
     team_id: i64,
@@ -555,29 +705,41 @@ pub async fn handle_merge(
 
     let mut tx = pool.begin().await?;
 
-    let target_pk = lookup_did(&mut tx, team_id, target)
-        .await?
-        .ok_or_else(|| DbError::NotFound(format!("target distinct_id '{target}' not found")))?;
-
-    let target_resolved = resolve_by_pk(&mut tx, team_id, target_pk)
-        .await?
-        .ok_or_else(|| DbError::Internal("target chain has no root".into()))?;
-
-    let target_person_id = target_resolved.person_id;
+    let (target_pk, target_person_id, target_person_uuid) =
+        match check_did(&mut tx, team_id, target).await? {
+            DidState::NotFound => {
+                return Err(DbError::NotFound(format!(
+                    "target distinct_id '{target}' not found"
+                )));
+            }
+            DidState::Orphaned(pk) => {
+                let person_uuid = Uuid::new_v4().to_string();
+                let person_id: i64 = sqlx::query_scalar(
+                    "INSERT INTO person_mapping (team_id, person_uuid) \
+                     VALUES ($1, $2) RETURNING person_id",
+                )
+                .bind(team_id)
+                .bind(&person_uuid)
+                .fetch_one(&mut *tx)
+                .await?;
+                root_did(&mut tx, team_id, pk, person_id).await?;
+                (pk, person_id, person_uuid)
+            }
+            DidState::Live(pk, resolved) => (pk, resolved.person_id, resolved.person_uuid),
+        };
 
     for src in sources {
-        let src_pk = lookup_did(&mut tx, team_id, src).await?;
-
-        match src_pk {
-            None => {
+        match check_did(&mut tx, team_id, src).await? {
+            DidState::NotFound => {
                 insert_did_and_link(&mut tx, team_id, src, target_pk).await?;
             }
-            Some(spk) => {
+            DidState::Orphaned(pk) => {
+                link_did(&mut tx, team_id, pk, target_pk).await?;
+            }
+            DidState::Live(spk, _) => {
                 let root = resolve_root(&mut tx, team_id, spk).await?;
                 match root {
-                    Some((root_current, root_person)) if root_person == target_person_id => {
-                        let _ = root_current;
-                    }
+                    Some((_, root_person)) if root_person == target_person_id => {}
                     Some((root_current, old_person)) => {
                         link_root_to_target(&mut tx, team_id, root_current, old_person, target_pk)
                             .await?;
@@ -596,7 +758,117 @@ pub async fn handle_merge(
     tx.commit().await?;
 
     Ok(MergeResponse {
-        person_uuid: target_resolved.person_uuid,
+        person_uuid: target_person_uuid,
         is_identified: true,
+    })
+}
+
+/// /delete_person — soft-delete a person by setting deleted_at on the
+/// person_mapping row and all union_find roots that reference it.
+/// The distinct_ids are left in place and lazily cleaned up by future
+/// write operations via check_did.
+pub async fn handle_delete_person(
+    pool: &PgPool,
+    team_id: i64,
+    person_uuid: &str,
+) -> DbResult<DeletePersonResponse> {
+    let mut tx = pool.begin().await?;
+
+    let person_id: i64 = sqlx::query_scalar(
+        "SELECT person_id FROM person_mapping \
+         WHERE team_id = $1 AND person_uuid = $2 AND deleted_at IS NULL",
+    )
+    .bind(team_id)
+    .bind(person_uuid)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| DbError::NotFound(format!("person '{person_uuid}' not found")))?;
+
+    sqlx::query("UPDATE person_mapping SET deleted_at = now() WHERE person_id = $1")
+        .bind(person_id)
+        .execute(&mut *tx)
+        .await?;
+
+    sqlx::query(
+        "UPDATE union_find SET deleted_at = now() \
+         WHERE team_id = $1 AND person_id = $2 AND deleted_at IS NULL",
+    )
+    .bind(team_id)
+    .bind(person_id)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    Ok(DeletePersonResponse {
+        person_uuid: person_uuid.to_string(),
+    })
+}
+
+/// /delete_distinct_id — unlink a distinct_id from its chain, then hard-delete
+/// the union_find row and distinct_id_mappings row. If the deleted node was the
+/// last root for a person, the person_mapping is soft-deleted as a side effect.
+pub async fn handle_delete_distinct_id(
+    pool: &PgPool,
+    team_id: i64,
+    distinct_id: &str,
+) -> DbResult<DeleteDistinctIdResponse> {
+    let mut tx = pool.begin().await?;
+
+    let did_pk = lookup_did(&mut tx, team_id, distinct_id)
+        .await?
+        .ok_or_else(|| DbError::NotFound(format!("distinct_id '{distinct_id}' not found")))?;
+
+    let original_person_id: Option<i64> =
+        sqlx::query_scalar("SELECT person_id FROM union_find WHERE team_id = $1 AND current = $2")
+            .bind(team_id)
+            .bind(did_pk)
+            .fetch_optional(&mut *tx)
+            .await?
+            .unwrap_or(None);
+
+    unlink_did(&mut tx, team_id, did_pk).await?;
+
+    sqlx::query("DELETE FROM union_find WHERE team_id = $1 AND current = $2")
+        .bind(team_id)
+        .bind(did_pk)
+        .execute(&mut *tx)
+        .await?;
+
+    sqlx::query("DELETE FROM distinct_id_mappings WHERE id = $1")
+        .bind(did_pk)
+        .execute(&mut *tx)
+        .await?;
+
+    let mut person_deleted = false;
+    if let Some(pid) = original_person_id {
+        let still_referenced: bool = sqlx::query_scalar(
+            "SELECT EXISTS(\
+               SELECT 1 FROM union_find \
+               WHERE team_id = $1 AND person_id = $2 AND deleted_at IS NULL\
+             )",
+        )
+        .bind(team_id)
+        .bind(pid)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        if !still_referenced {
+            sqlx::query(
+                "UPDATE person_mapping SET deleted_at = now() \
+                 WHERE person_id = $1 AND deleted_at IS NULL",
+            )
+            .bind(pid)
+            .execute(&mut *tx)
+            .await?;
+            person_deleted = true;
+        }
+    }
+
+    tx.commit().await?;
+
+    Ok(DeleteDistinctIdResponse {
+        distinct_id: distinct_id.to_string(),
+        person_deleted,
     })
 }

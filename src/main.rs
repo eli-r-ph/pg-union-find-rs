@@ -73,6 +73,7 @@ async fn main() {
 
     let state = AppState {
         workers: Arc::from(senders.into_boxed_slice()),
+        pool: pool.clone(),
     };
 
     let app = Router::new()
@@ -81,6 +82,9 @@ async fn main() {
         .route("/identify", post(handlers::identify))
         .route("/alias", post(handlers::alias))
         .route("/merge", post(handlers::merge))
+        .route("/delete_person", post(handlers::delete_person))
+        .route("/delete_distinct_id", post(handlers::delete_distinct_id))
+        .route("/resolve", post(handlers::resolve))
         .with_state(state)
         .layer(CatchPanicLayer::custom(
             |_: Box<dyn std::any::Any + Send>| {
