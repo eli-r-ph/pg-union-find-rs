@@ -149,33 +149,112 @@ async fn lookup_did(
     Ok(row.map(|(id,)| id))
 }
 
-/// Splice a node out of its union_find chain. Parents that pointed to this
-/// node inherit its (next, person_id, deleted_at) values via a self-join
-/// UPDATE, then the target node is cleared to a clean orphan state.
+/// Splice a node out of its union_find chain, then clear it to orphan state.
+///
+/// Non-root nodes (person_id IS NULL): all parents inherit the node's `next`,
+/// splicing past it. Safe because person_id is NULL — no duplication.
+///
+/// Root nodes (person_id IS NOT NULL): exactly one parent is promoted to root
+/// (inherits next/person_id/deleted_at) and all other parents are redirected
+/// to the promoted parent. This preserves the invariant that each person_id
+/// appears at most once in union_find.
 async fn unlink_did(conn: &mut PgConnection, team_id: i64, did_pk: i64) -> DbResult<()> {
-    sqlx::query(
-        "UPDATE union_find AS parent \
-         SET next = target.next, \
-             person_id = target.person_id, \
-             deleted_at = target.deleted_at \
-         FROM (SELECT next, person_id, deleted_at \
-               FROM union_find WHERE team_id = $1 AND current = $2) AS target \
-         WHERE parent.team_id = $1 AND parent.next = $2",
+    let is_root: bool = sqlx::query_scalar(
+        "SELECT COALESCE(person_id IS NOT NULL, false) \
+         FROM union_find WHERE team_id = $1 AND current = $2",
     )
     .bind(team_id)
     .bind(did_pk)
-    .execute(&mut *conn)
-    .await?;
+    .fetch_optional(&mut *conn)
+    .await?
+    .unwrap_or(false);
 
-    sqlx::query(
-        "UPDATE union_find \
-         SET next = NULL, person_id = NULL, deleted_at = NULL \
-         WHERE team_id = $1 AND current = $2",
-    )
-    .bind(team_id)
-    .bind(did_pk)
-    .execute(&mut *conn)
-    .await?;
+    if !is_root {
+        // Non-root: bulk-splice all parents through this node.
+        // Parents inherit (next, person_id, deleted_at) from the unlinked node.
+        // Safe because person_id is NULL here — no duplication possible.
+        sqlx::query(
+            "UPDATE union_find AS parent \
+             SET next = target.next, \
+                 person_id = target.person_id, \
+                 deleted_at = target.deleted_at \
+             FROM (SELECT next, person_id, deleted_at \
+                   FROM union_find WHERE team_id = $1 AND current = $2) AS target \
+             WHERE parent.team_id = $1 AND parent.next = $2",
+        )
+        .bind(team_id)
+        .bind(did_pk)
+        .execute(&mut *conn)
+        .await?;
+
+        // Clear the unlinked node to orphan state.
+        sqlx::query(
+            "UPDATE union_find \
+             SET next = NULL, person_id = NULL, deleted_at = NULL \
+             WHERE team_id = $1 AND current = $2",
+        )
+        .bind(team_id)
+        .bind(did_pk)
+        .execute(&mut *conn)
+        .await?;
+    } else {
+        // Root: promote exactly one parent to root, redirect all others to it.
+        let promoted_pk: Option<i64> = sqlx::query_scalar(
+            "SELECT current FROM union_find \
+             WHERE team_id = $1 AND next = $2 \
+             LIMIT 1",
+        )
+        .bind(team_id)
+        .bind(did_pk)
+        .fetch_optional(&mut *conn)
+        .await?;
+
+        if let Some(promoted_pk) = promoted_pk {
+            // Single UPDATE clears old root and promotes parent in one pass.
+            // A single UPDATE defers unique constraint checks until all row
+            // modifications are applied, preventing transient person_id duplicates.
+            // The read-only CTE captures the old root's values from the snapshot.
+            sqlx::query(
+                "WITH old AS ( \
+                     SELECT person_id, deleted_at \
+                     FROM union_find WHERE team_id = $1 AND current = $2 \
+                 ) \
+                 UPDATE union_find AS uf \
+                 SET next = NULL, \
+                     person_id = CASE WHEN uf.current = $2 THEN NULL ELSE old.person_id END, \
+                     deleted_at = CASE WHEN uf.current = $2 THEN NULL ELSE old.deleted_at END \
+                 FROM old \
+                 WHERE uf.team_id = $1 AND uf.current IN ($2, $3)",
+            )
+            .bind(team_id)
+            .bind(did_pk)
+            .bind(promoted_pk)
+            .execute(&mut *conn)
+            .await?;
+
+            // Redirect all other parents to the promoted node.
+            sqlx::query(
+                "UPDATE union_find SET next = $3 \
+                 WHERE team_id = $1 AND next = $2 AND current != $3",
+            )
+            .bind(team_id)
+            .bind(did_pk)
+            .bind(promoted_pk)
+            .execute(&mut *conn)
+            .await?;
+        } else {
+            // No parents: clear old root (person_id is lost).
+            sqlx::query(
+                "UPDATE union_find \
+                 SET next = NULL, person_id = NULL, deleted_at = NULL \
+                 WHERE team_id = $1 AND current = $2",
+            )
+            .bind(team_id)
+            .bind(did_pk)
+            .execute(&mut *conn)
+            .await?;
+        }
+    }
 
     Ok(())
 }
@@ -490,8 +569,8 @@ async fn set_identified(conn: &mut PgConnection, person_id: i64) -> DbResult<()>
 /// Link a source root into the target's tree, converting it from a root to a
 /// non-root. This properly merges the two union-find components so that all
 /// nodes formerly reachable from the source root now resolve through the target
-/// tree. Cleans up the orphaned person_mapping row if no other root still
-/// references it.
+/// tree. The unique person_id invariant guarantees no other union_find row
+/// holds old_person, so the orphaned person_mapping is unconditionally deleted.
 async fn link_root_to_target(
     conn: &mut PgConnection,
     team_id: i64,
@@ -509,23 +588,10 @@ async fn link_root_to_target(
     .execute(&mut *conn)
     .await?;
 
-    let still_referenced: bool = sqlx::query_scalar(
-        "SELECT EXISTS(\
-           SELECT 1 FROM union_find \
-           WHERE team_id = $1 AND person_id = $2 AND deleted_at IS NULL\
-         )",
-    )
-    .bind(team_id)
-    .bind(old_person)
-    .fetch_one(&mut *conn)
-    .await?;
-
-    if !still_referenced {
-        sqlx::query("DELETE FROM person_mapping WHERE person_id = $1")
-            .bind(old_person)
-            .execute(&mut *conn)
-            .await?;
-    }
+    sqlx::query("DELETE FROM person_mapping WHERE person_id = $1")
+        .bind(old_person)
+        .execute(&mut *conn)
+        .await?;
 
     Ok(())
 }

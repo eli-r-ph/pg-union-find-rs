@@ -28,6 +28,7 @@ async fn create_new() {
     let uf = get_uf_row(&pool, t, "user-1").await.unwrap();
     assert!(uf.next.is_none(), "root must have next=NULL");
     assert!(uf.person_id.is_some(), "root must have person_id set");
+    assert!(!uf.is_deleted, "root must not be deleted");
 
     assert_all_invariants(&pool, t).await;
 }
@@ -139,10 +140,12 @@ async fn alias_case1a_target_exists() {
     let uf_primary = get_uf_row(&pool, t, "primary").await.unwrap();
     assert!(uf_primary.person_id.is_some(), "primary should be root");
     assert!(uf_primary.next.is_none());
+    assert!(!uf_primary.is_deleted);
 
     let uf_anon = get_uf_row(&pool, t, "anon").await.unwrap();
     assert!(uf_anon.person_id.is_none(), "anon should not be root");
     assert_eq!(uf_anon.next, Some(uf_primary.current));
+    assert!(!uf_anon.is_deleted);
 
     let pid = get_root_person_id(&pool, t, "primary").await.unwrap();
     assert!(is_person_identified(&pool, pid).await);
@@ -170,10 +173,12 @@ async fn alias_case1b_source_exists() {
 
     let uf_anon = get_uf_row(&pool, t, "anon").await.unwrap();
     assert!(uf_anon.person_id.is_some(), "anon should be root");
+    assert!(!uf_anon.is_deleted);
 
     let uf_primary = get_uf_row(&pool, t, "primary").await.unwrap();
     assert!(uf_primary.person_id.is_none(), "primary should not be root");
     assert_eq!(uf_primary.next, Some(uf_anon.current));
+    assert!(!uf_primary.is_deleted);
 
     let pid = get_root_person_id(&pool, t, "anon").await.unwrap();
     assert!(is_person_identified(&pool, pid).await);
@@ -309,10 +314,12 @@ async fn alias_case3_neither_exists() {
     let uf_primary = get_uf_row(&pool, t, "primary").await.unwrap();
     assert!(uf_primary.person_id.is_some(), "primary should be root");
     assert!(uf_primary.next.is_none());
+    assert!(!uf_primary.is_deleted);
 
     let uf_anon = get_uf_row(&pool, t, "anon").await.unwrap();
     assert!(uf_anon.person_id.is_none(), "anon should not be root");
     assert_eq!(uf_anon.next, Some(uf_primary.current));
+    assert!(!uf_anon.is_deleted);
 
     let pid = get_root_person_id(&pool, t, "primary").await.unwrap();
     assert!(is_person_identified(&pool, pid).await);
@@ -378,8 +385,10 @@ async fn merge_source_not_found() {
 
     let uf_source = get_uf_row(&pool, t, "new-source").await.unwrap();
     assert!(uf_source.person_id.is_none());
+    assert!(!uf_source.is_deleted);
     let uf_tgt = get_uf_row(&pool, t, "tgt").await.unwrap();
     assert_eq!(uf_source.next, Some(uf_tgt.current));
+    assert!(!uf_tgt.is_deleted);
 
     assert_all_invariants(&pool, t).await;
 }
@@ -667,6 +676,7 @@ async fn resolve_root() {
     let chain = walk_chain(&pool, t, "root-did").await;
     assert_eq!(chain.len(), 1);
     assert!(chain[0].person_id.is_some());
+    assert!(!chain[0].is_deleted);
 }
 
 #[tokio::test]
@@ -683,7 +693,9 @@ async fn resolve_one_hop() {
     let chain = walk_chain(&pool, t, "leaf").await;
     assert_eq!(chain.len(), 2);
     assert!(chain[0].person_id.is_none(), "leaf should not be root");
+    assert!(!chain[0].is_deleted);
     assert!(chain[1].person_id.is_some(), "second node should be root");
+    assert!(!chain[1].is_deleted);
 }
 
 #[tokio::test]
@@ -703,8 +715,11 @@ async fn resolve_multi_hop() {
     let chain = walk_chain(&pool, t, "d").await;
     assert_eq!(chain.len(), 4, "chain should be d -> c -> b -> a");
     assert!(chain[3].person_id.is_some(), "last node (a) should be root");
-    for (i, node) in chain.iter().enumerate().take(3) {
-        assert!(node.person_id.is_none(), "node {i} should not be root");
+    for (i, node) in chain.iter().enumerate() {
+        assert!(!node.is_deleted, "node {i} should not be deleted");
+        if i < 3 {
+            assert!(node.person_id.is_none(), "node {i} should not be root");
+        }
     }
 
     assert_all_invariants(&pool, t).await;
@@ -850,7 +865,15 @@ async fn invariants_after_complex_operations() {
             root.person_id.is_some(),
             "chain for {did} should terminate at a root"
         );
+        for node in &chain {
+            assert!(
+                !node.is_deleted,
+                "chain for {did} should have no deleted nodes"
+            );
+        }
     }
+
+    assert_no_deleted_rows(&pool, t).await;
 }
 
 // ===========================================================================
@@ -1030,6 +1053,7 @@ async fn merge_link_structure() {
     // b's root should now be a non-root linked to a's node
     let uf_b = get_uf_row(&pool, t, "b").await.unwrap();
     assert!(uf_b.person_id.is_none(), "b should be non-root after merge");
+    assert!(!uf_b.is_deleted);
     assert_eq!(
         uf_b.next,
         Some(uf_a_before.current),
@@ -1040,6 +1064,7 @@ async fn merge_link_structure() {
     let uf_a = get_uf_row(&pool, t, "a").await.unwrap();
     assert!(uf_a.person_id.is_some(), "a should still be root");
     assert!(uf_a.next.is_none());
+    assert!(!uf_a.is_deleted);
 
     assert_all_invariants(&pool, t).await;
 }
@@ -1060,6 +1085,7 @@ async fn alias_case2b_link_structure() {
     // b's root should now be a non-root linked to a's node
     let uf_b = get_uf_row(&pool, t, "b").await.unwrap();
     assert!(uf_b.person_id.is_none(), "b should be non-root after alias");
+    assert!(!uf_b.is_deleted);
     assert_eq!(
         uf_b.next,
         Some(uf_a_before.current),
@@ -1068,6 +1094,7 @@ async fn alias_case2b_link_structure() {
 
     let uf_a = get_uf_row(&pool, t, "a").await.unwrap();
     assert!(uf_a.person_id.is_some(), "a should still be root");
+    assert!(!uf_a.is_deleted);
 
     assert_all_invariants(&pool, t).await;
 }
@@ -1161,6 +1188,9 @@ async fn alias_fan_out() {
     assert!(chain_d[0].person_id.is_none(), "d should not be root");
     assert!(chain_d[1].person_id.is_none(), "b should not be root");
     assert!(chain_d[2].person_id.is_some(), "a should be root");
+    for node in &chain_d {
+        assert!(!node.is_deleted);
+    }
 
     assert_all_invariants(&pool, t).await;
 }
@@ -1322,4 +1352,794 @@ async fn orphan_cleanup_stepwise() {
     );
 
     assert_all_invariants(&pool, t).await;
+}
+
+// ===========================================================================
+// N. /delete_person
+// ===========================================================================
+
+#[tokio::test]
+async fn delete_person_basic() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let created = db::handle_create(&pool, t, "a").await.unwrap();
+    let pid = get_root_person_id(&pool, t, "a").await.unwrap();
+
+    let resp = db::handle_delete_person(&pool, t, &created.person_uuid)
+        .await
+        .unwrap();
+    assert_eq!(resp.person_uuid, created.person_uuid);
+
+    let resolved = db::resolve(&pool, t, "a").await.unwrap();
+    assert!(
+        resolved.is_none(),
+        "resolve should return None after delete"
+    );
+
+    assert!(is_person_deleted(&pool, pid).await);
+
+    let uf = get_uf_row(&pool, t, "a").await.unwrap();
+    assert!(uf.is_deleted, "union_find root should be marked deleted");
+
+    assert_eq!(count_live_person_mappings(&pool, t).await, 0);
+    assert_structural_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn delete_person_not_found() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let result = db::handle_delete_person(&pool, t, "nonexistent-uuid").await;
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        DbError::NotFound(_) => {}
+        other => panic!("expected NotFound, got: {other}"),
+    }
+}
+
+#[tokio::test]
+async fn delete_person_already_deleted() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let created = db::handle_create(&pool, t, "a").await.unwrap();
+    db::handle_delete_person(&pool, t, &created.person_uuid)
+        .await
+        .unwrap();
+
+    let result = db::handle_delete_person(&pool, t, &created.person_uuid).await;
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        DbError::NotFound(_) => {}
+        other => panic!("expected NotFound on second delete, got: {other}"),
+    }
+}
+
+#[tokio::test]
+async fn delete_person_with_chain() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let created = db::handle_create(&pool, t, "a").await.unwrap();
+    db::handle_alias(&pool, t, "a", "b").await.unwrap();
+    db::handle_alias(&pool, t, "a", "c").await.unwrap();
+
+    db::handle_delete_person(&pool, t, &created.person_uuid)
+        .await
+        .unwrap();
+
+    for did in &["a", "b", "c"] {
+        let resolved = db::resolve(&pool, t, did).await.unwrap();
+        assert!(
+            resolved.is_none(),
+            "{did} should resolve to None after person delete"
+        );
+    }
+
+    assert_eq!(count_live_person_mappings(&pool, t).await, 0);
+    assert_structural_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn delete_person_team_isolation() {
+    let pool = test_pool().await;
+    let t1 = next_team_id();
+    let t2 = next_team_id();
+
+    let p1 = db::handle_create(&pool, t1, "shared").await.unwrap();
+    let p2 = db::handle_create(&pool, t2, "shared").await.unwrap();
+
+    db::handle_delete_person(&pool, t1, &p1.person_uuid)
+        .await
+        .unwrap();
+
+    let resolved_t1 = db::resolve(&pool, t1, "shared").await.unwrap();
+    assert!(resolved_t1.is_none(), "team1 person should be deleted");
+
+    let resolved_t2 = db::resolve(&pool, t2, "shared").await.unwrap();
+    assert!(resolved_t2.is_some(), "team2 person should be unaffected");
+    assert_eq!(resolved_t2.unwrap().person_uuid, p2.person_uuid);
+
+    assert_structural_invariants(&pool, t1).await;
+    assert_all_invariants(&pool, t2).await;
+}
+
+// ===========================================================================
+// O. /delete_distinct_id
+// ===========================================================================
+
+#[tokio::test]
+async fn delete_did_sole_node() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let created = db::handle_create(&pool, t, "a").await.unwrap();
+    let pid = get_root_person_id(&pool, t, "a").await.unwrap();
+
+    let resp = db::handle_delete_distinct_id(&pool, t, "a").await.unwrap();
+    assert_eq!(resp.distinct_id, "a");
+    assert!(
+        resp.person_deleted,
+        "person should be soft-deleted when last DID removed"
+    );
+
+    assert_eq!(count_distinct_ids(&pool, t).await, 0);
+    assert_eq!(count_union_find(&pool, t).await, 0);
+    assert!(is_person_deleted(&pool, pid).await);
+
+    let resolved = db::resolve(&pool, t, "a").await.unwrap();
+    assert!(resolved.is_none());
+
+    // person_mapping row still exists (soft-deleted)
+    assert!(person_exists(&pool, pid).await);
+    let _ = created;
+
+    assert_structural_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn delete_did_not_found() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let result = db::handle_delete_distinct_id(&pool, t, "ghost").await;
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        DbError::NotFound(_) => {}
+        other => panic!("expected NotFound, got: {other}"),
+    }
+}
+
+#[tokio::test]
+async fn delete_did_leaf() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let created = db::handle_create(&pool, t, "a").await.unwrap();
+    db::handle_alias(&pool, t, "a", "b").await.unwrap();
+
+    // b is the leaf, a is the root
+    let resp = db::handle_delete_distinct_id(&pool, t, "b").await.unwrap();
+    assert_eq!(resp.distinct_id, "b");
+    assert!(
+        !resp.person_deleted,
+        "person should NOT be deleted (a still references it)"
+    );
+
+    let resolved_a = db::resolve(&pool, t, "a").await.unwrap();
+    assert!(resolved_a.is_some());
+    assert_eq!(resolved_a.unwrap().person_uuid, created.person_uuid);
+
+    let resolved_b = db::resolve(&pool, t, "b").await.unwrap();
+    assert!(resolved_b.is_none(), "b should no longer resolve");
+
+    assert_eq!(count_distinct_ids(&pool, t).await, 1);
+    assert_eq!(count_union_find(&pool, t).await, 1);
+
+    assert_all_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn delete_did_root() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let created = db::handle_create(&pool, t, "a").await.unwrap();
+    db::handle_alias(&pool, t, "a", "b").await.unwrap();
+
+    // a is the root, b is the leaf pointing to a
+    // Deleting a should unlink a (b inherits a's person_id) then hard-delete a
+    let resp = db::handle_delete_distinct_id(&pool, t, "a").await.unwrap();
+    assert_eq!(resp.distinct_id, "a");
+    assert!(
+        !resp.person_deleted,
+        "person should NOT be deleted (b inherited root)"
+    );
+
+    let resolved_b = db::resolve(&pool, t, "b").await.unwrap();
+    assert!(resolved_b.is_some(), "b should still resolve");
+    assert_eq!(resolved_b.unwrap().person_uuid, created.person_uuid);
+
+    let resolved_a = db::resolve(&pool, t, "a").await.unwrap();
+    assert!(resolved_a.is_none(), "a should no longer resolve");
+
+    assert_eq!(count_distinct_ids(&pool, t).await, 1);
+    assert_eq!(count_union_find(&pool, t).await, 1);
+
+    let uf_b = get_uf_row(&pool, t, "b").await.unwrap();
+    assert!(uf_b.person_id.is_some(), "b should now be the root");
+    assert!(uf_b.next.is_none());
+
+    assert_all_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn delete_did_mid_chain() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    // Build chain: c -> b -> a (root)
+    let created = db::handle_create(&pool, t, "a").await.unwrap();
+    db::handle_alias(&pool, t, "a", "b").await.unwrap();
+    db::handle_alias(&pool, t, "b", "c").await.unwrap();
+
+    // Delete b (mid-chain) — c should be spliced past b to point at a
+    let resp = db::handle_delete_distinct_id(&pool, t, "b").await.unwrap();
+    assert_eq!(resp.distinct_id, "b");
+    assert!(!resp.person_deleted);
+
+    let resolved_a = db::resolve(&pool, t, "a").await.unwrap().unwrap();
+    assert_eq!(resolved_a.person_uuid, created.person_uuid);
+
+    let resolved_c = db::resolve(&pool, t, "c").await.unwrap().unwrap();
+    assert_eq!(resolved_c.person_uuid, created.person_uuid);
+
+    let resolved_b = db::resolve(&pool, t, "b").await.unwrap();
+    assert!(resolved_b.is_none());
+
+    assert_eq!(count_distinct_ids(&pool, t).await, 2);
+    assert_eq!(count_union_find(&pool, t).await, 2);
+
+    // Verify chain structure: c should now point directly to a
+    let uf_c = get_uf_row(&pool, t, "c").await.unwrap();
+    let uf_a = get_uf_row(&pool, t, "a").await.unwrap();
+    assert_eq!(
+        uf_c.next,
+        Some(uf_a.current),
+        "c should point directly to a after b removed"
+    );
+
+    assert_all_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn delete_did_preserves_siblings() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let created = db::handle_create(&pool, t, "a").await.unwrap();
+    db::handle_merge(&pool, t, "a", &["b".into(), "c".into()])
+        .await
+        .unwrap();
+
+    let resp = db::handle_delete_distinct_id(&pool, t, "b").await.unwrap();
+    assert_eq!(resp.distinct_id, "b");
+    assert!(!resp.person_deleted);
+
+    let resolved_a = db::resolve(&pool, t, "a").await.unwrap().unwrap();
+    assert_eq!(resolved_a.person_uuid, created.person_uuid);
+
+    let resolved_c = db::resolve(&pool, t, "c").await.unwrap().unwrap();
+    assert_eq!(resolved_c.person_uuid, created.person_uuid);
+
+    let resolved_b = db::resolve(&pool, t, "b").await.unwrap();
+    assert!(resolved_b.is_none());
+
+    assert_eq!(count_distinct_ids(&pool, t).await, 2);
+    assert_eq!(count_union_find(&pool, t).await, 2);
+    assert_eq!(count_live_person_mappings(&pool, t).await, 1);
+
+    assert_all_invariants(&pool, t).await;
+}
+
+// ===========================================================================
+// P. Lazy unlink / post-delete recovery
+// ===========================================================================
+
+#[tokio::test]
+async fn create_after_delete_person() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let old = db::handle_create(&pool, t, "a").await.unwrap();
+    db::handle_delete_person(&pool, t, &old.person_uuid)
+        .await
+        .unwrap();
+
+    let new = db::handle_create(&pool, t, "a").await.unwrap();
+    assert_ne!(old.person_uuid, new.person_uuid, "should get a new person");
+
+    let resolved = db::resolve(&pool, t, "a").await.unwrap().unwrap();
+    assert_eq!(resolved.person_uuid, new.person_uuid);
+
+    assert_eq!(count_live_person_mappings(&pool, t).await, 1);
+    assert_structural_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn create_after_delete_person_no_duplicate_rows() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    db::handle_create(&pool, t, "a").await.unwrap();
+    let old_uuid = db::resolve(&pool, t, "a")
+        .await
+        .unwrap()
+        .unwrap()
+        .person_uuid;
+    db::handle_delete_person(&pool, t, &old_uuid).await.unwrap();
+
+    db::handle_create(&pool, t, "a").await.unwrap();
+
+    assert_eq!(
+        count_distinct_ids(&pool, t).await,
+        1,
+        "DID row should be reused, not duplicated"
+    );
+    assert_eq!(
+        count_union_find(&pool, t).await,
+        1,
+        "union_find row should be reused, not duplicated"
+    );
+    assert_eq!(count_live_person_mappings(&pool, t).await, 1);
+
+    assert_structural_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn alias_with_deleted_target() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let pa = db::handle_create(&pool, t, "a").await.unwrap();
+    let pb = db::handle_create(&pool, t, "b").await.unwrap();
+
+    db::handle_delete_person(&pool, t, &pa.person_uuid)
+        .await
+        .unwrap();
+
+    // a is orphaned, b is live → a should attach into b's chain
+    let resp = db::handle_alias(&pool, t, "a", "b").await.unwrap();
+    assert_eq!(resp.person_uuid, pb.person_uuid);
+    assert!(resp.is_identified);
+
+    let resolved_a = db::resolve(&pool, t, "a").await.unwrap().unwrap();
+    assert_eq!(resolved_a.person_uuid, pb.person_uuid);
+
+    let resolved_b = db::resolve(&pool, t, "b").await.unwrap().unwrap();
+    assert_eq!(resolved_b.person_uuid, pb.person_uuid);
+
+    assert_structural_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn alias_with_deleted_source() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let pa = db::handle_create(&pool, t, "a").await.unwrap();
+    let pb = db::handle_create(&pool, t, "b").await.unwrap();
+
+    db::handle_delete_person(&pool, t, &pb.person_uuid)
+        .await
+        .unwrap();
+
+    // a is live, b is orphaned → b should attach into a's chain
+    let resp = db::handle_alias(&pool, t, "a", "b").await.unwrap();
+    assert_eq!(resp.person_uuid, pa.person_uuid);
+    assert!(resp.is_identified);
+
+    let resolved_a = db::resolve(&pool, t, "a").await.unwrap().unwrap();
+    assert_eq!(resolved_a.person_uuid, pa.person_uuid);
+
+    let resolved_b = db::resolve(&pool, t, "b").await.unwrap().unwrap();
+    assert_eq!(resolved_b.person_uuid, pa.person_uuid);
+
+    assert_structural_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn alias_both_deleted() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let pa = db::handle_create(&pool, t, "a").await.unwrap();
+    let pb = db::handle_create(&pool, t, "b").await.unwrap();
+
+    db::handle_delete_person(&pool, t, &pa.person_uuid)
+        .await
+        .unwrap();
+    db::handle_delete_person(&pool, t, &pb.person_uuid)
+        .await
+        .unwrap();
+
+    // Both orphaned → new person created, both DIDs reused
+    let resp = db::handle_alias(&pool, t, "a", "b").await.unwrap();
+    assert_ne!(resp.person_uuid, pa.person_uuid);
+    assert_ne!(resp.person_uuid, pb.person_uuid);
+    assert!(resp.is_identified);
+
+    let resolved_a = db::resolve(&pool, t, "a").await.unwrap().unwrap();
+    assert_eq!(resolved_a.person_uuid, resp.person_uuid);
+
+    let resolved_b = db::resolve(&pool, t, "b").await.unwrap().unwrap();
+    assert_eq!(resolved_b.person_uuid, resp.person_uuid);
+
+    assert_eq!(
+        count_distinct_ids(&pool, t).await,
+        2,
+        "DID rows should be reused"
+    );
+    assert_eq!(count_live_person_mappings(&pool, t).await, 1);
+
+    assert_structural_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn merge_with_deleted_target() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let pa = db::handle_create(&pool, t, "a").await.unwrap();
+    db::handle_delete_person(&pool, t, &pa.person_uuid)
+        .await
+        .unwrap();
+
+    // Target orphaned → should create new person for a, then link b
+    let resp = db::handle_merge(&pool, t, "a", &["b".into()])
+        .await
+        .unwrap();
+    assert_ne!(resp.person_uuid, pa.person_uuid);
+    assert!(resp.is_identified);
+
+    let resolved_a = db::resolve(&pool, t, "a").await.unwrap().unwrap();
+    assert_eq!(resolved_a.person_uuid, resp.person_uuid);
+
+    let resolved_b = db::resolve(&pool, t, "b").await.unwrap().unwrap();
+    assert_eq!(resolved_b.person_uuid, resp.person_uuid);
+
+    assert_structural_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn merge_with_deleted_source() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let pa = db::handle_create(&pool, t, "a").await.unwrap();
+    let pb = db::handle_create(&pool, t, "b").await.unwrap();
+
+    db::handle_delete_person(&pool, t, &pb.person_uuid)
+        .await
+        .unwrap();
+
+    // b is orphaned → should be linked into a's chain
+    let resp = db::handle_merge(&pool, t, "a", &["b".into()])
+        .await
+        .unwrap();
+    assert_eq!(resp.person_uuid, pa.person_uuid);
+    assert!(resp.is_identified);
+
+    let resolved_b = db::resolve(&pool, t, "b").await.unwrap().unwrap();
+    assert_eq!(resolved_b.person_uuid, pa.person_uuid);
+
+    assert_structural_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn resolve_after_delete_person() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let created = db::handle_create(&pool, t, "a").await.unwrap();
+    db::handle_delete_person(&pool, t, &created.person_uuid)
+        .await
+        .unwrap();
+
+    let resolved = db::resolve(&pool, t, "a").await.unwrap();
+    assert!(
+        resolved.is_none(),
+        "resolve should return None for deleted person"
+    );
+}
+
+// ===========================================================================
+// Q. Cross-operation delete workflows
+// ===========================================================================
+
+#[tokio::test]
+async fn delete_person_then_full_lifecycle() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let old = db::handle_create(&pool, t, "a").await.unwrap();
+    db::handle_alias(&pool, t, "a", "b").await.unwrap();
+
+    db::handle_delete_person(&pool, t, &old.person_uuid)
+        .await
+        .unwrap();
+
+    // Re-create a (lazy unlink), then alias with c
+    let new = db::handle_create(&pool, t, "a").await.unwrap();
+    assert_ne!(old.person_uuid, new.person_uuid);
+
+    db::handle_alias(&pool, t, "a", "c").await.unwrap();
+
+    let resolved_a = db::resolve(&pool, t, "a").await.unwrap().unwrap();
+    let resolved_c = db::resolve(&pool, t, "c").await.unwrap().unwrap();
+    assert_eq!(resolved_a.person_uuid, new.person_uuid);
+    assert_eq!(resolved_c.person_uuid, new.person_uuid);
+
+    assert_eq!(count_live_person_mappings(&pool, t).await, 1);
+    assert_structural_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn delete_did_then_recreate() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let pa = db::handle_create(&pool, t, "a").await.unwrap();
+    db::handle_alias(&pool, t, "a", "b").await.unwrap();
+
+    // Hard-delete b's DID
+    db::handle_delete_distinct_id(&pool, t, "b").await.unwrap();
+
+    // b is now fully gone — create(b) should get a fresh person
+    let pb = db::handle_create(&pool, t, "b").await.unwrap();
+    assert_ne!(pa.person_uuid, pb.person_uuid, "b should be a new person");
+
+    let resolved_a = db::resolve(&pool, t, "a").await.unwrap().unwrap();
+    let resolved_b = db::resolve(&pool, t, "b").await.unwrap().unwrap();
+    assert_eq!(resolved_a.person_uuid, pa.person_uuid);
+    assert_eq!(resolved_b.person_uuid, pb.person_uuid);
+
+    assert_all_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn delete_person_merge_recovery() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let pa = db::handle_create(&pool, t, "a").await.unwrap();
+    let pb = db::handle_create(&pool, t, "b").await.unwrap();
+    db::handle_alias(&pool, t, "a", "c").await.unwrap();
+
+    // Delete a's person (a and c become orphaned)
+    db::handle_delete_person(&pool, t, &pa.person_uuid)
+        .await
+        .unwrap();
+
+    // Merge orphaned a and c into live b
+    let resp = db::handle_merge(&pool, t, "b", &["a".into(), "c".into()])
+        .await
+        .unwrap();
+    assert_eq!(resp.person_uuid, pb.person_uuid);
+    assert!(resp.is_identified);
+
+    for did in &["a", "b", "c"] {
+        let resolved = db::resolve(&pool, t, did).await.unwrap().unwrap();
+        assert_eq!(
+            resolved.person_uuid, pb.person_uuid,
+            "{did} should resolve to b's person after merge recovery"
+        );
+    }
+
+    assert_structural_invariants(&pool, t).await;
+}
+
+// ===========================================================================
+// R. Unique person_id invariant — root unlink with multiple parents
+// ===========================================================================
+
+#[tokio::test]
+async fn delete_did_root_with_multiple_parents() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    // Build fan-out: A -> R, B -> R, C -> R  (R is root)
+    let created = db::handle_create(&pool, t, "r").await.unwrap();
+    db::handle_alias(&pool, t, "r", "a").await.unwrap();
+    db::handle_alias(&pool, t, "r", "b").await.unwrap();
+    db::handle_alias(&pool, t, "r", "c").await.unwrap();
+
+    let pid_before = get_root_person_id(&pool, t, "r").await.unwrap();
+
+    // Delete the root distinct_id
+    let resp = db::handle_delete_distinct_id(&pool, t, "r").await.unwrap();
+    assert_eq!(resp.distinct_id, "r");
+    assert!(
+        !resp.person_deleted,
+        "person should survive via promoted parent"
+    );
+
+    // r should no longer resolve
+    let resolved_r = db::resolve(&pool, t, "r").await.unwrap();
+    assert!(resolved_r.is_none());
+
+    // All remaining distinct_ids should resolve to the same person
+    let resolved_a = db::resolve(&pool, t, "a").await.unwrap().unwrap();
+    let resolved_b = db::resolve(&pool, t, "b").await.unwrap().unwrap();
+    let resolved_c = db::resolve(&pool, t, "c").await.unwrap().unwrap();
+    assert_eq!(resolved_a.person_uuid, created.person_uuid);
+    assert_eq!(resolved_b.person_uuid, created.person_uuid);
+    assert_eq!(resolved_c.person_uuid, created.person_uuid);
+
+    // Exactly one root should exist with the original person_id
+    let roots: Vec<(i64,)> = sqlx::query_as(
+        "SELECT current FROM union_find \
+         WHERE team_id = $1 AND person_id = $2",
+    )
+    .bind(t)
+    .bind(pid_before)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(roots.len(), 1, "exactly one root should hold the person_id");
+
+    assert_eq!(count_distinct_ids(&pool, t).await, 3);
+    assert_eq!(count_union_find(&pool, t).await, 3);
+    assert_eq!(count_live_person_mappings(&pool, t).await, 1);
+
+    assert_all_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn delete_did_root_with_multiple_parents_and_chain() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    // Build: D -> A -> R (root), B -> R, C -> R
+    let created = db::handle_create(&pool, t, "r").await.unwrap();
+    db::handle_alias(&pool, t, "r", "a").await.unwrap();
+    db::handle_alias(&pool, t, "a", "d").await.unwrap();
+    db::handle_alias(&pool, t, "r", "b").await.unwrap();
+    db::handle_alias(&pool, t, "r", "c").await.unwrap();
+
+    // Delete the root
+    let resp = db::handle_delete_distinct_id(&pool, t, "r").await.unwrap();
+    assert_eq!(resp.distinct_id, "r");
+    assert!(!resp.person_deleted);
+
+    // All remaining distinct_ids should resolve to the same person
+    for did in &["a", "b", "c", "d"] {
+        let resolved = db::resolve(&pool, t, did).await.unwrap().unwrap();
+        assert_eq!(
+            resolved.person_uuid, created.person_uuid,
+            "{did} should resolve to original person after root deletion"
+        );
+    }
+
+    // D's chain should still work (D -> A -> ... -> new root)
+    let chain_d = walk_chain(&pool, t, "d").await;
+    assert!(
+        chain_d.len() >= 2,
+        "d should traverse at least 2 nodes to reach root"
+    );
+    assert!(
+        chain_d.last().unwrap().person_id.is_some(),
+        "chain should terminate at a root"
+    );
+
+    assert_eq!(count_distinct_ids(&pool, t).await, 4);
+    assert_eq!(count_union_find(&pool, t).await, 4);
+
+    assert_all_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn delete_did_root_no_parents() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let created = db::handle_create(&pool, t, "solo").await.unwrap();
+    let pid = get_root_person_id(&pool, t, "solo").await.unwrap();
+
+    let resp = db::handle_delete_distinct_id(&pool, t, "solo")
+        .await
+        .unwrap();
+    assert_eq!(resp.distinct_id, "solo");
+    assert!(
+        resp.person_deleted,
+        "person should be soft-deleted when last DID removed"
+    );
+
+    assert_eq!(count_distinct_ids(&pool, t).await, 0);
+    assert_eq!(count_union_find(&pool, t).await, 0);
+    assert!(is_person_deleted(&pool, pid).await);
+
+    let resolved = db::resolve(&pool, t, "solo").await.unwrap();
+    assert!(resolved.is_none());
+
+    let _ = created;
+    assert_structural_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn unlink_root_after_delete_person() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    // Build chain: B -> A (root, person P1)
+    let pa = db::handle_create(&pool, t, "a").await.unwrap();
+    db::handle_alias(&pool, t, "a", "b").await.unwrap();
+
+    // Soft-delete the person
+    db::handle_delete_person(&pool, t, &pa.person_uuid)
+        .await
+        .unwrap();
+
+    // Both a and b should resolve to None now (person is soft-deleted)
+    assert!(db::resolve(&pool, t, "a").await.unwrap().is_none());
+    assert!(db::resolve(&pool, t, "b").await.unwrap().is_none());
+
+    // Trigger check_did on "b" by re-creating it — this should lazily unlink b
+    // from the dead chain and give it a fresh person.
+    let new_b = db::handle_create(&pool, t, "b").await.unwrap();
+    assert_ne!(new_b.person_uuid, pa.person_uuid);
+
+    let resolved_b = db::resolve(&pool, t, "b").await.unwrap().unwrap();
+    assert_eq!(resolved_b.person_uuid, new_b.person_uuid);
+
+    // a is still orphaned (part of the dead chain)
+    assert!(db::resolve(&pool, t, "a").await.unwrap().is_none());
+
+    // Now trigger check_did on "a" by re-creating it
+    let new_a = db::handle_create(&pool, t, "a").await.unwrap();
+    assert_ne!(new_a.person_uuid, pa.person_uuid);
+
+    let resolved_a = db::resolve(&pool, t, "a").await.unwrap().unwrap();
+    assert_eq!(resolved_a.person_uuid, new_a.person_uuid);
+
+    assert_structural_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn unlink_root_with_fan_out_after_delete_person() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    // Build fan-out: A -> R, B -> R, C -> R  (R is root)
+    let pr = db::handle_create(&pool, t, "r").await.unwrap();
+    db::handle_alias(&pool, t, "r", "a").await.unwrap();
+    db::handle_alias(&pool, t, "r", "b").await.unwrap();
+    db::handle_alias(&pool, t, "r", "c").await.unwrap();
+
+    // Soft-delete the person
+    db::handle_delete_person(&pool, t, &pr.person_uuid)
+        .await
+        .unwrap();
+
+    // All should resolve to None
+    for did in &["r", "a", "b", "c"] {
+        assert!(
+            db::resolve(&pool, t, did).await.unwrap().is_none(),
+            "{did} should resolve to None after person delete"
+        );
+    }
+
+    // Trigger lazy unlink on "a" via create — the root R is soft-deleted,
+    // so check_did should unlink "a" and give it a fresh person.
+    let new_a = db::handle_create(&pool, t, "a").await.unwrap();
+    assert_ne!(new_a.person_uuid, pr.person_uuid);
+
+    let resolved_a = db::resolve(&pool, t, "a").await.unwrap().unwrap();
+    assert_eq!(resolved_a.person_uuid, new_a.person_uuid);
+
+    // The uniqueness invariant should still hold even though we're in the
+    // middle of lazily cleaning up the soft-deleted chain.
+    assert_structural_invariants(&pool, t).await;
 }

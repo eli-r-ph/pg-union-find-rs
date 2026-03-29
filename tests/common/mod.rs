@@ -69,12 +69,13 @@ pub struct UfRow {
     pub current: i64,
     pub next: Option<i64>,
     pub person_id: Option<i64>,
+    pub is_deleted: bool,
 }
 
 /// Return the union_find row for a given distinct_id string.
 pub async fn get_uf_row(pool: &PgPool, team_id: i64, distinct_id: &str) -> Option<UfRow> {
-    sqlx::query_as::<_, (i64, Option<i64>, Option<i64>)>(
-        "SELECT uf.current, uf.next, uf.person_id \
+    sqlx::query_as::<_, (i64, Option<i64>, Option<i64>, bool)>(
+        "SELECT uf.current, uf.next, uf.person_id, (uf.deleted_at IS NOT NULL) \
          FROM union_find uf \
          JOIN distinct_id_mappings d ON d.id = uf.current \
          WHERE d.team_id = $1 AND d.distinct_id = $2 AND uf.team_id = $1",
@@ -84,10 +85,11 @@ pub async fn get_uf_row(pool: &PgPool, team_id: i64, distinct_id: &str) -> Optio
     .fetch_optional(pool)
     .await
     .unwrap()
-    .map(|(current, next, person_id)| UfRow {
+    .map(|(current, next, person_id, is_deleted)| UfRow {
         current,
         next,
         person_id,
+        is_deleted,
     })
 }
 
@@ -110,8 +112,8 @@ pub async fn walk_chain(pool: &PgPool, team_id: i64, distinct_id: &str) -> Vec<U
     };
 
     for _ in 0..1001 {
-        let row = sqlx::query_as::<_, (i64, Option<i64>, Option<i64>)>(
-            "SELECT current, next, person_id FROM union_find \
+        let row = sqlx::query_as::<_, (i64, Option<i64>, Option<i64>, bool)>(
+            "SELECT current, next, person_id, (deleted_at IS NOT NULL) FROM union_find \
              WHERE team_id = $1 AND current = $2",
         )
         .bind(team_id)
@@ -121,12 +123,13 @@ pub async fn walk_chain(pool: &PgPool, team_id: i64, distinct_id: &str) -> Vec<U
         .unwrap();
 
         match row {
-            Some((current, next, person_id)) => {
+            Some((current, next, person_id, is_deleted)) => {
                 let is_root = person_id.is_some();
                 chain.push(UfRow {
                     current,
                     next,
                     person_id,
+                    is_deleted,
                 });
                 if is_root {
                     break;
@@ -176,6 +179,28 @@ pub async fn is_person_identified(pool: &PgPool, person_id: i64) -> bool {
 pub async fn person_exists(pool: &PgPool, person_id: i64) -> bool {
     sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM person_mapping WHERE person_id = $1)",
+    )
+    .bind(person_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// Count only live (non-soft-deleted) person_mapping rows for a team.
+pub async fn count_live_person_mappings(pool: &PgPool, team_id: i64) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM person_mapping WHERE team_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(team_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// Check if a person_mapping row is soft-deleted.
+pub async fn is_person_deleted(pool: &PgPool, person_id: i64) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT deleted_at IS NOT NULL FROM person_mapping WHERE person_id = $1",
     )
     .bind(person_id)
     .fetch_one(pool)
@@ -259,10 +284,69 @@ pub async fn assert_did_refs_valid(pool: &PgPool, team_id: i64) {
     );
 }
 
-/// Run all graph invariant checks for a team.
-pub async fn assert_all_invariants(pool: &PgPool, team_id: i64) {
+/// No union_find or person_mapping rows should have deleted_at set.
+/// Use this to catch normal operations accidentally soft-deleting rows.
+pub async fn assert_no_deleted_rows(pool: &PgPool, team_id: i64) {
+    let bad_uf: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM union_find \
+         WHERE team_id = $1 AND deleted_at IS NOT NULL",
+    )
+    .bind(team_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        bad_uf, 0,
+        "found {bad_uf} union_find rows with unexpected deleted_at"
+    );
+
+    let bad_pm: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM person_mapping \
+         WHERE team_id = $1 AND deleted_at IS NOT NULL",
+    )
+    .bind(team_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        bad_pm, 0,
+        "found {bad_pm} person_mapping rows with unexpected deleted_at"
+    );
+}
+
+/// Each person_id must appear at most once in union_find (per team).
+pub async fn assert_unique_person_ids(pool: &PgPool, team_id: i64) {
+    let bad: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM (\
+           SELECT person_id FROM union_find \
+           WHERE team_id = $1 AND person_id IS NOT NULL \
+           GROUP BY person_id HAVING COUNT(*) > 1\
+         ) AS dupes",
+    )
+    .bind(team_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        bad, 0,
+        "found {bad} person_ids appearing in multiple union_find rows"
+    );
+}
+
+/// Structural graph invariant checks only. Safe to call after delete operations
+/// that legitimately leave soft-deleted rows.
+pub async fn assert_structural_invariants(pool: &PgPool, team_id: i64) {
     assert_roots_have_null_next(pool, team_id).await;
     assert_non_roots_have_next(pool, team_id).await;
     assert_person_refs_valid(pool, team_id).await;
     assert_did_refs_valid(pool, team_id).await;
+    assert_unique_person_ids(pool, team_id).await;
+}
+
+/// Run all graph invariant checks for a team, including that no rows are
+/// soft-deleted. Use this in tests that do NOT involve delete operations.
+/// For tests that involve deletions, use assert_structural_invariants instead.
+pub async fn assert_all_invariants(pool: &PgPool, team_id: i64) {
+    assert_structural_invariants(pool, team_id).await;
+    assert_no_deleted_rows(pool, team_id).await;
 }
