@@ -410,9 +410,9 @@ pub async fn identify_tx(
     conn: &mut PgConnection,
     team_id: i64,
     distinct_id: &str,
-) -> DbResult<String> {
+) -> DbResult<ResolvedPerson> {
     match check_did(&mut *conn, team_id, distinct_id).await? {
-        DidState::Live(_pk, resolved) => Ok(resolved.person_uuid),
+        DidState::Live(_pk, resolved) => Ok(resolved),
 
         DidState::NotFound => {
             let person_uuid = Uuid::new_v4().to_string();
@@ -445,7 +445,11 @@ pub async fn identify_tx(
             .execute(&mut *conn)
             .await?;
 
-            Ok(person_uuid)
+            Ok(ResolvedPerson {
+                person_uuid,
+                person_id,
+                is_identified: false,
+            })
         }
 
         DidState::Orphaned(did_pk) => {
@@ -462,7 +466,11 @@ pub async fn identify_tx(
 
             root_did(&mut *conn, team_id, did_pk, person_id).await?;
 
-            Ok(person_uuid)
+            Ok(ResolvedPerson {
+                person_uuid,
+                person_id,
+                is_identified: false,
+            })
         }
     }
 }
@@ -546,10 +554,7 @@ pub async fn handle_create(
 ) -> DbResult<CreateResponse> {
     validate_distinct_id(distinct_id)?;
     let mut tx = pool.begin().await?;
-    identify_tx(&mut tx, team_id, distinct_id).await?;
-    let resolved = resolve_tx(&mut tx, team_id, distinct_id)
-        .await?
-        .ok_or_else(|| DbError::Internal("just created but can't resolve".into()))?;
+    let resolved = identify_tx(&mut tx, team_id, distinct_id).await?;
     tx.commit().await?;
     Ok(CreateResponse {
         person_uuid: resolved.person_uuid,
@@ -603,14 +608,11 @@ pub async fn handle_alias(
 
     if target == source {
         let mut tx = pool.begin().await?;
-        let person_uuid = identify_tx(&mut tx, team_id, target).await?;
-        let resolved = resolve_tx(&mut tx, team_id, target)
-            .await?
-            .ok_or_else(|| DbError::Internal("just created but can't resolve".into()))?;
+        let resolved = identify_tx(&mut tx, team_id, target).await?;
         set_identified(&mut tx, resolved.person_id).await?;
         tx.commit().await?;
         return Ok(AliasResponse {
-            person_uuid,
+            person_uuid: resolved.person_uuid,
             is_identified: true,
         });
     }
