@@ -228,6 +228,44 @@ async fn seed_batch(pool: &PgPool, items: &[(i64, String)]) {
     tx.commit().await.expect("commit seed batch");
 }
 
+async fn seed_parallel(pool: &PgPool, pairs: &[(i64, String)]) {
+    let mut set = tokio::task::JoinSet::new();
+    for chunk in pairs.chunks(SEED_TX_BATCH) {
+        let pool = pool.clone();
+        let chunk: Vec<(i64, String)> = chunk.to_vec();
+        set.spawn(async move { seed_batch(&pool, &chunk).await });
+    }
+    while let Some(result) = set.join_next().await {
+        result.expect("seed task panicked");
+    }
+}
+
+/// Like seed_parallel but returns (team_id, person_uuid) for each seeded row.
+async fn seed_parallel_with_uuids(pool: &PgPool, pairs: &[(i64, String)]) -> Vec<(i64, String)> {
+    let mut set = tokio::task::JoinSet::new();
+    for chunk in pairs.chunks(SEED_TX_BATCH) {
+        let pool = pool.clone();
+        let chunk: Vec<(i64, String)> = chunk.to_vec();
+        set.spawn(async move {
+            let mut results = Vec::with_capacity(chunk.len());
+            let mut tx = pool.begin().await.expect("begin tx");
+            for (team_id, did) in &chunk {
+                let resolved = db::identify_tx(&mut tx, *team_id, did)
+                    .await
+                    .expect("identify_tx in seed batch");
+                results.push((*team_id, resolved.person_uuid));
+            }
+            tx.commit().await.expect("commit seed batch");
+            results
+        });
+    }
+    let mut all_results = Vec::with_capacity(pairs.len());
+    while let Some(result) = set.join_next().await {
+        all_results.extend(result.expect("seed task panicked"));
+    }
+    all_results
+}
+
 // ---------------------------------------------------------------------------
 // Phase 1: warm-up — create N persons distributed round-robin across teams.
 // ---------------------------------------------------------------------------
@@ -253,19 +291,17 @@ async fn phase_warm(pool: &PgPool, n: usize, team_ids: &[i64]) -> WarmupResult {
         .map(|i| (team_ids[i % team_ids.len()], format!("primary-{i}")))
         .collect();
 
-    for chunk in pairs.chunks(SEED_TX_BATCH) {
-        seed_batch(pool, chunk).await;
+    seed_parallel(pool, &pairs).await;
 
-        for (team_id, did) in chunk {
-            all_targets.push(ScopedId {
-                team_id: *team_id,
-                distinct_id: did.clone(),
-            });
-            targets_by_team
-                .entry(*team_id)
-                .or_default()
-                .push(did.clone());
-        }
+    for (team_id, did) in &pairs {
+        all_targets.push(ScopedId {
+            team_id: *team_id,
+            distinct_id: did.clone(),
+        });
+        targets_by_team
+            .entry(*team_id)
+            .or_default()
+            .push(did.clone());
     }
 
     let elapsed = t0.elapsed();
@@ -530,11 +566,9 @@ async fn phase_merge(
     let n_ops = pregen.ops.len();
     println!("Phase 3: merging {n} distinct_ids in {n_ops} batches via POST /merge...");
 
-    println!("  seeding {n} merge distinct_ids (tx batch {SEED_TX_BATCH})...");
+    println!("  seeding {n} merge distinct_ids (parallel, tx batch {SEED_TX_BATCH})...");
     let t_pre = Instant::now();
-    for chunk in pregen.seed_pairs.chunks(SEED_TX_BATCH) {
-        seed_batch(pool, chunk).await;
-    }
+    seed_parallel(pool, &pregen.seed_pairs).await;
     println!("  seeded in {:.2?}", t_pre.elapsed());
 
     let url = format!("{base_url}/merge");
@@ -730,14 +764,12 @@ async fn phase_delete_distinct_id(
 ) {
     println!("Phase 5: benchmarking {n} POST /delete_distinct_id calls...");
 
-    println!("  seeding {n} distinct_ids for deletion...");
+    println!("  seeding {n} distinct_ids for deletion (parallel)...");
     let t_pre = Instant::now();
     let pairs: Vec<(i64, String)> = (0..n)
         .map(|i| (team_ids[i % team_ids.len()], format!("del-did-{i}")))
         .collect();
-    for chunk in pairs.chunks(SEED_TX_BATCH) {
-        seed_batch(pool, chunk).await;
-    }
+    seed_parallel(pool, &pairs).await;
     println!("  seeded in {:.2?}", t_pre.elapsed());
 
     let url = format!("{base_url}/delete_distinct_id");
@@ -778,23 +810,12 @@ async fn phase_delete_person(
 ) {
     println!("Phase 6: benchmarking {n} POST /delete_person calls...");
 
-    println!("  seeding {n} persons for deletion...");
+    println!("  seeding {n} persons for deletion (parallel)...");
     let t_pre = Instant::now();
-    let mut delete_targets: Vec<(i64, String)> = Vec::with_capacity(n);
-
     let pairs: Vec<(i64, String)> = (0..n)
         .map(|i| (team_ids[i % team_ids.len()], format!("del-person-{i}")))
         .collect();
-    for chunk in pairs.chunks(SEED_TX_BATCH) {
-        let mut tx = pool.begin().await.expect("begin tx");
-        for (team_id, did) in chunk {
-            let resolved = db::identify_tx(&mut tx, *team_id, did)
-                .await
-                .expect("identify_tx for delete_person seed");
-            delete_targets.push((*team_id, resolved.person_uuid));
-        }
-        tx.commit().await.expect("commit seed batch");
-    }
+    let delete_targets = seed_parallel_with_uuids(pool, &pairs).await;
     println!("  seeded in {:.2?}", t_pre.elapsed());
 
     let url = format!("{base_url}/delete_person");
