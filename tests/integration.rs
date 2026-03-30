@@ -546,20 +546,16 @@ async fn merge_multiple_sources() {
     assert!(resp.is_identified);
 
     assert_chain_is_root(&pool, t, "a", &person_a.person_uuid).await;
-    for did in &["b", "c", "brand-new"] {
-        let chain = collect_chain(&pool, t, did).await;
-        assert!(!chain.is_empty(), "{did} chain should not be empty");
-        assert_eq!(
-            chain.last().unwrap().distinct_id,
-            "a",
-            "{did} chain should terminate at root 'a'"
-        );
-        let resolved = db::resolve(&pool, t, did).await.unwrap().unwrap();
-        assert_eq!(
-            resolved.person_uuid, person_a.person_uuid,
-            "failed for {did}"
-        );
-    }
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &person_a.person_uuid).await;
+    assert_chain_matches(&pool, t, "c", &["c", "a"], &person_a.person_uuid).await;
+    assert_chain_matches(
+        &pool,
+        t,
+        "brand-new",
+        &["brand-new", "a"],
+        &person_a.person_uuid,
+    )
+    .await;
 
     assert_all_invariants(&pool, t).await;
 }
@@ -1853,14 +1849,8 @@ async fn delete_person_merge_recovery() {
     assert!(resp.is_identified);
 
     assert_chain_is_root(&pool, t, "b", &pb.person_uuid).await;
-    for did in &["a", "c"] {
-        let chain = collect_chain(&pool, t, did).await;
-        assert_eq!(
-            chain.last().unwrap().distinct_id,
-            "b",
-            "{did} chain should terminate at root 'b'"
-        );
-    }
+    assert_chain_matches(&pool, t, "a", &["a", "b"], &pb.person_uuid).await;
+    assert_chain_matches(&pool, t, "c", &["c", "b"], &pb.person_uuid).await;
 
     assert_structural_invariants(&pool, t).await;
 }
@@ -1976,6 +1966,10 @@ async fn delete_did_root_with_multiple_parents_and_chain() {
     assert!(
         chain_d.len() >= 2,
         "d should traverse at least 2 nodes to reach root"
+    );
+    assert_eq!(
+        chain_d[1].distinct_id, "a",
+        "d's second link should still be 'a' (d -> a link was never disrupted)"
     );
 
     assert_eq!(count_distinct_ids(&pool, t).await, 4);
