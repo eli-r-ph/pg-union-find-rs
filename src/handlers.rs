@@ -12,6 +12,8 @@ use crate::models::{
     DeletePersonRequest, IdentifyRequest, MergeRequest, ResolveRequest, ResolveResponse,
 };
 
+const ENQUEUE_TIMEOUT: Duration = Duration::from_millis(100);
+
 #[derive(Clone)]
 pub struct AppState {
     pub workers: Arc<[mpsc::Sender<DbOp>]>,
@@ -26,6 +28,22 @@ impl AppState {
     }
 }
 
+async fn enqueue_op(sender: &mpsc::Sender<DbOp>, op: DbOp) -> Result<(), axum::response::Response> {
+    match tokio::time::timeout(ENQUEUE_TIMEOUT, sender.send(op)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "worker unavailable"})),
+        )
+            .into_response()),
+        Err(_) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "queue full"})),
+        )
+            .into_response()),
+    }
+}
+
 fn enqueue_compress(state: &AppState, team_id: i64, hint: CompressHint) {
     let sender = state.sender_for(team_id).clone();
     tokio::spawn(async move {
@@ -37,7 +55,7 @@ fn enqueue_compress(state: &AppState, team_id: i64, hint: CompressHint) {
                 depth: hint.depth,
                 reply: reply_tx,
             };
-            match tokio::time::timeout(Duration::from_millis(100), sender.send(op)).await {
+            match tokio::time::timeout(ENQUEUE_TIMEOUT, sender.send(op)).await {
                 Ok(Ok(())) => return,
                 Ok(Err(_)) => {
                     tracing::error!(
@@ -82,12 +100,8 @@ pub async fn create(
         reply: reply_tx,
     };
 
-    if state.sender_for(team_id).send(op).await.is_err() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "worker unavailable"})),
-        )
-            .into_response();
+    if let Err(resp) = enqueue_op(state.sender_for(team_id), op).await {
+        return resp;
     }
 
     match reply_rx.await {
@@ -119,12 +133,8 @@ pub async fn identify(
         reply: reply_tx,
     };
 
-    if state.sender_for(team_id).send(op).await.is_err() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "worker unavailable"})),
-        )
-            .into_response();
+    if let Err(resp) = enqueue_op(state.sender_for(team_id), op).await {
+        return resp;
     }
 
     match reply_rx.await {
@@ -161,12 +171,8 @@ pub async fn alias(
         reply: reply_tx,
     };
 
-    if state.sender_for(team_id).send(op).await.is_err() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "worker unavailable"})),
-        )
-            .into_response();
+    if let Err(resp) = enqueue_op(state.sender_for(team_id), op).await {
+        return resp;
     }
 
     match reply_rx.await {
@@ -203,12 +209,8 @@ pub async fn merge(
         reply: reply_tx,
     };
 
-    if state.sender_for(team_id).send(op).await.is_err() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "worker unavailable"})),
-        )
-            .into_response();
+    if let Err(resp) = enqueue_op(state.sender_for(team_id), op).await {
+        return resp;
     }
 
     match reply_rx.await {
@@ -255,12 +257,8 @@ pub async fn delete_person(
         reply: reply_tx,
     };
 
-    if state.sender_for(team_id).send(op).await.is_err() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "worker unavailable"})),
-        )
-            .into_response();
+    if let Err(resp) = enqueue_op(state.sender_for(team_id), op).await {
+        return resp;
     }
 
     match reply_rx.await {
@@ -291,12 +289,8 @@ pub async fn delete_distinct_id(
         reply: reply_tx,
     };
 
-    if state.sender_for(team_id).send(op).await.is_err() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "worker unavailable"})),
-        )
-            .into_response();
+    if let Err(resp) = enqueue_op(state.sender_for(team_id), op).await {
+        return resp;
     }
 
     match reply_rx.await {

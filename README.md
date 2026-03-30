@@ -43,13 +43,17 @@ cargo run --release
 
 ## Benchmark
 
-```bash
-# Reset DB and run the benchmark directly:
-bin/reset-db.sh
-cargo run --release --bin bench
+The benchmark sends parallel HTTP requests to a running server instance. State is
+pre-seeded via direct DB calls; timed sections measure full-stack server throughput.
 
-# Or use the full bootstrap script (tears down Docker, rebuilds, runs):
+```bash
+# Full bootstrap: tears down Docker, rebuilds, starts server, runs benchmarks:
 bin/run-bench.sh
+
+# Or manually: reset DB, start the server, run the benchmark client:
+bin/reset-db.sh
+cargo run --release &
+cargo run --release --bin bench
 ```
 
 Tunable via env vars (defaults in parentheses):
@@ -58,9 +62,14 @@ Tunable via env vars (defaults in parentheses):
 |---------|---------|-------------|
 | `BENCH_TEAMS` | auto (N_WARM/1000) | Number of team_ids |
 | `BENCH_WARM` | 100,000 | Phase 1 person count |
+| `BENCH_CREATE` | 50,000 | Phase 1b create count |
 | `BENCH_ALIAS` | 100,000 | Phase 2 alias count |
 | `BENCH_MERGE` | 100,000 | Phase 3 merge distinct_id count |
 | `BENCH_BATCH` | 10 | Phase 3 sub-batch size |
 | `BENCH_CHAIN_DEPTH` | 100 | Phase 3b max union_find chain depth |
 | `BENCH_READS` | 1,000,000 | Phase 4 read count |
-| `BENCH_DB_POOL` | 50 | Max DB connections |
+| `BENCH_DELETE_DID` | 10,000 | Phase 5 delete_distinct_id count |
+| `BENCH_DELETE_PERSON` | 10,000 | Phase 6 delete_person count |
+| `BENCH_DB_POOL` | 50 | Max DB connections (seeding) |
+| `BENCH_CONCURRENCY` | 50 | Max parallel HTTP requests |
+| `BENCH_BASE_URL` | http://127.0.0.1:3000 | Server base URL |

@@ -7,8 +7,25 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: union_find
+    shm_size: '512m'
     command:
       - postgres
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - effective_cache_size=512MB
+      - -c
+      - work_mem=8MB
+      - -c
+      - maintenance_work_mem=64MB
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=200
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - wal_buffers=16MB
       - -c
       - wal_compression=lz4
       - -c
@@ -17,6 +34,8 @@ services:
       - commit_siblings=5
       - -c
       - max_connections=200
+      - -c
+      - max_wal_size=1GB
     volumes:
       - pgdata:/var/lib/postgresql/data
 

@@ -1,35 +1,46 @@
 //! Benchmark harness for the union-find service.
 //!
-//! Exercises the DB layer directly (no HTTP overhead) through five phases:
+//! Sends parallel HTTP requests to a running server instance and measures
+//! throughput and latency. State is pre-seeded via direct DB calls so the
+//! timed sections only measure server performance under concurrent load.
 //!
-//!   Phase 1  — Warm-up:  batch-seed N_WARM persons via identify_tx across N_TEAMS
-//!   Phase 1b — Create:   benchmark N_CREATE individual handle_create calls (80% new, 20% existing)
-//!   Phase 2  — Alias:    run N_ALIAS alias ops (85% Case 1a, 5% Case 2a, 5% target==source, 5% Case 3)
-//!   Phase 3  — Merge:    seed N_MERGE distinct_ids, then merge in sub-batches
-//!   Phase 3b — Deepen:   merge targets into each other for realistic chain depths
-//!   Phase 4  — Read:     resolve N_READS random distinct_ids through union_find chains
+//!   Phase 1  — Warm-up:  batch-seed N_WARM persons via identify_tx across N_TEAMS (DB-direct, untimed)
+//!   Phase 1b — Create:   benchmark N_CREATE individual POST /create calls (80% new, 20% existing)
+//!   Phase 2  — Alias:    run N_ALIAS alias ops via POST /alias (mixed cases)
+//!   Phase 3  — Merge:    seed N_MERGE distinct_ids, then merge in sub-batches via POST /merge
+//!   Phase 3b — Deepen:   merge targets into each other for realistic chain depths (DB-direct, untimed)
+//!   Phase 4  — Read:     resolve N_READS random distinct_ids via POST /resolve
+//!   Phase 5  — Delete distinct_id: benchmark N delete_distinct_id calls via POST /delete_distinct_id
+//!   Phase 6  — Delete person: benchmark N delete_person calls via POST /delete_person
 //!
 //! Tune via env vars (defaults in parentheses):
-//!   BENCH_TEAMS       (auto: N_WARM/1000) — number of team_ids to distribute across
-//!   BENCH_WARM        (100_000)           — phase 1 person count
-//!   BENCH_CREATE      (50_000)            — phase 1b create count
-//!   BENCH_ALIAS       (100_000)           — phase 2 alias count
-//!   BENCH_MERGE       (100_000)           — phase 3 merge distinct_id count
-//!   BENCH_BATCH       (10)                — phase 3 sub-batch size
-//!   BENCH_CHAIN_DEPTH (100)               — phase 3b: max override chain depth
-//!   BENCH_READS       (1_000_000)         — phase 4 read count
-//!   BENCH_DB_POOL     (50)                — max DB connections for the benchmark pool
+//!   BENCH_TEAMS            (auto: N_WARM/1000)  — number of team_ids to distribute across
+//!   BENCH_WARM             (100_000)            — phase 1 person count
+//!   BENCH_CREATE           (50_000)             — phase 1b create count
+//!   BENCH_ALIAS            (100_000)            — phase 2 alias count
+//!   BENCH_MERGE            (100_000)            — phase 3 merge distinct_id count
+//!   BENCH_BATCH            (10)                 — phase 3 sub-batch size
+//!   BENCH_CHAIN_DEPTH      (100)                — phase 3b: max override chain depth
+//!   BENCH_READS            (1_000_000)          — phase 4 read count
+//!   BENCH_DELETE_DID       (10_000)             — phase 5 delete_distinct_id count
+//!   BENCH_DELETE_PERSON    (10_000)             — phase 6 delete_person count
+//!   BENCH_DB_POOL          (50)                 — max DB connections for seeding pool
+//!   BENCH_CONCURRENCY      (50)                 — max in-flight HTTP requests
+//!   BENCH_BASE_URL         (http://127.0.0.1:3000) — server base URL
 //!
 //! Run:
 //!   cargo run --release --bin bench
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rand::Rng;
 use rand::seq::SliceRandom;
+use reqwest::Client;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
+use tokio::sync::Semaphore;
 
 use pg_union_find_rs::db;
 
@@ -44,7 +55,10 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-/// Transaction batch size for bulk seeding (warm-up & merge precreation).
+fn env_string(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
 const SEED_TX_BATCH: usize = 500;
 
 // ---------------------------------------------------------------------------
@@ -58,25 +72,37 @@ struct ScopedId {
 }
 
 // ---------------------------------------------------------------------------
-// Latency stats
+// Latency stats with failure tracking
 // ---------------------------------------------------------------------------
 
 struct Stats {
-    total: Duration,
+    wall_time: Duration,
     count: usize,
+    failures: u64,
     p50: Duration,
     p95: Duration,
     p99: Duration,
     max: Duration,
 }
 
-fn compute_stats(mut latencies: Vec<Duration>) -> Stats {
+fn compute_stats(mut latencies: Vec<Duration>, wall_time: Duration, failures: u64) -> Stats {
     latencies.sort();
     let n = latencies.len();
-    let total: Duration = latencies.iter().sum();
+    if n == 0 {
+        return Stats {
+            wall_time,
+            count: 0,
+            failures,
+            p50: Duration::ZERO,
+            p95: Duration::ZERO,
+            p99: Duration::ZERO,
+            max: Duration::ZERO,
+        };
+    }
     Stats {
-        total,
+        wall_time,
         count: n,
+        failures,
         p50: latencies[n / 2],
         p95: latencies[n * 95 / 100],
         p99: latencies[n * 99 / 100],
@@ -85,19 +111,26 @@ fn compute_stats(mut latencies: Vec<Duration>) -> Stats {
 }
 
 fn print_stats(label: &str, stats: &Stats) {
-    let ops_sec = if stats.total.as_secs_f64() > 0.0 {
-        stats.count as f64 / stats.total.as_secs_f64()
+    let total_ops = stats.count as u64 + stats.failures;
+    let ops_sec = if stats.wall_time.as_secs_f64() > 0.0 {
+        total_ops as f64 / stats.wall_time.as_secs_f64()
+    } else {
+        0.0
+    };
+    let fail_pct = if total_ops > 0 {
+        stats.failures as f64 / total_ops as f64 * 100.0
     } else {
         0.0
     };
     println!("  [{label}]");
-    println!("    ops:    {}", stats.count);
-    println!("    total:  {:.2?}", stats.total);
-    println!("    ops/s:  {ops_sec:.0}");
-    println!("    p50:    {:.2?}", stats.p50);
-    println!("    p95:    {:.2?}", stats.p95);
-    println!("    p99:    {:.2?}", stats.p99);
-    println!("    max:    {:.2?}", stats.max);
+    println!("    ops:       {total_ops}");
+    println!("    failures:  {} ({fail_pct:.2}%)", stats.failures);
+    println!("    wall time: {:.2?}", stats.wall_time);
+    println!("    ops/s:     {ops_sec:.0}");
+    println!("    p50:       {:.2?}", stats.p50);
+    println!("    p95:       {:.2?}", stats.p95);
+    println!("    p99:       {:.2?}", stats.p99);
+    println!("    max:       {:.2?}", stats.max);
     println!();
 }
 
@@ -117,7 +150,6 @@ fn pick_target<'a>(
     }
 }
 
-/// Pick a target that belongs to a specific team.
 fn pick_target_for_team<'a>(
     rng: &mut impl Rng,
     team_id: i64,
@@ -135,8 +167,55 @@ fn pick_target_for_team<'a>(
 }
 
 // ---------------------------------------------------------------------------
-// Batched seeding helper — runs identify_tx for a slice of (team_id, did)
-// pairs inside a single transaction (one WAL sync per batch).
+// Parallel HTTP runner — sends requests with bounded concurrency.
+// ---------------------------------------------------------------------------
+
+struct OpResult {
+    latency: Duration,
+    success: bool,
+}
+
+async fn run_parallel(
+    client: &Client,
+    sem: &Arc<Semaphore>,
+    requests: Vec<(String, serde_json::Value)>,
+) -> (Vec<Duration>, u64) {
+    let wall_start = Instant::now();
+    let mut handles = Vec::with_capacity(requests.len());
+
+    for (url, body) in requests {
+        let permit = sem.clone().acquire_owned().await.expect("semaphore closed");
+        let client = client.clone();
+        handles.push(tokio::spawn(async move {
+            let t0 = Instant::now();
+            let result = client.post(&url).json(&body).send().await;
+            let latency = t0.elapsed();
+            drop(permit);
+            let success = match result {
+                Ok(resp) => resp.status().is_success(),
+                Err(_) => false,
+            };
+            OpResult { latency, success }
+        }));
+    }
+
+    let mut latencies = Vec::with_capacity(handles.len());
+    let mut failures = 0u64;
+    for handle in handles {
+        let result = handle.await.expect("task panicked");
+        if result.success {
+            latencies.push(result.latency);
+        } else {
+            failures += 1;
+        }
+    }
+
+    let _ = wall_start; // wall_time computed by caller
+    (latencies, failures)
+}
+
+// ---------------------------------------------------------------------------
+// Batched seeding helper — DB-direct, not timed.
 // ---------------------------------------------------------------------------
 
 async fn seed_batch(pool: &PgPool, items: &[(i64, String)]) {
@@ -218,7 +297,7 @@ async fn phase_warm(pool: &PgPool, n: usize, team_ids: &[i64]) -> WarmupResult {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 1b: /create latency benchmark — individual handle_create calls.
+// Phase 1b: /create benchmark — parallel HTTP POST /create
 // ---------------------------------------------------------------------------
 
 struct CreatePregen {
@@ -233,8 +312,8 @@ fn pregen_create_ops(
     team_ids: &[i64],
 ) -> CreatePregen {
     let mut rng = rand::rng();
-    let n_new = n * 4 / 5; // 80% create path
-    let n_get = n - n_new; // 20% get path (existing targets)
+    let n_new = n * 4 / 5;
+    let n_get = n - n_new;
 
     let mut ops = Vec::with_capacity(n);
     let mut new_ids = Vec::with_capacity(n_new);
@@ -262,26 +341,32 @@ fn pregen_create_ops(
     CreatePregen { ops, new_ids }
 }
 
-async fn phase_create(pool: &PgPool, ops: &[ScopedId]) {
-    println!(
-        "Phase 1b: benchmarking {} handle_create calls...",
-        ops.len()
-    );
-    let mut latencies = Vec::with_capacity(ops.len());
+async fn phase_create(client: &Client, sem: &Arc<Semaphore>, base_url: &str, ops: &[ScopedId]) {
+    println!("Phase 1b: benchmarking {} POST /create calls...", ops.len());
 
-    for op in ops {
-        let t0 = Instant::now();
-        db::handle_create(pool, op.team_id, &op.distinct_id)
-            .await
-            .expect("handle_create failed");
-        latencies.push(t0.elapsed());
-    }
+    let url = format!("{base_url}/create");
+    let requests: Vec<(String, serde_json::Value)> = ops
+        .iter()
+        .map(|op| {
+            (
+                url.clone(),
+                serde_json::json!({
+                    "team_id": op.team_id,
+                    "distinct_id": op.distinct_id,
+                }),
+            )
+        })
+        .collect();
 
-    print_stats("create", &compute_stats(latencies));
+    let wall_start = Instant::now();
+    let (latencies, failures) = run_parallel(client, sem, requests).await;
+    let wall_time = wall_start.elapsed();
+
+    print_stats("create", &compute_stats(latencies, wall_time, failures));
 }
 
 // ---------------------------------------------------------------------------
-// Phase 2: alias benchmark
+// Phase 2: alias benchmark — parallel HTTP POST /alias
 // ---------------------------------------------------------------------------
 
 struct AliasOp {
@@ -290,11 +375,6 @@ struct AliasOp {
     source: String,
 }
 
-/// Pregenerate alias operations covering four code paths:
-///   - ~85% Case 1a: target exists, source is new
-///   - ~5%  Case 2a: both exist, same person (target + alias-{i} from Case 1a)
-///   - ~5%  target==source: get-or-create via the identify_tx shortcut
-///   - ~5%  Case 3:  neither exists (both target and source are fresh)
 struct AliasPregen {
     ops: Vec<AliasOp>,
 }
@@ -306,15 +386,13 @@ fn pregen_alias_ops(
     team_ids: &[i64],
 ) -> AliasPregen {
     let mut rng = rand::rng();
-    let n_case2a = n / 20; // 5%
-    let n_tgt_eq_src = n / 20; // 5%
-    let n_case3 = n / 20; // 5%
+    let n_case2a = n / 20;
+    let n_tgt_eq_src = n / 20;
+    let n_case3 = n / 20;
     let n_case1a = n - n_case2a - n_tgt_eq_src - n_case3;
 
     let mut ops = Vec::with_capacity(n);
 
-    // Case 1a: target exists, source is new — must run first so Case 2a
-    // can reference the (target, alias-{i}) pairs created here.
     for i in 0..n_case1a {
         let tgt = pick_target(&mut rng, all_targets, hot_set);
         ops.push(AliasOp {
@@ -324,9 +402,6 @@ fn pregen_alias_ops(
         });
     }
 
-    // Case 2a: both exist, same person — pick a random Case 1a op and re-use
-    // its (target, alias-{i}) pair so both distinct_ids exist in the DB and
-    // share the same person.
     for _ in 0..n_case2a {
         let donor = &ops[rng.random_range(0..n_case1a)];
         ops.push(AliasOp {
@@ -336,7 +411,6 @@ fn pregen_alias_ops(
         });
     }
 
-    // target==source: get-or-create via the identify_tx shortcut
     for _ in 0..n_tgt_eq_src {
         let tgt = pick_target(&mut rng, all_targets, hot_set);
         ops.push(AliasOp {
@@ -346,7 +420,6 @@ fn pregen_alias_ops(
         });
     }
 
-    // Case 3: neither exists — both are fresh distinct_ids
     for i in 0..n_case3 {
         let team_id = team_ids[rng.random_range(0..team_ids.len())];
         ops.push(AliasOp {
@@ -359,26 +432,36 @@ fn pregen_alias_ops(
     AliasPregen { ops }
 }
 
-async fn phase_alias(pool: &PgPool, ops: &[AliasOp]) {
+async fn phase_alias(client: &Client, sem: &Arc<Semaphore>, base_url: &str, ops: &[AliasOp]) {
     println!(
-        "Phase 2: aliasing {} distinct_ids (mixed cases)...",
+        "Phase 2: aliasing {} distinct_ids via POST /alias (mixed cases)...",
         ops.len()
     );
-    let mut latencies = Vec::with_capacity(ops.len());
 
-    for op in ops {
-        let t0 = Instant::now();
-        db::handle_alias(pool, op.team_id, &op.target, &op.source, i32::MAX)
-            .await
-            .expect("alias failed");
-        latencies.push(t0.elapsed());
-    }
+    let url = format!("{base_url}/alias");
+    let requests: Vec<(String, serde_json::Value)> = ops
+        .iter()
+        .map(|op| {
+            (
+                url.clone(),
+                serde_json::json!({
+                    "team_id": op.team_id,
+                    "target": op.target,
+                    "alias": op.source,
+                }),
+            )
+        })
+        .collect();
 
-    print_stats("alias", &compute_stats(latencies));
+    let wall_start = Instant::now();
+    let (latencies, failures) = run_parallel(client, sem, requests).await;
+    let wall_time = wall_start.elapsed();
+
+    print_stats("alias", &compute_stats(latencies, wall_time, failures));
 }
 
 // ---------------------------------------------------------------------------
-// Phase 3: merge benchmark
+// Phase 3: merge benchmark — parallel HTTP POST /merge
 // ---------------------------------------------------------------------------
 
 struct MergeOp {
@@ -436,10 +519,16 @@ fn pregen_merge(
     }
 }
 
-async fn phase_merge(pool: &PgPool, pregen: &MergePregen) {
+async fn phase_merge(
+    pool: &PgPool,
+    client: &Client,
+    sem: &Arc<Semaphore>,
+    base_url: &str,
+    pregen: &MergePregen,
+) {
     let n = pregen.seed_pairs.len();
     let n_ops = pregen.ops.len();
-    println!("Phase 3: merging {n} distinct_ids in {n_ops} batches...");
+    println!("Phase 3: merging {n} distinct_ids in {n_ops} batches via POST /merge...");
 
     println!("  seeding {n} merge distinct_ids (tx batch {SEED_TX_BATCH})...");
     let t_pre = Instant::now();
@@ -448,21 +537,34 @@ async fn phase_merge(pool: &PgPool, pregen: &MergePregen) {
     }
     println!("  seeded in {:.2?}", t_pre.elapsed());
 
-    let mut latencies = Vec::with_capacity(n_ops);
-    for op in &pregen.ops {
-        let t0 = Instant::now();
-        db::handle_merge(pool, op.team_id, &op.target, &op.sources, i32::MAX)
-            .await
-            .expect("merge failed");
-        latencies.push(t0.elapsed());
-    }
+    let url = format!("{base_url}/merge");
+    let requests: Vec<(String, serde_json::Value)> = pregen
+        .ops
+        .iter()
+        .map(|op| {
+            (
+                url.clone(),
+                serde_json::json!({
+                    "team_id": op.team_id,
+                    "target": op.target,
+                    "sources": op.sources,
+                }),
+            )
+        })
+        .collect();
 
-    print_stats("merge (per batch)", &compute_stats(latencies));
+    let wall_start = Instant::now();
+    let (latencies, failures) = run_parallel(client, sem, requests).await;
+    let wall_time = wall_start.elapsed();
+
+    print_stats(
+        "merge (per batch)",
+        &compute_stats(latencies, wall_time, failures),
+    );
 }
 
 // ---------------------------------------------------------------------------
-// Phase 3b: chain deepening — merge targets into each other to create
-// union_find chains of realistic, varying depths.
+// Phase 3b: chain deepening — DB-direct, not HTTP-benchmarked.
 // ---------------------------------------------------------------------------
 
 fn generate_chain_lengths(rng: &mut impl Rng, n_targets: usize, max_depth: usize) -> Vec<usize> {
@@ -563,58 +665,160 @@ async fn phase_chain_deepen(
     }
 
     let t0 = Instant::now();
-    let mut latencies = Vec::with_capacity(total_links);
-
     for (team_id, chains) in &team_plans {
         for chain in chains {
             for i in 0..chain.len().saturating_sub(1) {
-                let t_op = Instant::now();
                 db::handle_merge(pool, *team_id, &chain[i + 1], &[chain[i].clone()], i32::MAX)
                     .await
                     .expect("chain deepen merge failed");
-                latencies.push(t_op.elapsed());
             }
         }
     }
 
-    if !latencies.is_empty() {
-        print_stats("chain deepen", &compute_stats(latencies));
-    }
     println!("  total chain deepening wall time: {:.2?}\n", t0.elapsed());
 }
 
 // ---------------------------------------------------------------------------
-// Phase 4: read benchmark
+// Phase 4: read benchmark — parallel HTTP POST /resolve
 // ---------------------------------------------------------------------------
 
-fn pregen_read_indices(n: usize, pool_size: usize) -> Vec<usize> {
+async fn phase_read(
+    client: &Client,
+    sem: &Arc<Semaphore>,
+    base_url: &str,
+    lookup_ids: &[ScopedId],
+    n_reads: usize,
+) {
+    println!("Phase 4: reading {n_reads} random distinct_ids via POST /resolve...");
+
     let mut rng = rand::rng();
-    (0..n).map(|_| rng.random_range(0..pool_size)).collect()
+    let url = format!("{base_url}/resolve");
+    let requests: Vec<(String, serde_json::Value)> = (0..n_reads)
+        .map(|_| {
+            let sid = &lookup_ids[rng.random_range(0..lookup_ids.len())];
+            (
+                url.clone(),
+                serde_json::json!({
+                    "team_id": sid.team_id,
+                    "distinct_id": sid.distinct_id,
+                }),
+            )
+        })
+        .collect();
+
+    let wall_start = Instant::now();
+    let (latencies, failures) = run_parallel(client, sem, requests).await;
+    let wall_time = wall_start.elapsed();
+
+    print_stats(
+        "resolve (read)",
+        &compute_stats(latencies, wall_time, failures),
+    );
 }
 
-async fn phase_read(pool: &PgPool, lookup_ids: &[ScopedId], indices: &[usize]) {
-    let n = indices.len();
-    println!("Phase 4: reading {n} random non-primary distinct_ids...");
-    let mut latencies = Vec::with_capacity(n);
+// ---------------------------------------------------------------------------
+// Phase 5: delete_distinct_id benchmark
+// ---------------------------------------------------------------------------
 
-    for &idx in indices {
-        let sid = &lookup_ids[idx];
+async fn phase_delete_distinct_id(
+    pool: &PgPool,
+    client: &Client,
+    sem: &Arc<Semaphore>,
+    base_url: &str,
+    n: usize,
+    team_ids: &[i64],
+) {
+    println!("Phase 5: benchmarking {n} POST /delete_distinct_id calls...");
 
-        let t0 = Instant::now();
-        let resolved = db::resolve(pool, sid.team_id, &sid.distinct_id)
-            .await
-            .expect("resolve failed");
-        latencies.push(t0.elapsed());
-
-        assert!(
-            resolved.is_some(),
-            "expected {}:{} to resolve",
-            sid.team_id,
-            sid.distinct_id
-        );
+    println!("  seeding {n} distinct_ids for deletion...");
+    let t_pre = Instant::now();
+    let pairs: Vec<(i64, String)> = (0..n)
+        .map(|i| (team_ids[i % team_ids.len()], format!("del-did-{i}")))
+        .collect();
+    for chunk in pairs.chunks(SEED_TX_BATCH) {
+        seed_batch(pool, chunk).await;
     }
+    println!("  seeded in {:.2?}", t_pre.elapsed());
 
-    print_stats("resolve (read)", &compute_stats(latencies));
+    let url = format!("{base_url}/delete_distinct_id");
+    let requests: Vec<(String, serde_json::Value)> = pairs
+        .iter()
+        .map(|(team_id, did)| {
+            (
+                url.clone(),
+                serde_json::json!({
+                    "team_id": team_id,
+                    "distinct_id": did,
+                }),
+            )
+        })
+        .collect();
+
+    let wall_start = Instant::now();
+    let (latencies, failures) = run_parallel(client, sem, requests).await;
+    let wall_time = wall_start.elapsed();
+
+    print_stats(
+        "delete_distinct_id",
+        &compute_stats(latencies, wall_time, failures),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6: delete_person benchmark
+// ---------------------------------------------------------------------------
+
+async fn phase_delete_person(
+    pool: &PgPool,
+    client: &Client,
+    sem: &Arc<Semaphore>,
+    base_url: &str,
+    n: usize,
+    team_ids: &[i64],
+) {
+    println!("Phase 6: benchmarking {n} POST /delete_person calls...");
+
+    println!("  seeding {n} persons for deletion...");
+    let t_pre = Instant::now();
+    let mut delete_targets: Vec<(i64, String)> = Vec::with_capacity(n);
+
+    let pairs: Vec<(i64, String)> = (0..n)
+        .map(|i| (team_ids[i % team_ids.len()], format!("del-person-{i}")))
+        .collect();
+    for chunk in pairs.chunks(SEED_TX_BATCH) {
+        let mut tx = pool.begin().await.expect("begin tx");
+        for (team_id, did) in chunk {
+            let resolved = db::identify_tx(&mut tx, *team_id, did)
+                .await
+                .expect("identify_tx for delete_person seed");
+            delete_targets.push((*team_id, resolved.person_uuid));
+        }
+        tx.commit().await.expect("commit seed batch");
+    }
+    println!("  seeded in {:.2?}", t_pre.elapsed());
+
+    let url = format!("{base_url}/delete_person");
+    let requests: Vec<(String, serde_json::Value)> = delete_targets
+        .iter()
+        .map(|(team_id, person_uuid)| {
+            (
+                url.clone(),
+                serde_json::json!({
+                    "team_id": team_id,
+                    "person_uuid": person_uuid,
+                }),
+            )
+        })
+        .collect();
+
+    let wall_start = Instant::now();
+    let (latencies, failures) = run_parallel(client, sem, requests).await;
+    let wall_time = wall_start.elapsed();
+
+    print_stats(
+        "delete_person",
+        &compute_stats(latencies, wall_time, failures),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -630,21 +834,29 @@ async fn main() {
     let batch_size = env_usize("BENCH_BATCH", 10);
     let chain_depth = env_usize("BENCH_CHAIN_DEPTH", 100);
     let n_reads = env_usize("BENCH_READS", 1_000_000);
+    let n_delete_did = env_usize("BENCH_DELETE_DID", 10_000);
+    let n_delete_person = env_usize("BENCH_DELETE_PERSON", 10_000);
     let n_teams = env_usize("BENCH_TEAMS", std::cmp::max(1, n_warm / 1000));
     let db_pool_size = env_usize("BENCH_DB_POOL", 50);
+    let concurrency = env_usize("BENCH_CONCURRENCY", 50);
+    let base_url = env_string("BENCH_BASE_URL", "http://127.0.0.1:3000");
 
     let team_ids: Vec<i64> = (1..=n_teams as i64).collect();
 
-    println!("=== Union-Find Benchmark ===");
-    println!("  BENCH_TEAMS       = {n_teams}");
-    println!("  BENCH_WARM        = {n_warm}");
-    println!("  BENCH_CREATE      = {n_create}");
-    println!("  BENCH_ALIAS       = {n_alias}");
-    println!("  BENCH_MERGE       = {n_merge}");
-    println!("  BENCH_BATCH       = {batch_size}");
-    println!("  BENCH_CHAIN_DEPTH = {chain_depth}");
-    println!("  BENCH_READS       = {n_reads}");
-    println!("  BENCH_DB_POOL     = {db_pool_size}");
+    println!("=== Union-Find Benchmark (parallel HTTP) ===");
+    println!("  BENCH_TEAMS          = {n_teams}");
+    println!("  BENCH_WARM           = {n_warm}");
+    println!("  BENCH_CREATE         = {n_create}");
+    println!("  BENCH_ALIAS          = {n_alias}");
+    println!("  BENCH_MERGE          = {n_merge}");
+    println!("  BENCH_BATCH          = {batch_size}");
+    println!("  BENCH_CHAIN_DEPTH    = {chain_depth}");
+    println!("  BENCH_READS          = {n_reads}");
+    println!("  BENCH_DELETE_DID     = {n_delete_did}");
+    println!("  BENCH_DELETE_PERSON  = {n_delete_person}");
+    println!("  BENCH_DB_POOL        = {db_pool_size}");
+    println!("  BENCH_CONCURRENCY    = {concurrency}");
+    println!("  BENCH_BASE_URL       = {base_url}");
     println!();
 
     let database_url = std::env::var("DATABASE_URL")
@@ -666,10 +878,16 @@ async fn main() {
         .await
         .expect("failed to truncate");
 
-    // Phase 1: warm-up (seeding, not latency-benchmarked)
+    let client = Client::builder()
+        .pool_max_idle_per_host(concurrency)
+        .build()
+        .expect("failed to build HTTP client");
+    let sem = Arc::new(Semaphore::new(concurrency));
+
+    // Phase 1: warm-up (DB-direct seeding, not benchmarked)
     let warm = phase_warm(&pool, n_warm, &team_ids).await;
 
-    // Pregenerate all operation data so timed loops measure only DB work.
+    // Pregenerate all operation data so timed loops measure only server work.
     let t_pregen = Instant::now();
 
     let create_pregen = pregen_create_ops(n_create, &warm.all_targets, &warm.hot_set, &team_ids);
@@ -682,7 +900,7 @@ async fn main() {
         &warm.hot_by_team,
     );
 
-    // Build read lookup pool: collect resolvable distinct_ids from every phase.
+    // Build read lookup pool from resolvable distinct_ids across all phases.
     let mut lookup_ids: Vec<ScopedId> = Vec::new();
     for op in &alias_pregen.ops {
         if op.target != op.source {
@@ -690,7 +908,6 @@ async fn main() {
                 team_id: op.team_id,
                 distinct_id: op.source.clone(),
             });
-            // Case 3 fresh-tgt-{i} is also resolvable after the alias runs
             if !op.target.starts_with("primary-") {
                 lookup_ids.push(ScopedId {
                     team_id: op.team_id,
@@ -702,31 +919,34 @@ async fn main() {
     lookup_ids.extend(create_pregen.new_ids.iter().cloned());
     lookup_ids.extend(merge_pregen.all_merge_ids.iter().cloned());
 
-    let read_indices = pregen_read_indices(n_reads, lookup_ids.len());
-
     println!(
-        "pregenerated {} create + {} alias + {} merge + {} read ops in {:.2?}\n",
+        "pregenerated {} create + {} alias + {} merge ops in {:.2?}\n",
         create_pregen.ops.len(),
         alias_pregen.ops.len(),
         merge_pregen.ops.len(),
-        read_indices.len(),
         t_pregen.elapsed(),
     );
 
-    // Phase 1b: create latency benchmark
-    phase_create(&pool, &create_pregen.ops).await;
+    // Phase 1b: create benchmark (parallel HTTP)
+    phase_create(&client, &sem, &base_url, &create_pregen.ops).await;
 
-    // Phase 2: alias benchmark
-    phase_alias(&pool, &alias_pregen.ops).await;
+    // Phase 2: alias benchmark (parallel HTTP)
+    phase_alias(&client, &sem, &base_url, &alias_pregen.ops).await;
 
-    // Phase 3: merge benchmark
-    phase_merge(&pool, &merge_pregen).await;
+    // Phase 3: merge benchmark (parallel HTTP, DB-direct seeding)
+    phase_merge(&pool, &client, &sem, &base_url, &merge_pregen).await;
 
-    // Phase 3b: chain deepening
+    // Phase 3b: chain deepening (DB-direct, not benchmarked)
     phase_chain_deepen(&pool, chain_depth, &warm.targets_by_team).await;
 
-    // Phase 4: read benchmark
-    phase_read(&pool, &lookup_ids, &read_indices).await;
+    // Phase 4: read benchmark (parallel HTTP)
+    phase_read(&client, &sem, &base_url, &lookup_ids, n_reads).await;
+
+    // Phase 5: delete_distinct_id benchmark (parallel HTTP)
+    phase_delete_distinct_id(&pool, &client, &sem, &base_url, n_delete_did, &team_ids).await;
+
+    // Phase 6: delete_person benchmark (parallel HTTP)
+    phase_delete_person(&pool, &client, &sem, &base_url, n_delete_person, &team_ids).await;
 
     println!("=== Done ===");
 }
