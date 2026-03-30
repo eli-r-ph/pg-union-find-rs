@@ -25,10 +25,7 @@ async fn create_new() {
     assert_eq!(count_distinct_ids(&pool, t).await, 1);
     assert_eq!(count_union_find(&pool, t).await, 1);
 
-    let uf = get_uf_row(&pool, t, "user-1").await.unwrap();
-    assert!(uf.next.is_none(), "root must have next=NULL");
-    assert!(uf.person_id.is_some(), "root must have person_id set");
-    assert!(!uf.is_deleted, "root must not be deleted");
+    assert_chain_is_root(&pool, t, "user-1", &resp.person_uuid).await;
 
     assert_all_invariants(&pool, t).await;
 }
@@ -46,6 +43,8 @@ async fn create_idempotent() {
     assert_eq!(count_distinct_ids(&pool, t).await, 1);
     assert_eq!(count_union_find(&pool, t).await, 1);
 
+    assert_chain_is_root(&pool, t, "user-1", &r1.person_uuid).await;
+
     assert_all_invariants(&pool, t).await;
 }
 
@@ -62,6 +61,9 @@ async fn create_different_teams() {
     assert_eq!(count_person_mappings(&pool, t1).await, 1);
     assert_eq!(count_person_mappings(&pool, t2).await, 1);
 
+    assert_chain_is_root(&pool, t1, "shared-did", &r1.person_uuid).await;
+    assert_chain_is_root(&pool, t2, "shared-did", &r2.person_uuid).await;
+
     assert_all_invariants(&pool, t1).await;
     assert_all_invariants(&pool, t2).await;
 }
@@ -74,8 +76,11 @@ async fn create_produces_unidentified() {
     let resp = db::handle_create(&pool, t, "newbie").await.unwrap();
     assert!(!resp.is_identified);
 
-    let pid = get_root_person_id(&pool, t, "newbie").await.unwrap();
-    assert!(!is_person_identified(&pool, pid).await);
+    assert_chain_is_root(&pool, t, "newbie", &resp.person_uuid).await;
+
+    let chain = collect_chain(&pool, t, "newbie").await;
+    let root_person_id = chain.last().unwrap().person_id.unwrap();
+    assert!(!is_person_identified(&pool, root_person_id).await);
 }
 
 // ===========================================================================
@@ -98,8 +103,9 @@ async fn alias_target_eq_source_new() {
     assert_eq!(count_distinct_ids(&pool, t).await, 1);
     assert_eq!(count_union_find(&pool, t).await, 1);
 
-    let pid = get_root_person_id(&pool, t, "x").await.unwrap();
-    assert!(is_person_identified(&pool, pid).await);
+    assert_chain_is_root(&pool, t, "x", &resp.person_uuid).await;
+    let chain = collect_chain(&pool, t, "x").await;
+    assert!(is_person_identified(&pool, chain[0].person_id.unwrap()).await);
 
     assert_all_invariants(&pool, t).await;
 }
@@ -110,12 +116,16 @@ async fn alias_target_eq_source_existing() {
     let t = next_team_id();
 
     let r1 = db::handle_create(&pool, t, "x").await.unwrap();
+    assert_chain_is_root(&pool, t, "x", &r1.person_uuid).await;
+
     let r2 = db::handle_alias(&pool, t, "x", "x").await.unwrap();
     assert_eq!(r1.person_uuid, r2.person_uuid);
     assert!(r2.is_identified);
 
     assert_eq!(count_person_mappings(&pool, t).await, 1);
     assert_eq!(count_distinct_ids(&pool, t).await, 1);
+
+    assert_chain_is_root(&pool, t, "x", &r1.person_uuid).await;
 
     assert_all_invariants(&pool, t).await;
 }
@@ -126,6 +136,8 @@ async fn alias_case1a_target_exists() {
     let t = next_team_id();
 
     let created = db::handle_create(&pool, t, "primary").await.unwrap();
+    assert_chain_is_root(&pool, t, "primary", &created.person_uuid).await;
+
     let aliased = db::handle_alias(&pool, t, "primary", "anon").await.unwrap();
     assert_eq!(created.person_uuid, aliased.person_uuid);
     assert!(aliased.is_identified);
@@ -137,18 +149,11 @@ async fn alias_case1a_target_exists() {
     assert_eq!(count_distinct_ids(&pool, t).await, 2);
     assert_eq!(count_union_find(&pool, t).await, 2);
 
-    let uf_primary = get_uf_row(&pool, t, "primary").await.unwrap();
-    assert!(uf_primary.person_id.is_some(), "primary should be root");
-    assert!(uf_primary.next.is_none());
-    assert!(!uf_primary.is_deleted);
+    assert_chain_is_root(&pool, t, "primary", &created.person_uuid).await;
+    assert_chain_matches(&pool, t, "anon", &["anon", "primary"], &created.person_uuid).await;
 
-    let uf_anon = get_uf_row(&pool, t, "anon").await.unwrap();
-    assert!(uf_anon.person_id.is_none(), "anon should not be root");
-    assert_eq!(uf_anon.next, Some(uf_primary.current));
-    assert!(!uf_anon.is_deleted);
-
-    let pid = get_root_person_id(&pool, t, "primary").await.unwrap();
-    assert!(is_person_identified(&pool, pid).await);
+    let chain = collect_chain(&pool, t, "primary").await;
+    assert!(is_person_identified(&pool, chain[0].person_id.unwrap()).await);
 
     assert_all_invariants(&pool, t).await;
 }
@@ -159,7 +164,8 @@ async fn alias_case1b_source_exists() {
     let t = next_team_id();
 
     let created = db::handle_create(&pool, t, "anon").await.unwrap();
-    // target="primary" doesn't exist, source="anon" exists → link primary to anon's chain
+    assert_chain_is_root(&pool, t, "anon", &created.person_uuid).await;
+
     let aliased = db::handle_alias(&pool, t, "primary", "anon").await.unwrap();
     assert_eq!(created.person_uuid, aliased.person_uuid);
     assert!(aliased.is_identified);
@@ -171,17 +177,18 @@ async fn alias_case1b_source_exists() {
     assert_eq!(count_distinct_ids(&pool, t).await, 2);
     assert_eq!(count_union_find(&pool, t).await, 2);
 
-    let uf_anon = get_uf_row(&pool, t, "anon").await.unwrap();
-    assert!(uf_anon.person_id.is_some(), "anon should be root");
-    assert!(!uf_anon.is_deleted);
+    assert_chain_is_root(&pool, t, "anon", &created.person_uuid).await;
+    assert_chain_matches(
+        &pool,
+        t,
+        "primary",
+        &["primary", "anon"],
+        &created.person_uuid,
+    )
+    .await;
 
-    let uf_primary = get_uf_row(&pool, t, "primary").await.unwrap();
-    assert!(uf_primary.person_id.is_none(), "primary should not be root");
-    assert_eq!(uf_primary.next, Some(uf_anon.current));
-    assert!(!uf_primary.is_deleted);
-
-    let pid = get_root_person_id(&pool, t, "anon").await.unwrap();
-    assert!(is_person_identified(&pool, pid).await);
+    let chain = collect_chain(&pool, t, "anon").await;
+    assert!(is_person_identified(&pool, chain[0].person_id.unwrap()).await);
 
     assert_all_invariants(&pool, t).await;
 }
@@ -191,8 +198,11 @@ async fn alias_case2a_same_person() {
     let pool = test_pool().await;
     let t = next_team_id();
 
-    db::handle_create(&pool, t, "a").await.unwrap();
+    let r_a = db::handle_create(&pool, t, "a").await.unwrap();
     db::handle_alias(&pool, t, "a", "b").await.unwrap();
+
+    assert_chain_is_root(&pool, t, "a", &r_a.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &r_a.person_uuid).await;
 
     let before_dids = count_distinct_ids(&pool, t).await;
     let before_uf = count_union_find(&pool, t).await;
@@ -200,11 +210,13 @@ async fn alias_case2a_same_person() {
     // b already linked to a's person — calling alias(a, b) again is a no-op
     let resp = db::handle_alias(&pool, t, "a", "b").await.unwrap();
     assert!(resp.is_identified);
-    let resolved_a = db::resolve(&pool, t, "a").await.unwrap().unwrap();
-    assert_eq!(resp.person_uuid, resolved_a.person_uuid);
+    assert_eq!(resp.person_uuid, r_a.person_uuid);
 
     assert_eq!(count_distinct_ids(&pool, t).await, before_dids);
     assert_eq!(count_union_find(&pool, t).await, before_uf);
+
+    assert_chain_is_root(&pool, t, "a", &r_a.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &r_a.person_uuid).await;
 
     assert_all_invariants(&pool, t).await;
 }
@@ -215,19 +227,22 @@ async fn alias_case2b_both_unidentified_succeeds() {
     let t = next_team_id();
 
     let person_a = db::handle_create(&pool, t, "a").await.unwrap();
-    db::handle_create(&pool, t, "b").await.unwrap();
+    let person_b = db::handle_create(&pool, t, "b").await.unwrap();
 
-    // Both persons are unidentified (created via /create) so merge should succeed
+    assert_chain_is_root(&pool, t, "a", &person_a.person_uuid).await;
+    assert_chain_is_root(&pool, t, "b", &person_b.person_uuid).await;
+
     let result = db::handle_alias(&pool, t, "a", "b").await.unwrap();
     assert_eq!(result.person_uuid, person_a.person_uuid);
     assert!(result.is_identified);
 
-    // b now resolves to a's person
     let resolved_b = db::resolve(&pool, t, "b").await.unwrap().unwrap();
     assert_eq!(resolved_b.person_uuid, person_a.person_uuid);
 
-    // Orphaned person cleaned up
     assert_eq!(count_person_mappings(&pool, t).await, 1);
+
+    assert_chain_is_root(&pool, t, "a", &person_a.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &person_a.person_uuid).await;
 
     assert_all_invariants(&pool, t).await;
 }
@@ -237,16 +252,20 @@ async fn alias_case2b_source_identified_rejected() {
     let pool = test_pool().await;
     let t = next_team_id();
 
-    // Create A and B
-    db::handle_create(&pool, t, "a").await.unwrap();
-    db::handle_create(&pool, t, "b").await.unwrap();
+    let r_a = db::handle_create(&pool, t, "a").await.unwrap();
+    let r_b = db::handle_create(&pool, t, "b").await.unwrap();
 
-    // Identify B by aliasing B to C — B's person becomes is_identified=true
+    // Identify B by aliasing B to C
     db::handle_alias(&pool, t, "b", "c").await.unwrap();
-    let pid_b = get_root_person_id(&pool, t, "b").await.unwrap();
+    let chain_b = collect_chain(&pool, t, "b").await;
+    let pid_b = chain_b.last().unwrap().person_id.unwrap();
     assert!(is_person_identified(&pool, pid_b).await);
 
-    // Now alias(target=a, source=b): source (b) is identified → reject
+    assert_chain_is_root(&pool, t, "a", &r_a.person_uuid).await;
+    assert_chain_is_root(&pool, t, "b", &r_b.person_uuid).await;
+    assert_chain_matches(&pool, t, "c", &["c", "b"], &r_b.person_uuid).await;
+
+    // alias(target=a, source=b): source (b) is identified → reject
     let result = db::handle_alias(&pool, t, "a", "b").await;
     assert!(result.is_err());
     match result.unwrap_err() {
@@ -254,10 +273,10 @@ async fn alias_case2b_source_identified_rejected() {
         other => panic!("expected AlreadyIdentified, got: {other}"),
     }
 
-    // Graph unchanged: a and b still have different persons
-    let resolved_a = db::resolve(&pool, t, "a").await.unwrap().unwrap();
-    let resolved_b = db::resolve(&pool, t, "b").await.unwrap().unwrap();
-    assert_ne!(resolved_a.person_uuid, resolved_b.person_uuid);
+    // Graph unchanged
+    assert_chain_is_root(&pool, t, "a", &r_a.person_uuid).await;
+    assert_chain_is_root(&pool, t, "b", &r_b.person_uuid).await;
+    assert_chain_matches(&pool, t, "c", &["c", "b"], &r_b.person_uuid).await;
 
     assert_all_invariants(&pool, t).await;
 }
@@ -267,28 +286,29 @@ async fn alias_case2b_target_identified_source_not() {
     let pool = test_pool().await;
     let t = next_team_id();
 
-    // Create A and B
-    db::handle_create(&pool, t, "a").await.unwrap();
-    db::handle_create(&pool, t, "b").await.unwrap();
+    let r_a = db::handle_create(&pool, t, "a").await.unwrap();
+    let r_b = db::handle_create(&pool, t, "b").await.unwrap();
 
     // Identify A by aliasing A to C
     let alias_resp = db::handle_alias(&pool, t, "a", "c").await.unwrap();
-    let pid_a = get_root_person_id(&pool, t, "a").await.unwrap();
-    assert!(is_person_identified(&pool, pid_a).await);
     assert!(alias_resp.is_identified);
 
-    // B is still unidentified
-    let pid_b = get_root_person_id(&pool, t, "b").await.unwrap();
-    assert!(!is_person_identified(&pool, pid_b).await);
+    assert_chain_is_root(&pool, t, "a", &r_a.person_uuid).await;
+    assert_chain_matches(&pool, t, "c", &["c", "a"], &r_a.person_uuid).await;
+    let chain_a = collect_chain(&pool, t, "a").await;
+    assert!(is_person_identified(&pool, chain_a[0].person_id.unwrap()).await);
+
+    assert_chain_is_root(&pool, t, "b", &r_b.person_uuid).await;
+    let chain_b = collect_chain(&pool, t, "b").await;
+    assert!(!is_person_identified(&pool, chain_b[0].person_id.unwrap()).await);
 
     // alias(target=a, source=b): source (b) is NOT identified → merge succeeds
     let result = db::handle_alias(&pool, t, "a", "b").await.unwrap();
     assert!(result.is_identified);
 
-    // b now resolves to a's person
-    let resolved_a = db::resolve(&pool, t, "a").await.unwrap().unwrap();
-    let resolved_b = db::resolve(&pool, t, "b").await.unwrap().unwrap();
-    assert_eq!(resolved_a.person_uuid, resolved_b.person_uuid);
+    assert_chain_is_root(&pool, t, "a", &r_a.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &r_a.person_uuid).await;
+    assert_chain_matches(&pool, t, "c", &["c", "a"], &r_a.person_uuid).await;
 
     assert_all_invariants(&pool, t).await;
 }
@@ -311,18 +331,11 @@ async fn alias_case3_neither_exists() {
     assert_eq!(count_distinct_ids(&pool, t).await, 2);
     assert_eq!(count_union_find(&pool, t).await, 2);
 
-    let uf_primary = get_uf_row(&pool, t, "primary").await.unwrap();
-    assert!(uf_primary.person_id.is_some(), "primary should be root");
-    assert!(uf_primary.next.is_none());
-    assert!(!uf_primary.is_deleted);
+    assert_chain_is_root(&pool, t, "primary", &resp.person_uuid).await;
+    assert_chain_matches(&pool, t, "anon", &["anon", "primary"], &resp.person_uuid).await;
 
-    let uf_anon = get_uf_row(&pool, t, "anon").await.unwrap();
-    assert!(uf_anon.person_id.is_none(), "anon should not be root");
-    assert_eq!(uf_anon.next, Some(uf_primary.current));
-    assert!(!uf_anon.is_deleted);
-
-    let pid = get_root_person_id(&pool, t, "primary").await.unwrap();
-    assert!(is_person_identified(&pool, pid).await);
+    let chain = collect_chain(&pool, t, "primary").await;
+    assert!(is_person_identified(&pool, chain[0].person_id.unwrap()).await);
 
     assert_all_invariants(&pool, t).await;
 }
@@ -332,20 +345,25 @@ async fn alias_sets_identified() {
     let pool = test_pool().await;
     let t = next_team_id();
 
-    db::handle_create(&pool, t, "x").await.unwrap();
-    db::handle_create(&pool, t, "y").await.unwrap();
+    let r_x = db::handle_create(&pool, t, "x").await.unwrap();
+    let r_y = db::handle_create(&pool, t, "y").await.unwrap();
 
-    let pid_x = get_root_person_id(&pool, t, "x").await.unwrap();
-    let pid_y = get_root_person_id(&pool, t, "y").await.unwrap();
-    assert!(!is_person_identified(&pool, pid_x).await);
-    assert!(!is_person_identified(&pool, pid_y).await);
+    assert_chain_is_root(&pool, t, "x", &r_x.person_uuid).await;
+    assert_chain_is_root(&pool, t, "y", &r_y.person_uuid).await;
+
+    let chain_x = collect_chain(&pool, t, "x").await;
+    let chain_y = collect_chain(&pool, t, "y").await;
+    assert!(!is_person_identified(&pool, chain_x[0].person_id.unwrap()).await);
+    assert!(!is_person_identified(&pool, chain_y[0].person_id.unwrap()).await);
 
     let resp = db::handle_alias(&pool, t, "x", "y").await.unwrap();
     assert!(resp.is_identified);
 
-    // The surviving person (x's) should be identified
-    let pid_result = get_root_person_id(&pool, t, "x").await.unwrap();
-    assert!(is_person_identified(&pool, pid_result).await);
+    assert_chain_is_root(&pool, t, "x", &r_x.person_uuid).await;
+    assert_chain_matches(&pool, t, "y", &["y", "x"], &r_x.person_uuid).await;
+
+    let chain = collect_chain(&pool, t, "x").await;
+    assert!(is_person_identified(&pool, chain[0].person_id.unwrap()).await);
 }
 
 // ===========================================================================
@@ -371,6 +389,8 @@ async fn merge_source_not_found() {
     let t = next_team_id();
 
     let tgt = db::handle_create(&pool, t, "tgt").await.unwrap();
+    assert_chain_is_root(&pool, t, "tgt", &tgt.person_uuid).await;
+
     let resp = db::handle_merge(&pool, t, "tgt", &["new-source".into()])
         .await
         .unwrap();
@@ -383,12 +403,15 @@ async fn merge_source_not_found() {
     assert_eq!(count_distinct_ids(&pool, t).await, 2);
     assert_eq!(count_union_find(&pool, t).await, 2);
 
-    let uf_source = get_uf_row(&pool, t, "new-source").await.unwrap();
-    assert!(uf_source.person_id.is_none());
-    assert!(!uf_source.is_deleted);
-    let uf_tgt = get_uf_row(&pool, t, "tgt").await.unwrap();
-    assert_eq!(uf_source.next, Some(uf_tgt.current));
-    assert!(!uf_tgt.is_deleted);
+    assert_chain_is_root(&pool, t, "tgt", &tgt.person_uuid).await;
+    assert_chain_matches(
+        &pool,
+        t,
+        "new-source",
+        &["new-source", "tgt"],
+        &tgt.person_uuid,
+    )
+    .await;
 
     assert_all_invariants(&pool, t).await;
 }
@@ -398,18 +421,23 @@ async fn merge_same_person() {
     let pool = test_pool().await;
     let t = next_team_id();
 
-    db::handle_create(&pool, t, "a").await.unwrap();
+    let r_a = db::handle_create(&pool, t, "a").await.unwrap();
     db::handle_alias(&pool, t, "a", "b").await.unwrap();
+
+    assert_chain_is_root(&pool, t, "a", &r_a.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &r_a.person_uuid).await;
 
     let before_uf = count_union_find(&pool, t).await;
     let resp = db::handle_merge(&pool, t, "a", &["b".into()])
         .await
         .unwrap();
     assert!(resp.is_identified);
-    let resolved_a = db::resolve(&pool, t, "a").await.unwrap().unwrap();
-    assert_eq!(resp.person_uuid, resolved_a.person_uuid);
+    assert_eq!(resp.person_uuid, r_a.person_uuid);
 
     assert_eq!(count_union_find(&pool, t).await, before_uf);
+
+    assert_chain_is_root(&pool, t, "a", &r_a.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &r_a.person_uuid).await;
 
     assert_all_invariants(&pool, t).await;
 }
@@ -420,18 +448,18 @@ async fn merge_different_person() {
     let t = next_team_id();
 
     let person_a = db::handle_create(&pool, t, "a").await.unwrap();
-    db::handle_create(&pool, t, "b").await.unwrap();
+    let person_b = db::handle_create(&pool, t, "b").await.unwrap();
 
-    let old_root_pid = get_root_person_id(&pool, t, "b").await.unwrap();
+    assert_chain_is_root(&pool, t, "a", &person_a.person_uuid).await;
+    assert_chain_is_root(&pool, t, "b", &person_b.person_uuid).await;
+
+    let old_root_pid = collect_chain(&pool, t, "b").await[0].person_id.unwrap();
 
     let resp = db::handle_merge(&pool, t, "a", &["b".into()])
         .await
         .unwrap();
     assert_eq!(resp.person_uuid, person_a.person_uuid);
     assert!(resp.is_identified);
-
-    let resolved_b = db::resolve(&pool, t, "b").await.unwrap().unwrap();
-    assert_eq!(resolved_b.person_uuid, person_a.person_uuid);
 
     assert!(
         !person_exists(&pool, old_root_pid).await,
@@ -440,8 +468,11 @@ async fn merge_different_person() {
 
     assert_eq!(count_person_mappings(&pool, t).await, 1);
 
-    let pid = get_root_person_id(&pool, t, "a").await.unwrap();
-    assert!(is_person_identified(&pool, pid).await);
+    assert_chain_is_root(&pool, t, "a", &person_a.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &person_a.person_uuid).await;
+
+    let chain = collect_chain(&pool, t, "a").await;
+    assert!(is_person_identified(&pool, chain[0].person_id.unwrap()).await);
 
     assert_all_invariants(&pool, t).await;
 }
@@ -452,10 +483,14 @@ async fn merge_shared_person_cleanup() {
     let t = next_team_id();
 
     let person_a = db::handle_create(&pool, t, "a").await.unwrap();
-    db::handle_create(&pool, t, "b").await.unwrap();
+    let person_b = db::handle_create(&pool, t, "b").await.unwrap();
     db::handle_alias(&pool, t, "b", "c").await.unwrap();
 
-    let old_person_b_id = get_root_person_id(&pool, t, "b").await.unwrap();
+    assert_chain_is_root(&pool, t, "a", &person_a.person_uuid).await;
+    assert_chain_is_root(&pool, t, "b", &person_b.person_uuid).await;
+    assert_chain_matches(&pool, t, "c", &["c", "b"], &person_b.person_uuid).await;
+
+    let old_person_b_id = collect_chain(&pool, t, "b").await[0].person_id.unwrap();
 
     let resp = db::handle_merge(&pool, t, "a", &["b".into(), "c".into()])
         .await
@@ -463,16 +498,15 @@ async fn merge_shared_person_cleanup() {
     assert_eq!(resp.person_uuid, person_a.person_uuid);
     assert!(resp.is_identified);
 
-    let resolved_b = db::resolve(&pool, t, "b").await.unwrap().unwrap();
-    let resolved_c = db::resolve(&pool, t, "c").await.unwrap().unwrap();
-    assert_eq!(resolved_b.person_uuid, person_a.person_uuid);
-    assert_eq!(resolved_c.person_uuid, person_a.person_uuid);
-
     assert!(
         !person_exists(&pool, old_person_b_id).await,
         "person B should be deleted after merge"
     );
     assert_eq!(count_person_mappings(&pool, t).await, 1);
+
+    assert_chain_is_root(&pool, t, "a", &person_a.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &person_a.person_uuid).await;
+    assert_chain_matches(&pool, t, "c", &["c", "b", "a"], &person_a.person_uuid).await;
 
     assert_all_invariants(&pool, t).await;
 }
@@ -490,6 +524,8 @@ async fn merge_empty_sources() {
     assert_eq!(count_person_mappings(&pool, t).await, 1);
     assert_eq!(count_distinct_ids(&pool, t).await, 1);
     assert_eq!(count_union_find(&pool, t).await, 1);
+
+    assert_chain_is_root(&pool, t, "tgt", &tgt.person_uuid).await;
 
     assert_all_invariants(&pool, t).await;
 }
@@ -509,7 +545,15 @@ async fn merge_multiple_sources() {
     assert_eq!(resp.person_uuid, person_a.person_uuid);
     assert!(resp.is_identified);
 
-    for did in &["a", "b", "c", "brand-new"] {
+    assert_chain_is_root(&pool, t, "a", &person_a.person_uuid).await;
+    for did in &["b", "c", "brand-new"] {
+        let chain = collect_chain(&pool, t, did).await;
+        assert!(!chain.is_empty(), "{did} chain should not be empty");
+        assert_eq!(
+            chain.last().unwrap().distinct_id,
+            "a",
+            "{did} chain should terminate at root 'a'"
+        );
         let resolved = db::resolve(&pool, t, did).await.unwrap().unwrap();
         assert_eq!(
             resolved.person_uuid, person_a.person_uuid,
@@ -535,6 +579,8 @@ async fn merge_target_in_sources() {
     assert_eq!(count_distinct_ids(&pool, t).await, 1);
     assert_eq!(count_union_find(&pool, t).await, 1);
 
+    assert_chain_is_root(&pool, t, "a", &tgt.person_uuid).await;
+
     assert_all_invariants(&pool, t).await;
 }
 
@@ -543,38 +589,27 @@ async fn merge_chain_all_ids_follow() {
     let pool = test_pool().await;
     let t = next_team_id();
 
-    db::handle_create(&pool, t, "a").await.unwrap();
+    let person_a = db::handle_create(&pool, t, "a").await.unwrap();
     db::handle_create(&pool, t, "b").await.unwrap();
     let person_c = db::handle_create(&pool, t, "c").await.unwrap();
 
-    // Step 1: merge b into a — b's tree is now linked into a's tree
+    // Step 1: merge b into a
     db::handle_merge(&pool, t, "a", &["b".into()])
         .await
         .unwrap();
 
-    let resolved_a = db::resolve(&pool, t, "a").await.unwrap().unwrap();
-    let resolved_b = db::resolve(&pool, t, "b").await.unwrap().unwrap();
-    assert_eq!(resolved_a.person_uuid, resolved_b.person_uuid);
+    assert_chain_is_root(&pool, t, "a", &person_a.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &person_a.person_uuid).await;
 
-    // Step 2: merge a into c — since b is part of a's tree, b should
-    // also resolve to c's person after this.
+    // Step 2: merge a into c — b is part of a's tree, so b should also
+    // resolve to c's person through the chain b -> a -> c.
     db::handle_merge(&pool, t, "c", &["a".into()])
         .await
         .unwrap();
 
-    let resolved_a = db::resolve(&pool, t, "a").await.unwrap().unwrap();
-    let resolved_b = db::resolve(&pool, t, "b").await.unwrap().unwrap();
-    let resolved_c = db::resolve(&pool, t, "c").await.unwrap().unwrap();
-
-    assert_eq!(
-        resolved_a.person_uuid, person_c.person_uuid,
-        "a should resolve to c's person"
-    );
-    assert_eq!(
-        resolved_b.person_uuid, person_c.person_uuid,
-        "b should follow the chain through a to c's person"
-    );
-    assert_eq!(resolved_c.person_uuid, person_c.person_uuid);
+    assert_chain_is_root(&pool, t, "c", &person_c.person_uuid).await;
+    assert_chain_matches(&pool, t, "a", &["a", "c"], &person_c.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a", "c"], &person_c.person_uuid).await;
 
     assert_eq!(
         count_person_mappings(&pool, t).await,
@@ -585,14 +620,12 @@ async fn merge_chain_all_ids_follow() {
     assert_all_invariants(&pool, t).await;
 }
 
-/// Verify that a longer chain of merges (a<-b, a<-c, then d<-a) correctly
-/// moves all previously merged distinct_ids to the final target.
 #[tokio::test]
 async fn merge_chain_deep_transitive() {
     let pool = test_pool().await;
     let t = next_team_id();
 
-    db::handle_create(&pool, t, "a").await.unwrap();
+    let person_a = db::handle_create(&pool, t, "a").await.unwrap();
     db::handle_create(&pool, t, "b").await.unwrap();
     db::handle_create(&pool, t, "c").await.unwrap();
     let person_d = db::handle_create(&pool, t, "d").await.unwrap();
@@ -601,32 +634,19 @@ async fn merge_chain_deep_transitive() {
         .await
         .unwrap();
 
-    // a, b, c all share a person
-    for did in &["a", "b", "c"] {
-        let r = db::resolve(&pool, t, did).await.unwrap().unwrap();
-        assert_eq!(
-            r.person_uuid,
-            db::resolve(&pool, t, "a")
-                .await
-                .unwrap()
-                .unwrap()
-                .person_uuid,
-            "{did} should resolve to a's person after first merge"
-        );
-    }
+    assert_chain_is_root(&pool, t, "a", &person_a.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &person_a.person_uuid).await;
+    assert_chain_matches(&pool, t, "c", &["c", "a"], &person_a.person_uuid).await;
 
-    // Now merge a into d — all of a's tree (including b and c) should follow
+    // Merge a into d — all of a's tree (b, c) should follow through a -> d
     db::handle_merge(&pool, t, "d", &["a".into()])
         .await
         .unwrap();
 
-    for did in &["a", "b", "c", "d"] {
-        let r = db::resolve(&pool, t, did).await.unwrap().unwrap();
-        assert_eq!(
-            r.person_uuid, person_d.person_uuid,
-            "{did} should resolve to d's person after second merge"
-        );
-    }
+    assert_chain_is_root(&pool, t, "d", &person_d.person_uuid).await;
+    assert_chain_matches(&pool, t, "a", &["a", "d"], &person_d.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a", "d"], &person_d.person_uuid).await;
+    assert_chain_matches(&pool, t, "c", &["c", "a", "d"], &person_d.person_uuid).await;
 
     assert_eq!(count_person_mappings(&pool, t).await, 1);
     assert_all_invariants(&pool, t).await;
@@ -637,10 +657,11 @@ async fn merge_sets_identified() {
     let pool = test_pool().await;
     let t = next_team_id();
 
-    db::handle_create(&pool, t, "x").await.unwrap();
+    let r_x = db::handle_create(&pool, t, "x").await.unwrap();
     db::handle_create(&pool, t, "y").await.unwrap();
 
-    let pid_x = get_root_person_id(&pool, t, "x").await.unwrap();
+    let chain_x = collect_chain(&pool, t, "x").await;
+    let pid_x = chain_x[0].person_id.unwrap();
     assert!(!is_person_identified(&pool, pid_x).await);
 
     let resp = db::handle_merge(&pool, t, "x", &["y".into()])
@@ -648,6 +669,8 @@ async fn merge_sets_identified() {
         .unwrap();
     assert!(resp.is_identified);
 
+    assert_chain_is_root(&pool, t, "x", &r_x.person_uuid).await;
+    assert_chain_matches(&pool, t, "y", &["y", "x"], &r_x.person_uuid).await;
     assert!(is_person_identified(&pool, pid_x).await);
 }
 
@@ -673,10 +696,7 @@ async fn resolve_root() {
     let resolved = db::resolve(&pool, t, "root-did").await.unwrap().unwrap();
     assert_eq!(resolved.person_uuid, created.person_uuid);
 
-    let chain = walk_chain(&pool, t, "root-did").await;
-    assert_eq!(chain.len(), 1);
-    assert!(chain[0].person_id.is_some());
-    assert!(!chain[0].is_deleted);
+    assert_chain_is_root(&pool, t, "root-did", &created.person_uuid).await;
 }
 
 #[tokio::test]
@@ -690,12 +710,7 @@ async fn resolve_one_hop() {
     let resolved = db::resolve(&pool, t, "leaf").await.unwrap().unwrap();
     assert_eq!(resolved.person_uuid, created.person_uuid);
 
-    let chain = walk_chain(&pool, t, "leaf").await;
-    assert_eq!(chain.len(), 2);
-    assert!(chain[0].person_id.is_none(), "leaf should not be root");
-    assert!(!chain[0].is_deleted);
-    assert!(chain[1].person_id.is_some(), "second node should be root");
-    assert!(!chain[1].is_deleted);
+    assert_chain_matches(&pool, t, "leaf", &["leaf", "root"], &created.person_uuid).await;
 }
 
 #[tokio::test]
@@ -703,7 +718,6 @@ async fn resolve_multi_hop() {
     let pool = test_pool().await;
     let t = next_team_id();
 
-    // Build chain: d -> c -> b -> a (root)
     let created = db::handle_create(&pool, t, "a").await.unwrap();
     db::handle_alias(&pool, t, "a", "b").await.unwrap();
     db::handle_alias(&pool, t, "b", "c").await.unwrap();
@@ -712,15 +726,7 @@ async fn resolve_multi_hop() {
     let resolved = db::resolve(&pool, t, "d").await.unwrap().unwrap();
     assert_eq!(resolved.person_uuid, created.person_uuid);
 
-    let chain = walk_chain(&pool, t, "d").await;
-    assert_eq!(chain.len(), 4, "chain should be d -> c -> b -> a");
-    assert!(chain[3].person_id.is_some(), "last node (a) should be root");
-    for (i, node) in chain.iter().enumerate() {
-        assert!(!node.is_deleted, "node {i} should not be deleted");
-        if i < 3 {
-            assert!(node.person_id.is_none(), "node {i} should not be root");
-        }
-    }
+    assert_chain_matches(&pool, t, "d", &["d", "c", "b", "a"], &created.person_uuid).await;
 
     assert_all_invariants(&pool, t).await;
 }
@@ -735,10 +741,12 @@ async fn create_then_alias() {
     let t = next_team_id();
 
     let person_a = db::handle_create(&pool, t, "a").await.unwrap();
+    assert_chain_is_root(&pool, t, "a", &person_a.person_uuid).await;
+
     db::handle_alias(&pool, t, "a", "b").await.unwrap();
 
-    let resolved_b = db::resolve(&pool, t, "b").await.unwrap().unwrap();
-    assert_eq!(resolved_b.person_uuid, person_a.person_uuid);
+    assert_chain_is_root(&pool, t, "a", &person_a.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &person_a.person_uuid).await;
 
     assert_all_invariants(&pool, t).await;
 }
@@ -751,15 +759,12 @@ async fn create_alias_merge_workflow() {
     let person_a = db::handle_create(&pool, t, "a").await.unwrap();
     db::handle_create(&pool, t, "b").await.unwrap();
 
-    // Both are unidentified, so alias succeeds (merges b into a)
     let alias_result = db::handle_alias(&pool, t, "a", "b").await.unwrap();
     assert_eq!(alias_result.person_uuid, person_a.person_uuid);
     assert!(alias_result.is_identified);
 
-    let resolved_a = db::resolve(&pool, t, "a").await.unwrap().unwrap();
-    let resolved_b = db::resolve(&pool, t, "b").await.unwrap().unwrap();
-    assert_eq!(resolved_a.person_uuid, person_a.person_uuid);
-    assert_eq!(resolved_b.person_uuid, person_a.person_uuid);
+    assert_chain_is_root(&pool, t, "a", &person_a.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &person_a.person_uuid).await;
 
     assert_eq!(count_person_mappings(&pool, t).await, 1);
 
@@ -783,8 +788,15 @@ async fn team_isolation() {
     let resolved_t2 = db::resolve(&pool, t2, "alias-1").await.unwrap();
     assert!(resolved_t2.is_none());
 
-    let resolved_t1 = db::resolve(&pool, t1, "alias-1").await.unwrap().unwrap();
-    assert_eq!(resolved_t1.person_uuid, p1.person_uuid);
+    assert_chain_matches(
+        &pool,
+        t1,
+        "alias-1",
+        &["alias-1", "shared"],
+        &p1.person_uuid,
+    )
+    .await;
+    assert_chain_is_root(&pool, t2, "shared", &p2.person_uuid).await;
 
     assert_all_invariants(&pool, t1).await;
     assert_all_invariants(&pool, t2).await;
@@ -858,18 +870,36 @@ async fn invariants_after_complex_operations() {
             .unwrap();
 
     for did in &all_dids {
-        let chain = walk_chain(&pool, t, did).await;
+        let chain = collect_chain(&pool, t, did).await;
         assert!(!chain.is_empty(), "chain for {did} should not be empty");
         let root = chain.last().unwrap();
         assert!(
             root.person_id.is_some(),
             "chain for {did} should terminate at a root"
         );
-        for node in &chain {
+        assert!(
+            root.next.is_none(),
+            "chain for {did}: root should have next=NULL"
+        );
+        for (i, link) in chain.iter().enumerate() {
             assert!(
-                !node.is_deleted,
-                "chain for {did} should have no deleted nodes"
+                !link.is_deleted,
+                "chain for {did}: link {i} ('{}') should not be deleted",
+                link.distinct_id
             );
+            if i < chain.len() - 1 {
+                assert!(
+                    link.person_id.is_none(),
+                    "chain for {did}: non-root '{}' should have person_id=NULL",
+                    link.distinct_id
+                );
+                assert_eq!(
+                    link.next,
+                    Some(chain[i + 1].current),
+                    "chain for {did}: link {i} ('{}') next mismatch",
+                    link.distinct_id
+                );
+            }
         }
     }
 
@@ -1041,30 +1071,18 @@ async fn merge_link_structure() {
     let pool = test_pool().await;
     let t = next_team_id();
 
-    db::handle_create(&pool, t, "a").await.unwrap();
-    db::handle_create(&pool, t, "b").await.unwrap();
+    let r_a = db::handle_create(&pool, t, "a").await.unwrap();
+    let r_b = db::handle_create(&pool, t, "b").await.unwrap();
 
-    let uf_a_before = get_uf_row(&pool, t, "a").await.unwrap();
+    assert_chain_is_root(&pool, t, "a", &r_a.person_uuid).await;
+    assert_chain_is_root(&pool, t, "b", &r_b.person_uuid).await;
 
     db::handle_merge(&pool, t, "a", &["b".into()])
         .await
         .unwrap();
 
-    // b's root should now be a non-root linked to a's node
-    let uf_b = get_uf_row(&pool, t, "b").await.unwrap();
-    assert!(uf_b.person_id.is_none(), "b should be non-root after merge");
-    assert!(!uf_b.is_deleted);
-    assert_eq!(
-        uf_b.next,
-        Some(uf_a_before.current),
-        "b should point to a's UF node"
-    );
-
-    // a is still the root
-    let uf_a = get_uf_row(&pool, t, "a").await.unwrap();
-    assert!(uf_a.person_id.is_some(), "a should still be root");
-    assert!(uf_a.next.is_none());
-    assert!(!uf_a.is_deleted);
+    assert_chain_is_root(&pool, t, "a", &r_a.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &r_a.person_uuid).await;
 
     assert_all_invariants(&pool, t).await;
 }
@@ -1074,27 +1092,16 @@ async fn alias_case2b_link_structure() {
     let pool = test_pool().await;
     let t = next_team_id();
 
-    db::handle_create(&pool, t, "a").await.unwrap();
-    db::handle_create(&pool, t, "b").await.unwrap();
+    let r_a = db::handle_create(&pool, t, "a").await.unwrap();
+    let r_b = db::handle_create(&pool, t, "b").await.unwrap();
 
-    let uf_a_before = get_uf_row(&pool, t, "a").await.unwrap();
+    assert_chain_is_root(&pool, t, "a", &r_a.person_uuid).await;
+    assert_chain_is_root(&pool, t, "b", &r_b.person_uuid).await;
 
-    // Both unidentified, so alias case 2b merges b into a
     db::handle_alias(&pool, t, "a", "b").await.unwrap();
 
-    // b's root should now be a non-root linked to a's node
-    let uf_b = get_uf_row(&pool, t, "b").await.unwrap();
-    assert!(uf_b.person_id.is_none(), "b should be non-root after alias");
-    assert!(!uf_b.is_deleted);
-    assert_eq!(
-        uf_b.next,
-        Some(uf_a_before.current),
-        "b should point to a's UF node"
-    );
-
-    let uf_a = get_uf_row(&pool, t, "a").await.unwrap();
-    assert!(uf_a.person_id.is_some(), "a should still be root");
-    assert!(!uf_a.is_deleted);
+    assert_chain_is_root(&pool, t, "a", &r_a.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &r_a.person_uuid).await;
 
     assert_all_invariants(&pool, t).await;
 }
@@ -1109,36 +1116,27 @@ async fn alias_after_merge() {
     let t = next_team_id();
 
     db::handle_create(&pool, t, "a").await.unwrap();
-    db::handle_create(&pool, t, "b").await.unwrap();
+    let person_b = db::handle_create(&pool, t, "b").await.unwrap();
     let person_c = db::handle_create(&pool, t, "c").await.unwrap();
 
-    // merge a into c (a's root now linked under c)
     db::handle_merge(&pool, t, "c", &["a".into()])
         .await
         .unwrap();
 
-    // now alias a with a new distinct_id d — d should resolve to c's person
+    assert_chain_is_root(&pool, t, "c", &person_c.person_uuid).await;
+    assert_chain_matches(&pool, t, "a", &["a", "c"], &person_c.person_uuid).await;
+
     db::handle_alias(&pool, t, "a", "d-new").await.unwrap();
 
-    let resolved_d = db::resolve(&pool, t, "d-new").await.unwrap().unwrap();
-    assert_eq!(
-        resolved_d.person_uuid, person_c.person_uuid,
-        "d should resolve to c's person through the merged chain"
-    );
-
-    for did in &["a", "b", "c", "d-new"] {
-        let r = db::resolve(&pool, t, did).await.unwrap();
-        if did == &"b" {
-            // b was never merged into anything in this test
-            assert!(r.is_some());
-        } else {
-            assert_eq!(
-                r.unwrap().person_uuid,
-                person_c.person_uuid,
-                "{did} should resolve to c's person"
-            );
-        }
-    }
+    assert_chain_matches(
+        &pool,
+        t,
+        "d-new",
+        &["d-new", "a", "c"],
+        &person_c.person_uuid,
+    )
+    .await;
+    assert_chain_is_root(&pool, t, "b", &person_b.person_uuid).await;
 
     assert_all_invariants(&pool, t).await;
 }
@@ -1150,16 +1148,16 @@ async fn alias_reverse_direction() {
 
     let resp1 = db::handle_alias(&pool, t, "a", "b").await.unwrap();
 
-    let dids_before = count_distinct_ids(&pool, t).await;
-    let uf_before = count_union_find(&pool, t).await;
+    assert_chain_is_root(&pool, t, "a", &resp1.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &resp1.person_uuid).await;
 
     // Reverse: alias(b, a) — both exist, same person → case 2a no-op
     let resp2 = db::handle_alias(&pool, t, "b", "a").await.unwrap();
     assert_eq!(resp1.person_uuid, resp2.person_uuid);
     assert!(resp2.is_identified);
 
-    assert_eq!(count_distinct_ids(&pool, t).await, dids_before);
-    assert_eq!(count_union_find(&pool, t).await, uf_before);
+    assert_chain_is_root(&pool, t, "a", &resp1.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &resp1.person_uuid).await;
 
     assert_all_invariants(&pool, t).await;
 }
@@ -1169,28 +1167,14 @@ async fn alias_fan_out() {
     let pool = test_pool().await;
     let t = next_team_id();
 
-    // a is root; b, c are leaves of a; d is a leaf of b
     let resp_ab = db::handle_alias(&pool, t, "a", "b").await.unwrap();
     db::handle_alias(&pool, t, "a", "c").await.unwrap();
     db::handle_alias(&pool, t, "b", "d").await.unwrap();
 
-    for did in &["a", "b", "c", "d"] {
-        let r = db::resolve(&pool, t, did).await.unwrap().unwrap();
-        assert_eq!(
-            r.person_uuid, resp_ab.person_uuid,
-            "{did} should resolve to a's person"
-        );
-    }
-
-    // d should traverse: d -> b -> a (3 nodes)
-    let chain_d = walk_chain(&pool, t, "d").await;
-    assert_eq!(chain_d.len(), 3, "d chain should be d -> b -> a");
-    assert!(chain_d[0].person_id.is_none(), "d should not be root");
-    assert!(chain_d[1].person_id.is_none(), "b should not be root");
-    assert!(chain_d[2].person_id.is_some(), "a should be root");
-    for node in &chain_d {
-        assert!(!node.is_deleted);
-    }
+    assert_chain_is_root(&pool, t, "a", &resp_ab.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &resp_ab.person_uuid).await;
+    assert_chain_matches(&pool, t, "c", &["c", "a"], &resp_ab.person_uuid).await;
+    assert_chain_matches(&pool, t, "d", &["d", "b", "a"], &resp_ab.person_uuid).await;
 
     assert_all_invariants(&pool, t).await;
 }
@@ -1207,15 +1191,14 @@ async fn merge_duplicate_sources() {
     let person_a = db::handle_create(&pool, t, "a").await.unwrap();
     db::handle_create(&pool, t, "b").await.unwrap();
 
-    // b appears twice — second iteration should be a same-person skip
     let resp = db::handle_merge(&pool, t, "a", &["b".into(), "b".into()])
         .await
         .unwrap();
     assert_eq!(resp.person_uuid, person_a.person_uuid);
     assert!(resp.is_identified);
 
-    let resolved_b = db::resolve(&pool, t, "b").await.unwrap().unwrap();
-    assert_eq!(resolved_b.person_uuid, person_a.person_uuid);
+    assert_chain_is_root(&pool, t, "a", &person_a.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &person_a.person_uuid).await;
 
     assert_eq!(count_person_mappings(&pool, t).await, 1);
     assert_all_invariants(&pool, t).await;
@@ -1229,14 +1212,13 @@ async fn merge_target_plus_others_in_sources() {
     let person_a = db::handle_create(&pool, t, "a").await.unwrap();
     db::handle_create(&pool, t, "b").await.unwrap();
 
-    // target "a" also appears in sources alongside real source "b"
     let resp = db::handle_merge(&pool, t, "a", &["a".into(), "b".into()])
         .await
         .unwrap();
     assert_eq!(resp.person_uuid, person_a.person_uuid);
 
-    let resolved_b = db::resolve(&pool, t, "b").await.unwrap().unwrap();
-    assert_eq!(resolved_b.person_uuid, person_a.person_uuid);
+    assert_chain_is_root(&pool, t, "a", &person_a.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &person_a.person_uuid).await;
 
     assert_eq!(count_person_mappings(&pool, t).await, 1);
     assert_all_invariants(&pool, t).await;
@@ -1251,7 +1233,6 @@ async fn full_pipeline_create_alias_merge_alias_resolve() {
     let pool = test_pool().await;
     let t = next_team_id();
 
-    // create(a) -> alias(a, b) -> create(c) -> merge(a, [c]) -> alias(a, d)
     let person_a = db::handle_create(&pool, t, "a").await.unwrap();
     db::handle_alias(&pool, t, "a", "b").await.unwrap();
     db::handle_create(&pool, t, "c").await.unwrap();
@@ -1260,13 +1241,10 @@ async fn full_pipeline_create_alias_merge_alias_resolve() {
         .unwrap();
     db::handle_alias(&pool, t, "a", "d").await.unwrap();
 
-    for did in &["a", "b", "c", "d"] {
-        let r = db::resolve(&pool, t, did).await.unwrap().unwrap();
-        assert_eq!(
-            r.person_uuid, person_a.person_uuid,
-            "{did} should resolve to a's person"
-        );
-    }
+    assert_chain_is_root(&pool, t, "a", &person_a.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &person_a.person_uuid).await;
+    assert_chain_matches(&pool, t, "c", &["c", "a"], &person_a.person_uuid).await;
+    assert_chain_matches(&pool, t, "d", &["d", "a"], &person_a.person_uuid).await;
 
     assert_eq!(count_person_mappings(&pool, t).await, 1);
     assert_all_invariants(&pool, t).await;
@@ -1283,11 +1261,12 @@ async fn create_idempotent_after_identify() {
 
     let r1 = db::handle_create(&pool, t, "x").await.unwrap();
     assert!(!r1.is_identified);
+    assert_chain_is_root(&pool, t, "x", &r1.person_uuid).await;
 
-    // Alias makes x's person identified
     db::handle_alias(&pool, t, "x", "y").await.unwrap();
+    assert_chain_is_root(&pool, t, "x", &r1.person_uuid).await;
+    assert_chain_matches(&pool, t, "y", &["y", "x"], &r1.person_uuid).await;
 
-    // Re-creating x should reflect the identified state
     let r2 = db::handle_create(&pool, t, "x").await.unwrap();
     assert_eq!(r1.person_uuid, r2.person_uuid);
     assert!(r2.is_identified);
@@ -1298,21 +1277,23 @@ async fn merge_already_identified_target() {
     let pool = test_pool().await;
     let t = next_team_id();
 
-    // Make x identified via self-alias
     let resp_x = db::handle_alias(&pool, t, "x", "x").await.unwrap();
     assert!(resp_x.is_identified);
+    assert_chain_is_root(&pool, t, "x", &resp_x.person_uuid).await;
 
     db::handle_create(&pool, t, "y").await.unwrap();
 
-    // Merge y into x — x was already identified, should stay identified
     let resp = db::handle_merge(&pool, t, "x", &["y".into()])
         .await
         .unwrap();
     assert_eq!(resp.person_uuid, resp_x.person_uuid);
     assert!(resp.is_identified);
 
-    let pid = get_root_person_id(&pool, t, "x").await.unwrap();
-    assert!(is_person_identified(&pool, pid).await);
+    assert_chain_is_root(&pool, t, "x", &resp_x.person_uuid).await;
+    assert_chain_matches(&pool, t, "y", &["y", "x"], &resp_x.person_uuid).await;
+
+    let chain = collect_chain(&pool, t, "x").await;
+    assert!(is_person_identified(&pool, chain[0].person_id.unwrap()).await);
 
     assert_all_invariants(&pool, t).await;
 }
@@ -1326,30 +1307,22 @@ async fn orphan_cleanup_stepwise() {
     let pool = test_pool().await;
     let t = next_team_id();
 
-    db::handle_create(&pool, t, "a").await.unwrap();
+    let r_a = db::handle_create(&pool, t, "a").await.unwrap();
     db::handle_create(&pool, t, "b").await.unwrap();
     db::handle_create(&pool, t, "c").await.unwrap();
     assert_eq!(count_person_mappings(&pool, t).await, 3);
 
-    // Step 1: merge b into a — b's person should be deleted
     db::handle_merge(&pool, t, "a", &["b".into()])
         .await
         .unwrap();
-    assert_eq!(
-        count_person_mappings(&pool, t).await,
-        2,
-        "b's person should be cleaned up after first merge"
-    );
+    assert_eq!(count_person_mappings(&pool, t).await, 2);
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &r_a.person_uuid).await;
 
-    // Step 2: merge c into a — c's person should be deleted
     db::handle_merge(&pool, t, "a", &["c".into()])
         .await
         .unwrap();
-    assert_eq!(
-        count_person_mappings(&pool, t).await,
-        1,
-        "c's person should be cleaned up after second merge"
-    );
+    assert_eq!(count_person_mappings(&pool, t).await, 1);
+    assert_chain_matches(&pool, t, "c", &["c", "a"], &r_a.person_uuid).await;
 
     assert_all_invariants(&pool, t).await;
 }
@@ -1364,7 +1337,10 @@ async fn delete_person_basic() {
     let t = next_team_id();
 
     let created = db::handle_create(&pool, t, "a").await.unwrap();
-    let pid = get_root_person_id(&pool, t, "a").await.unwrap();
+    assert_chain_is_root(&pool, t, "a", &created.person_uuid).await;
+
+    let chain = collect_chain(&pool, t, "a").await;
+    let pid = chain[0].person_id.unwrap();
 
     let resp = db::handle_delete_person(&pool, t, &created.person_uuid)
         .await
@@ -1426,6 +1402,10 @@ async fn delete_person_with_chain() {
     db::handle_alias(&pool, t, "a", "b").await.unwrap();
     db::handle_alias(&pool, t, "a", "c").await.unwrap();
 
+    assert_chain_is_root(&pool, t, "a", &created.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &created.person_uuid).await;
+    assert_chain_matches(&pool, t, "c", &["c", "a"], &created.person_uuid).await;
+
     db::handle_delete_person(&pool, t, &created.person_uuid)
         .await
         .unwrap();
@@ -1476,7 +1456,9 @@ async fn delete_did_sole_node() {
     let t = next_team_id();
 
     let created = db::handle_create(&pool, t, "a").await.unwrap();
-    let pid = get_root_person_id(&pool, t, "a").await.unwrap();
+    assert_chain_is_root(&pool, t, "a", &created.person_uuid).await;
+    let chain = collect_chain(&pool, t, "a").await;
+    let pid = chain[0].person_id.unwrap();
 
     let resp = db::handle_delete_distinct_id(&pool, t, "a").await.unwrap();
     assert_eq!(resp.distinct_id, "a");
@@ -1492,9 +1474,7 @@ async fn delete_did_sole_node() {
     let resolved = db::resolve(&pool, t, "a").await.unwrap();
     assert!(resolved.is_none());
 
-    // person_mapping row still exists (soft-deleted)
     assert!(person_exists(&pool, pid).await);
-    let _ = created;
 
     assert_structural_invariants(&pool, t).await;
 }
@@ -1520,20 +1500,14 @@ async fn delete_did_leaf() {
     let created = db::handle_create(&pool, t, "a").await.unwrap();
     db::handle_alias(&pool, t, "a", "b").await.unwrap();
 
-    // b is the leaf, a is the root
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &created.person_uuid).await;
+
     let resp = db::handle_delete_distinct_id(&pool, t, "b").await.unwrap();
     assert_eq!(resp.distinct_id, "b");
-    assert!(
-        !resp.person_deleted,
-        "person should NOT be deleted (a still references it)"
-    );
+    assert!(!resp.person_deleted);
 
-    let resolved_a = db::resolve(&pool, t, "a").await.unwrap();
-    assert!(resolved_a.is_some());
-    assert_eq!(resolved_a.unwrap().person_uuid, created.person_uuid);
-
-    let resolved_b = db::resolve(&pool, t, "b").await.unwrap();
-    assert!(resolved_b.is_none(), "b should no longer resolve");
+    assert_chain_is_root(&pool, t, "a", &created.person_uuid).await;
+    assert!(db::resolve(&pool, t, "b").await.unwrap().is_none());
 
     assert_eq!(count_distinct_ids(&pool, t).await, 1);
     assert_eq!(count_union_find(&pool, t).await, 1);
@@ -1549,28 +1523,17 @@ async fn delete_did_root() {
     let created = db::handle_create(&pool, t, "a").await.unwrap();
     db::handle_alias(&pool, t, "a", "b").await.unwrap();
 
-    // a is the root, b is the leaf pointing to a
-    // Deleting a should unlink a (b inherits a's person_id) then hard-delete a
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &created.person_uuid).await;
+
     let resp = db::handle_delete_distinct_id(&pool, t, "a").await.unwrap();
     assert_eq!(resp.distinct_id, "a");
-    assert!(
-        !resp.person_deleted,
-        "person should NOT be deleted (b inherited root)"
-    );
+    assert!(!resp.person_deleted);
 
-    let resolved_b = db::resolve(&pool, t, "b").await.unwrap();
-    assert!(resolved_b.is_some(), "b should still resolve");
-    assert_eq!(resolved_b.unwrap().person_uuid, created.person_uuid);
-
-    let resolved_a = db::resolve(&pool, t, "a").await.unwrap();
-    assert!(resolved_a.is_none(), "a should no longer resolve");
+    assert!(db::resolve(&pool, t, "a").await.unwrap().is_none());
+    assert_chain_is_root(&pool, t, "b", &created.person_uuid).await;
 
     assert_eq!(count_distinct_ids(&pool, t).await, 1);
     assert_eq!(count_union_find(&pool, t).await, 1);
-
-    let uf_b = get_uf_row(&pool, t, "b").await.unwrap();
-    assert!(uf_b.person_id.is_some(), "b should now be the root");
-    assert!(uf_b.next.is_none());
 
     assert_all_invariants(&pool, t).await;
 }
@@ -1580,36 +1543,23 @@ async fn delete_did_mid_chain() {
     let pool = test_pool().await;
     let t = next_team_id();
 
-    // Build chain: c -> b -> a (root)
     let created = db::handle_create(&pool, t, "a").await.unwrap();
     db::handle_alias(&pool, t, "a", "b").await.unwrap();
     db::handle_alias(&pool, t, "b", "c").await.unwrap();
 
-    // Delete b (mid-chain) — c should be spliced past b to point at a
+    assert_chain_matches(&pool, t, "c", &["c", "b", "a"], &created.person_uuid).await;
+
     let resp = db::handle_delete_distinct_id(&pool, t, "b").await.unwrap();
     assert_eq!(resp.distinct_id, "b");
     assert!(!resp.person_deleted);
 
-    let resolved_a = db::resolve(&pool, t, "a").await.unwrap().unwrap();
-    assert_eq!(resolved_a.person_uuid, created.person_uuid);
-
-    let resolved_c = db::resolve(&pool, t, "c").await.unwrap().unwrap();
-    assert_eq!(resolved_c.person_uuid, created.person_uuid);
-
-    let resolved_b = db::resolve(&pool, t, "b").await.unwrap();
-    assert!(resolved_b.is_none());
+    assert!(db::resolve(&pool, t, "b").await.unwrap().is_none());
 
     assert_eq!(count_distinct_ids(&pool, t).await, 2);
     assert_eq!(count_union_find(&pool, t).await, 2);
 
-    // Verify chain structure: c should now point directly to a
-    let uf_c = get_uf_row(&pool, t, "c").await.unwrap();
-    let uf_a = get_uf_row(&pool, t, "a").await.unwrap();
-    assert_eq!(
-        uf_c.next,
-        Some(uf_a.current),
-        "c should point directly to a after b removed"
-    );
+    assert_chain_is_root(&pool, t, "a", &created.person_uuid).await;
+    assert_chain_matches(&pool, t, "c", &["c", "a"], &created.person_uuid).await;
 
     assert_all_invariants(&pool, t).await;
 }
@@ -1624,18 +1574,16 @@ async fn delete_did_preserves_siblings() {
         .await
         .unwrap();
 
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &created.person_uuid).await;
+    assert_chain_matches(&pool, t, "c", &["c", "a"], &created.person_uuid).await;
+
     let resp = db::handle_delete_distinct_id(&pool, t, "b").await.unwrap();
     assert_eq!(resp.distinct_id, "b");
     assert!(!resp.person_deleted);
 
-    let resolved_a = db::resolve(&pool, t, "a").await.unwrap().unwrap();
-    assert_eq!(resolved_a.person_uuid, created.person_uuid);
-
-    let resolved_c = db::resolve(&pool, t, "c").await.unwrap().unwrap();
-    assert_eq!(resolved_c.person_uuid, created.person_uuid);
-
-    let resolved_b = db::resolve(&pool, t, "b").await.unwrap();
-    assert!(resolved_b.is_none());
+    assert!(db::resolve(&pool, t, "b").await.unwrap().is_none());
+    assert_chain_is_root(&pool, t, "a", &created.person_uuid).await;
+    assert_chain_matches(&pool, t, "c", &["c", "a"], &created.person_uuid).await;
 
     assert_eq!(count_distinct_ids(&pool, t).await, 2);
     assert_eq!(count_union_find(&pool, t).await, 2);
@@ -1654,6 +1602,8 @@ async fn create_after_delete_person() {
     let t = next_team_id();
 
     let old = db::handle_create(&pool, t, "a").await.unwrap();
+    assert_chain_is_root(&pool, t, "a", &old.person_uuid).await;
+
     db::handle_delete_person(&pool, t, &old.person_uuid)
         .await
         .unwrap();
@@ -1661,8 +1611,7 @@ async fn create_after_delete_person() {
     let new = db::handle_create(&pool, t, "a").await.unwrap();
     assert_ne!(old.person_uuid, new.person_uuid, "should get a new person");
 
-    let resolved = db::resolve(&pool, t, "a").await.unwrap().unwrap();
-    assert_eq!(resolved.person_uuid, new.person_uuid);
+    assert_chain_is_root(&pool, t, "a", &new.person_uuid).await;
 
     assert_eq!(count_live_person_mappings(&pool, t).await, 1);
     assert_structural_invariants(&pool, t).await;
@@ -1673,26 +1622,17 @@ async fn create_after_delete_person_no_duplicate_rows() {
     let pool = test_pool().await;
     let t = next_team_id();
 
-    db::handle_create(&pool, t, "a").await.unwrap();
-    let old_uuid = db::resolve(&pool, t, "a")
+    let old = db::handle_create(&pool, t, "a").await.unwrap();
+    assert_chain_is_root(&pool, t, "a", &old.person_uuid).await;
+    db::handle_delete_person(&pool, t, &old.person_uuid)
         .await
-        .unwrap()
-        .unwrap()
-        .person_uuid;
-    db::handle_delete_person(&pool, t, &old_uuid).await.unwrap();
+        .unwrap();
 
-    db::handle_create(&pool, t, "a").await.unwrap();
+    let new = db::handle_create(&pool, t, "a").await.unwrap();
+    assert_chain_is_root(&pool, t, "a", &new.person_uuid).await;
 
-    assert_eq!(
-        count_distinct_ids(&pool, t).await,
-        1,
-        "DID row should be reused, not duplicated"
-    );
-    assert_eq!(
-        count_union_find(&pool, t).await,
-        1,
-        "union_find row should be reused, not duplicated"
-    );
+    assert_eq!(count_distinct_ids(&pool, t).await, 1);
+    assert_eq!(count_union_find(&pool, t).await, 1);
     assert_eq!(count_live_person_mappings(&pool, t).await, 1);
 
     assert_structural_invariants(&pool, t).await;
@@ -1705,21 +1645,19 @@ async fn alias_with_deleted_target() {
 
     let pa = db::handle_create(&pool, t, "a").await.unwrap();
     let pb = db::handle_create(&pool, t, "b").await.unwrap();
+    assert_chain_is_root(&pool, t, "a", &pa.person_uuid).await;
+    assert_chain_is_root(&pool, t, "b", &pb.person_uuid).await;
 
     db::handle_delete_person(&pool, t, &pa.person_uuid)
         .await
         .unwrap();
 
-    // a is orphaned, b is live → a should attach into b's chain
     let resp = db::handle_alias(&pool, t, "a", "b").await.unwrap();
     assert_eq!(resp.person_uuid, pb.person_uuid);
     assert!(resp.is_identified);
 
-    let resolved_a = db::resolve(&pool, t, "a").await.unwrap().unwrap();
-    assert_eq!(resolved_a.person_uuid, pb.person_uuid);
-
-    let resolved_b = db::resolve(&pool, t, "b").await.unwrap().unwrap();
-    assert_eq!(resolved_b.person_uuid, pb.person_uuid);
+    assert_chain_is_root(&pool, t, "b", &pb.person_uuid).await;
+    assert_chain_matches(&pool, t, "a", &["a", "b"], &pb.person_uuid).await;
 
     assert_structural_invariants(&pool, t).await;
 }
@@ -1731,21 +1669,19 @@ async fn alias_with_deleted_source() {
 
     let pa = db::handle_create(&pool, t, "a").await.unwrap();
     let pb = db::handle_create(&pool, t, "b").await.unwrap();
+    assert_chain_is_root(&pool, t, "a", &pa.person_uuid).await;
+    assert_chain_is_root(&pool, t, "b", &pb.person_uuid).await;
 
     db::handle_delete_person(&pool, t, &pb.person_uuid)
         .await
         .unwrap();
 
-    // a is live, b is orphaned → b should attach into a's chain
     let resp = db::handle_alias(&pool, t, "a", "b").await.unwrap();
     assert_eq!(resp.person_uuid, pa.person_uuid);
     assert!(resp.is_identified);
 
-    let resolved_a = db::resolve(&pool, t, "a").await.unwrap().unwrap();
-    assert_eq!(resolved_a.person_uuid, pa.person_uuid);
-
-    let resolved_b = db::resolve(&pool, t, "b").await.unwrap().unwrap();
-    assert_eq!(resolved_b.person_uuid, pa.person_uuid);
+    assert_chain_is_root(&pool, t, "a", &pa.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &pa.person_uuid).await;
 
     assert_structural_invariants(&pool, t).await;
 }
@@ -1765,23 +1701,15 @@ async fn alias_both_deleted() {
         .await
         .unwrap();
 
-    // Both orphaned → new person created, both DIDs reused
     let resp = db::handle_alias(&pool, t, "a", "b").await.unwrap();
     assert_ne!(resp.person_uuid, pa.person_uuid);
     assert_ne!(resp.person_uuid, pb.person_uuid);
     assert!(resp.is_identified);
 
-    let resolved_a = db::resolve(&pool, t, "a").await.unwrap().unwrap();
-    assert_eq!(resolved_a.person_uuid, resp.person_uuid);
+    assert_chain_is_root(&pool, t, "a", &resp.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &resp.person_uuid).await;
 
-    let resolved_b = db::resolve(&pool, t, "b").await.unwrap().unwrap();
-    assert_eq!(resolved_b.person_uuid, resp.person_uuid);
-
-    assert_eq!(
-        count_distinct_ids(&pool, t).await,
-        2,
-        "DID rows should be reused"
-    );
+    assert_eq!(count_distinct_ids(&pool, t).await, 2);
     assert_eq!(count_live_person_mappings(&pool, t).await, 1);
 
     assert_structural_invariants(&pool, t).await;
@@ -1797,18 +1725,14 @@ async fn merge_with_deleted_target() {
         .await
         .unwrap();
 
-    // Target orphaned → should create new person for a, then link b
     let resp = db::handle_merge(&pool, t, "a", &["b".into()])
         .await
         .unwrap();
     assert_ne!(resp.person_uuid, pa.person_uuid);
     assert!(resp.is_identified);
 
-    let resolved_a = db::resolve(&pool, t, "a").await.unwrap().unwrap();
-    assert_eq!(resolved_a.person_uuid, resp.person_uuid);
-
-    let resolved_b = db::resolve(&pool, t, "b").await.unwrap().unwrap();
-    assert_eq!(resolved_b.person_uuid, resp.person_uuid);
+    assert_chain_is_root(&pool, t, "a", &resp.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &resp.person_uuid).await;
 
     assert_structural_invariants(&pool, t).await;
 }
@@ -1825,15 +1749,14 @@ async fn merge_with_deleted_source() {
         .await
         .unwrap();
 
-    // b is orphaned → should be linked into a's chain
     let resp = db::handle_merge(&pool, t, "a", &["b".into()])
         .await
         .unwrap();
     assert_eq!(resp.person_uuid, pa.person_uuid);
     assert!(resp.is_identified);
 
-    let resolved_b = db::resolve(&pool, t, "b").await.unwrap().unwrap();
-    assert_eq!(resolved_b.person_uuid, pa.person_uuid);
+    assert_chain_is_root(&pool, t, "a", &pa.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &pa.person_uuid).await;
 
     assert_structural_invariants(&pool, t).await;
 }
@@ -1867,20 +1790,20 @@ async fn delete_person_then_full_lifecycle() {
     let old = db::handle_create(&pool, t, "a").await.unwrap();
     db::handle_alias(&pool, t, "a", "b").await.unwrap();
 
+    assert_chain_is_root(&pool, t, "a", &old.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &old.person_uuid).await;
+
     db::handle_delete_person(&pool, t, &old.person_uuid)
         .await
         .unwrap();
 
-    // Re-create a (lazy unlink), then alias with c
     let new = db::handle_create(&pool, t, "a").await.unwrap();
     assert_ne!(old.person_uuid, new.person_uuid);
 
     db::handle_alias(&pool, t, "a", "c").await.unwrap();
 
-    let resolved_a = db::resolve(&pool, t, "a").await.unwrap().unwrap();
-    let resolved_c = db::resolve(&pool, t, "c").await.unwrap().unwrap();
-    assert_eq!(resolved_a.person_uuid, new.person_uuid);
-    assert_eq!(resolved_c.person_uuid, new.person_uuid);
+    assert_chain_is_root(&pool, t, "a", &new.person_uuid).await;
+    assert_chain_matches(&pool, t, "c", &["c", "a"], &new.person_uuid).await;
 
     assert_eq!(count_live_person_mappings(&pool, t).await, 1);
     assert_structural_invariants(&pool, t).await;
@@ -1894,17 +1817,15 @@ async fn delete_did_then_recreate() {
     let pa = db::handle_create(&pool, t, "a").await.unwrap();
     db::handle_alias(&pool, t, "a", "b").await.unwrap();
 
-    // Hard-delete b's DID
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &pa.person_uuid).await;
+
     db::handle_delete_distinct_id(&pool, t, "b").await.unwrap();
 
-    // b is now fully gone — create(b) should get a fresh person
     let pb = db::handle_create(&pool, t, "b").await.unwrap();
     assert_ne!(pa.person_uuid, pb.person_uuid, "b should be a new person");
 
-    let resolved_a = db::resolve(&pool, t, "a").await.unwrap().unwrap();
-    let resolved_b = db::resolve(&pool, t, "b").await.unwrap().unwrap();
-    assert_eq!(resolved_a.person_uuid, pa.person_uuid);
-    assert_eq!(resolved_b.person_uuid, pb.person_uuid);
+    assert_chain_is_root(&pool, t, "a", &pa.person_uuid).await;
+    assert_chain_is_root(&pool, t, "b", &pb.person_uuid).await;
 
     assert_all_invariants(&pool, t).await;
 }
@@ -1918,23 +1839,26 @@ async fn delete_person_merge_recovery() {
     let pb = db::handle_create(&pool, t, "b").await.unwrap();
     db::handle_alias(&pool, t, "a", "c").await.unwrap();
 
-    // Delete a's person (a and c become orphaned)
+    assert_chain_is_root(&pool, t, "a", &pa.person_uuid).await;
+    assert_chain_matches(&pool, t, "c", &["c", "a"], &pa.person_uuid).await;
+
     db::handle_delete_person(&pool, t, &pa.person_uuid)
         .await
         .unwrap();
 
-    // Merge orphaned a and c into live b
     let resp = db::handle_merge(&pool, t, "b", &["a".into(), "c".into()])
         .await
         .unwrap();
     assert_eq!(resp.person_uuid, pb.person_uuid);
     assert!(resp.is_identified);
 
-    for did in &["a", "b", "c"] {
-        let resolved = db::resolve(&pool, t, did).await.unwrap().unwrap();
+    assert_chain_is_root(&pool, t, "b", &pb.person_uuid).await;
+    for did in &["a", "c"] {
+        let chain = collect_chain(&pool, t, did).await;
         assert_eq!(
-            resolved.person_uuid, pb.person_uuid,
-            "{did} should resolve to b's person after merge recovery"
+            chain.last().unwrap().distinct_id,
+            "b",
+            "{did} chain should terminate at root 'b'"
         );
     }
 
@@ -1950,45 +1874,58 @@ async fn delete_did_root_with_multiple_parents() {
     let pool = test_pool().await;
     let t = next_team_id();
 
-    // Build fan-out: A -> R, B -> R, C -> R  (R is root)
     let created = db::handle_create(&pool, t, "r").await.unwrap();
     db::handle_alias(&pool, t, "r", "a").await.unwrap();
     db::handle_alias(&pool, t, "r", "b").await.unwrap();
     db::handle_alias(&pool, t, "r", "c").await.unwrap();
 
-    let pid_before = get_root_person_id(&pool, t, "r").await.unwrap();
+    assert_chain_is_root(&pool, t, "r", &created.person_uuid).await;
+    assert_chain_matches(&pool, t, "a", &["a", "r"], &created.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "r"], &created.person_uuid).await;
+    assert_chain_matches(&pool, t, "c", &["c", "r"], &created.person_uuid).await;
 
-    // Delete the root distinct_id
+    let root_uf = get_uf_row(&pool, t, "r").await.unwrap();
+    let parents_before = collect_parents(&pool, t, root_uf.current).await;
+    assert_eq!(parents_before.len(), 3, "r should have 3 parents: a, b, c");
+
     let resp = db::handle_delete_distinct_id(&pool, t, "r").await.unwrap();
     assert_eq!(resp.distinct_id, "r");
+    assert!(!resp.person_deleted);
+
+    assert!(db::resolve(&pool, t, "r").await.unwrap().is_none());
+
+    // Structural verification: exactly one former parent became root.
+    // Which parent was promoted is nondeterministic -- we verify invariants.
+    let mut promoted_did: Option<String> = None;
+    for did in &["a", "b", "c"] {
+        let chain = collect_chain(&pool, t, did).await;
+        let root = chain.last().unwrap();
+        assert!(
+            root.person_id.is_some(),
+            "{did} chain should terminate at a root"
+        );
+        assert!(
+            root.next.is_none(),
+            "{did} chain root should have next=NULL"
+        );
+        let resolved = db::resolve(&pool, t, did).await.unwrap().unwrap();
+        assert_eq!(
+            resolved.person_uuid, created.person_uuid,
+            "{did} should resolve to original person"
+        );
+        if chain.len() == 1 {
+            assert!(
+                promoted_did.is_none(),
+                "multiple nodes appear to be root: {} and {did}",
+                promoted_did.as_deref().unwrap_or("?")
+            );
+            promoted_did = Some(did.to_string());
+        }
+    }
     assert!(
-        !resp.person_deleted,
-        "person should survive via promoted parent"
+        promoted_did.is_some(),
+        "one parent should have been promoted to root"
     );
-
-    // r should no longer resolve
-    let resolved_r = db::resolve(&pool, t, "r").await.unwrap();
-    assert!(resolved_r.is_none());
-
-    // All remaining distinct_ids should resolve to the same person
-    let resolved_a = db::resolve(&pool, t, "a").await.unwrap().unwrap();
-    let resolved_b = db::resolve(&pool, t, "b").await.unwrap().unwrap();
-    let resolved_c = db::resolve(&pool, t, "c").await.unwrap().unwrap();
-    assert_eq!(resolved_a.person_uuid, created.person_uuid);
-    assert_eq!(resolved_b.person_uuid, created.person_uuid);
-    assert_eq!(resolved_c.person_uuid, created.person_uuid);
-
-    // Exactly one root should exist with the original person_id
-    let roots: Vec<(i64,)> = sqlx::query_as(
-        "SELECT current FROM union_find \
-         WHERE team_id = $1 AND person_id = $2",
-    )
-    .bind(t)
-    .bind(pid_before)
-    .fetch_all(&pool)
-    .await
-    .unwrap();
-    assert_eq!(roots.len(), 1, "exactly one root should hold the person_id");
 
     assert_eq!(count_distinct_ids(&pool, t).await, 3);
     assert_eq!(count_union_find(&pool, t).await, 3);
@@ -2002,20 +1939,32 @@ async fn delete_did_root_with_multiple_parents_and_chain() {
     let pool = test_pool().await;
     let t = next_team_id();
 
-    // Build: D -> A -> R (root), B -> R, C -> R
     let created = db::handle_create(&pool, t, "r").await.unwrap();
     db::handle_alias(&pool, t, "r", "a").await.unwrap();
     db::handle_alias(&pool, t, "a", "d").await.unwrap();
     db::handle_alias(&pool, t, "r", "b").await.unwrap();
     db::handle_alias(&pool, t, "r", "c").await.unwrap();
 
-    // Delete the root
+    assert_chain_is_root(&pool, t, "r", &created.person_uuid).await;
+    assert_chain_matches(&pool, t, "d", &["d", "a", "r"], &created.person_uuid).await;
+
     let resp = db::handle_delete_distinct_id(&pool, t, "r").await.unwrap();
     assert_eq!(resp.distinct_id, "r");
     assert!(!resp.person_deleted);
 
-    // All remaining distinct_ids should resolve to the same person
+    // Verify structural consistency: all DIDs resolve to original person,
+    // exactly one former parent became root, d's chain still terminates.
     for did in &["a", "b", "c", "d"] {
+        let chain = collect_chain(&pool, t, did).await;
+        let root = chain.last().unwrap();
+        assert!(
+            root.person_id.is_some(),
+            "{did} chain should terminate at root"
+        );
+        assert!(
+            root.next.is_none(),
+            "{did} chain root should have next=NULL"
+        );
         let resolved = db::resolve(&pool, t, did).await.unwrap().unwrap();
         assert_eq!(
             resolved.person_uuid, created.person_uuid,
@@ -2023,15 +1972,10 @@ async fn delete_did_root_with_multiple_parents_and_chain() {
         );
     }
 
-    // D's chain should still work (D -> A -> ... -> new root)
-    let chain_d = walk_chain(&pool, t, "d").await;
+    let chain_d = collect_chain(&pool, t, "d").await;
     assert!(
         chain_d.len() >= 2,
         "d should traverse at least 2 nodes to reach root"
-    );
-    assert!(
-        chain_d.last().unwrap().person_id.is_some(),
-        "chain should terminate at a root"
     );
 
     assert_eq!(count_distinct_ids(&pool, t).await, 4);
@@ -2046,25 +1990,22 @@ async fn delete_did_root_no_parents() {
     let t = next_team_id();
 
     let created = db::handle_create(&pool, t, "solo").await.unwrap();
-    let pid = get_root_person_id(&pool, t, "solo").await.unwrap();
+    assert_chain_is_root(&pool, t, "solo", &created.person_uuid).await;
+    let chain = collect_chain(&pool, t, "solo").await;
+    let pid = chain[0].person_id.unwrap();
 
     let resp = db::handle_delete_distinct_id(&pool, t, "solo")
         .await
         .unwrap();
     assert_eq!(resp.distinct_id, "solo");
-    assert!(
-        resp.person_deleted,
-        "person should be soft-deleted when last DID removed"
-    );
+    assert!(resp.person_deleted);
 
     assert_eq!(count_distinct_ids(&pool, t).await, 0);
     assert_eq!(count_union_find(&pool, t).await, 0);
     assert!(is_person_deleted(&pool, pid).await);
 
-    let resolved = db::resolve(&pool, t, "solo").await.unwrap();
-    assert!(resolved.is_none());
+    assert!(db::resolve(&pool, t, "solo").await.unwrap().is_none());
 
-    let _ = created;
     assert_structural_invariants(&pool, t).await;
 }
 
@@ -2073,36 +2014,27 @@ async fn unlink_root_after_delete_person() {
     let pool = test_pool().await;
     let t = next_team_id();
 
-    // Build chain: B -> A (root, person P1)
     let pa = db::handle_create(&pool, t, "a").await.unwrap();
     db::handle_alias(&pool, t, "a", "b").await.unwrap();
 
-    // Soft-delete the person
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &pa.person_uuid).await;
+
     db::handle_delete_person(&pool, t, &pa.person_uuid)
         .await
         .unwrap();
 
-    // Both a and b should resolve to None now (person is soft-deleted)
     assert!(db::resolve(&pool, t, "a").await.unwrap().is_none());
     assert!(db::resolve(&pool, t, "b").await.unwrap().is_none());
 
-    // Trigger check_did on "b" by re-creating it — this should lazily unlink b
-    // from the dead chain and give it a fresh person.
     let new_b = db::handle_create(&pool, t, "b").await.unwrap();
     assert_ne!(new_b.person_uuid, pa.person_uuid);
+    assert_chain_is_root(&pool, t, "b", &new_b.person_uuid).await;
 
-    let resolved_b = db::resolve(&pool, t, "b").await.unwrap().unwrap();
-    assert_eq!(resolved_b.person_uuid, new_b.person_uuid);
-
-    // a is still orphaned (part of the dead chain)
     assert!(db::resolve(&pool, t, "a").await.unwrap().is_none());
 
-    // Now trigger check_did on "a" by re-creating it
     let new_a = db::handle_create(&pool, t, "a").await.unwrap();
     assert_ne!(new_a.person_uuid, pa.person_uuid);
-
-    let resolved_a = db::resolve(&pool, t, "a").await.unwrap().unwrap();
-    assert_eq!(resolved_a.person_uuid, new_a.person_uuid);
+    assert_chain_is_root(&pool, t, "a", &new_a.person_uuid).await;
 
     assert_structural_invariants(&pool, t).await;
 }
@@ -2112,18 +2044,20 @@ async fn unlink_root_with_fan_out_after_delete_person() {
     let pool = test_pool().await;
     let t = next_team_id();
 
-    // Build fan-out: A -> R, B -> R, C -> R  (R is root)
     let pr = db::handle_create(&pool, t, "r").await.unwrap();
     db::handle_alias(&pool, t, "r", "a").await.unwrap();
     db::handle_alias(&pool, t, "r", "b").await.unwrap();
     db::handle_alias(&pool, t, "r", "c").await.unwrap();
 
-    // Soft-delete the person
+    assert_chain_is_root(&pool, t, "r", &pr.person_uuid).await;
+    assert_chain_matches(&pool, t, "a", &["a", "r"], &pr.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "r"], &pr.person_uuid).await;
+    assert_chain_matches(&pool, t, "c", &["c", "r"], &pr.person_uuid).await;
+
     db::handle_delete_person(&pool, t, &pr.person_uuid)
         .await
         .unwrap();
 
-    // All should resolve to None
     for did in &["r", "a", "b", "c"] {
         assert!(
             db::resolve(&pool, t, did).await.unwrap().is_none(),
@@ -2131,15 +2065,9 @@ async fn unlink_root_with_fan_out_after_delete_person() {
         );
     }
 
-    // Trigger lazy unlink on "a" via create — the root R is soft-deleted,
-    // so check_did should unlink "a" and give it a fresh person.
     let new_a = db::handle_create(&pool, t, "a").await.unwrap();
     assert_ne!(new_a.person_uuid, pr.person_uuid);
+    assert_chain_is_root(&pool, t, "a", &new_a.person_uuid).await;
 
-    let resolved_a = db::resolve(&pool, t, "a").await.unwrap().unwrap();
-    assert_eq!(resolved_a.person_uuid, new_a.person_uuid);
-
-    // The uniqueness invariant should still hold even though we're in the
-    // middle of lazily cleaning up the soft-deleted chain.
     assert_structural_invariants(&pool, t).await;
 }

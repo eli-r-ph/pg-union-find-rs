@@ -65,6 +65,7 @@ pub async fn count_union_find(pool: &PgPool, team_id: i64) -> i64 {
 // ---- Graph structure helpers ------------------------------------------------
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct UfRow {
     pub current: i64,
     pub next: Option<i64>,
@@ -93,63 +94,181 @@ pub async fn get_uf_row(pool: &PgPool, team_id: i64, distinct_id: &str) -> Optio
     })
 }
 
-/// Walk the chain from a distinct_id to the root via iterative SQL lookups.
-/// Returns the sequence of union_find rows from start to root.
-pub async fn walk_chain(pool: &PgPool, team_id: i64, distinct_id: &str) -> Vec<UfRow> {
-    let mut chain = Vec::new();
+// ---- CTE-based chain and parent collection ----------------------------------
 
-    let start_pk: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM distinct_id_mappings WHERE team_id = $1 AND distinct_id = $2",
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct ChainLink {
+    pub current: i64,
+    pub distinct_id: String,
+    pub next: Option<i64>,
+    pub person_id: Option<i64>,
+    pub is_deleted: bool,
+    pub depth: i32,
+}
+
+/// Collect the full chain from a distinct_id to root using a single recursive
+/// CTE (atomic snapshot). Returns links ordered by depth (0 = starting node).
+pub async fn collect_chain(pool: &PgPool, team_id: i64, distinct_id: &str) -> Vec<ChainLink> {
+    sqlx::query_as::<_, (i64, String, Option<i64>, Option<i64>, bool, i32)>(
+        r#"
+        WITH RECURSIVE chain AS (
+            SELECT uf.current, uf.next, uf.person_id, uf.deleted_at, 0 AS depth
+            FROM union_find uf
+            JOIN distinct_id_mappings d ON d.id = uf.current AND d.team_id = uf.team_id
+            WHERE d.team_id = $1 AND d.distinct_id = $2
+
+            UNION ALL
+
+            SELECT uf.current, uf.next, uf.person_id, uf.deleted_at, c.depth + 1
+            FROM chain c
+            JOIN union_find uf ON uf.team_id = $1 AND uf.current = c.next
+            WHERE c.person_id IS NULL AND c.depth < 1000
+        )
+        SELECT c.current, d.distinct_id, c.next, c.person_id,
+               (c.deleted_at IS NOT NULL) AS is_deleted, c.depth
+        FROM chain c
+        JOIN distinct_id_mappings d ON d.id = c.current AND d.team_id = $1
+        ORDER BY c.depth
+        "#,
     )
     .bind(team_id)
     .bind(distinct_id)
-    .fetch_optional(pool)
+    .fetch_all(pool)
     .await
-    .unwrap();
+    .unwrap()
+    .into_iter()
+    .map(
+        |(current, distinct_id, next, person_id, is_deleted, depth)| ChainLink {
+            current,
+            distinct_id,
+            next,
+            person_id,
+            is_deleted,
+            depth,
+        },
+    )
+    .collect()
+}
 
-    let Some(mut current_pk) = start_pk else {
-        return chain;
-    };
+/// Collect all union_find rows whose `next` points to a given node, ordered by
+/// `current ASC`. Useful for inspecting fan-in topology before/after root
+/// deletion. The production `unlink_did` picks the promoted parent via
+/// `LIMIT 1` without `ORDER BY` — which parent is chosen is nondeterministic.
+pub async fn collect_parents(pool: &PgPool, team_id: i64, did_pk: i64) -> Vec<ChainLink> {
+    sqlx::query_as::<_, (i64, String, Option<i64>, Option<i64>, bool)>(
+        "SELECT uf.current, d.distinct_id, uf.next, uf.person_id, \
+                (uf.deleted_at IS NOT NULL) AS is_deleted \
+         FROM union_find uf \
+         JOIN distinct_id_mappings d ON d.id = uf.current AND d.team_id = uf.team_id \
+         WHERE uf.team_id = $1 AND uf.next = $2 \
+         ORDER BY uf.current",
+    )
+    .bind(team_id)
+    .bind(did_pk)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(
+        |(current, distinct_id, next, person_id, is_deleted)| ChainLink {
+            current,
+            distinct_id,
+            next,
+            person_id,
+            is_deleted,
+            depth: 0,
+        },
+    )
+    .collect()
+}
 
-    for _ in 0..1001 {
-        let row = sqlx::query_as::<_, (i64, Option<i64>, Option<i64>, bool)>(
-            "SELECT current, next, person_id, (deleted_at IS NOT NULL) FROM union_find \
-             WHERE team_id = $1 AND current = $2",
-        )
-        .bind(team_id)
-        .bind(current_pk)
-        .fetch_optional(pool)
-        .await
-        .unwrap();
+// ---- Chain assertion helpers ------------------------------------------------
 
-        match row {
-            Some((current, next, person_id, is_deleted)) => {
-                let is_root = person_id.is_some();
-                chain.push(UfRow {
-                    current,
-                    next,
-                    person_id,
-                    is_deleted,
-                });
-                if is_root {
-                    break;
-                }
-                match next {
-                    Some(n) => current_pk = n,
-                    None => break,
-                }
-            }
-            None => break,
+/// Verify that the chain from `start_did` has exactly the expected sequence of
+/// distinct_ids, with proper link structure at each step, terminating at a root
+/// whose person_uuid matches `expected_person_uuid`.
+pub async fn assert_chain_matches(
+    pool: &PgPool,
+    team_id: i64,
+    start_did: &str,
+    expected_dids: &[&str],
+    expected_person_uuid: &str,
+) {
+    let chain = collect_chain(pool, team_id, start_did).await;
+    assert_eq!(
+        chain.len(),
+        expected_dids.len(),
+        "chain from '{start_did}': expected {} links, got {} (dids: {:?})",
+        expected_dids.len(),
+        chain.len(),
+        chain.iter().map(|l| &l.distinct_id).collect::<Vec<_>>()
+    );
+
+    for (i, (link, expected_did)) in chain.iter().zip(expected_dids).enumerate() {
+        assert_eq!(
+            &link.distinct_id, expected_did,
+            "chain from '{start_did}': link {i} expected did '{expected_did}', got '{}'",
+            link.distinct_id
+        );
+        assert!(
+            !link.is_deleted,
+            "chain from '{start_did}': link {i} ('{}') has unexpected deleted_at",
+            link.distinct_id
+        );
+
+        let is_last = i == chain.len() - 1;
+        if is_last {
+            assert!(
+                link.person_id.is_some(),
+                "chain from '{start_did}': root '{}' missing person_id",
+                link.distinct_id
+            );
+            assert!(
+                link.next.is_none(),
+                "chain from '{start_did}': root '{}' has non-NULL next",
+                link.distinct_id
+            );
+        } else {
+            assert!(
+                link.person_id.is_none(),
+                "chain from '{start_did}': non-root '{}' at depth {i} has person_id set",
+                link.distinct_id
+            );
+            assert_eq!(
+                link.next,
+                Some(chain[i + 1].current),
+                "chain from '{start_did}': link {i} ('{}') next should point to link {} ('{}')",
+                link.distinct_id,
+                i + 1,
+                chain[i + 1].distinct_id
+            );
         }
     }
 
-    chain
+    let root = chain.last().unwrap();
+    let person_uuid: String = sqlx::query_scalar(
+        "SELECT person_uuid FROM person_mapping \
+         WHERE person_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(root.person_id.unwrap())
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        person_uuid, expected_person_uuid,
+        "chain from '{start_did}': root person_uuid mismatch"
+    );
 }
 
-/// Get the root node's person_id for a distinct_id by walking the chain.
-pub async fn get_root_person_id(pool: &PgPool, team_id: i64, distinct_id: &str) -> Option<i64> {
-    let chain = walk_chain(pool, team_id, distinct_id).await;
-    chain.last().and_then(|r| r.person_id)
+/// Shortcut: verify that a DID is its own root with the expected person_uuid.
+pub async fn assert_chain_is_root(
+    pool: &PgPool,
+    team_id: i64,
+    did: &str,
+    expected_person_uuid: &str,
+) {
+    assert_chain_matches(pool, team_id, did, &[did], expected_person_uuid).await;
 }
 
 /// Get all distinct person_ids referenced by union_find roots for a team.
