@@ -2053,20 +2053,21 @@ async fn compress_deep_alias_chain() {
 
     db::handle_compress_path(&pool, t, "n25", 5).await.unwrap();
 
-    let depth_after = chain_depth(&pool, t, "n25").await;
-    assert_eq!(
-        depth_after, 1,
-        "after compression all non-root nodes should point directly at root"
-    );
-
     for i in 1..=25 {
         let did = format!("n{i}");
+        let depth = chain_depth(&pool, t, &did).await;
+        assert_eq!(
+            depth, 1,
+            "{did} should be at depth 1 after compression, got {depth}"
+        );
         let resolved = resolve(&pool, t, &did).await.unwrap().unwrap();
         assert_eq!(
             resolved.person_uuid, root.person_uuid,
             "{did} should still resolve to the original person"
         );
     }
+
+    assert_chain_is_root(&pool, t, "n0", &root.person_uuid).await;
 
     assert_all_invariants(&pool, t).await;
 }
@@ -2092,14 +2093,25 @@ async fn compress_deep_merge_chain() {
 
     db::handle_compress_path(&pool, t, "m25", 5).await.unwrap();
 
-    let depth_after = chain_depth(&pool, t, "m25").await;
-    assert_eq!(depth_after, 1);
+    for i in 1..=25 {
+        let did = format!("m{i}");
+        let depth = chain_depth(&pool, t, &did).await;
+        assert_eq!(
+            depth, 1,
+            "{did} should be at depth 1 after compression, got {depth}"
+        );
+    }
 
     for i in 0..=25 {
         let did = format!("m{i}");
         let resolved = resolve(&pool, t, &did).await.unwrap().unwrap();
-        assert_eq!(resolved.person_uuid, root.person_uuid);
+        assert_eq!(
+            resolved.person_uuid, root.person_uuid,
+            "{did} should still resolve to the original person"
+        );
     }
+
+    assert_chain_is_root(&pool, t, "m0", &root.person_uuid).await;
 
     assert_all_invariants(&pool, t).await;
 }
@@ -2196,6 +2208,20 @@ async fn compress_preserves_soft_deleted_root() {
             "{did} should still resolve to None after compression of deleted chain"
         );
     }
+
+    // Lazy unlink must still work: writing to an orphaned node after compression
+    // should create a fresh person and re-root the node.
+    let recovered = db::handle_create(&pool, t, "s25").await.unwrap();
+    assert_ne!(
+        recovered.person_uuid, created.person_uuid,
+        "s25 should get a new person after recovery"
+    );
+    assert_chain_is_root(&pool, t, "s25", &recovered.person_uuid).await;
+
+    // A sibling from the old compressed chain should also be recoverable.
+    let recovered_mid = db::handle_create(&pool, t, "s10").await.unwrap();
+    assert_ne!(recovered_mid.person_uuid, created.person_uuid);
+    assert_chain_is_root(&pool, t, "s10", &recovered_mid.person_uuid).await;
 
     assert_structural_invariants(&pool, t).await;
 }
@@ -2317,6 +2343,136 @@ async fn merge_returns_compress_hint_above_threshold() {
     );
     let hint = hint.unwrap();
     assert!(hint.depth > 5);
+
+    assert_all_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn compress_mid_chain_only_flattens_below() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    // Build chain: n25 -> n24 -> ... -> n1 -> n0 (root)
+    let root = db::handle_create(&pool, t, "n0").await.unwrap();
+    for i in 1..=25 {
+        let prev = format!("n{}", i - 1);
+        let curr = format!("n{i}");
+        handle_alias(&pool, t, &prev, &curr).await.unwrap();
+    }
+
+    // Compress from n10 (mid-chain). Should flatten n10..n1 to point at n0,
+    // but leave n25..n11 pointing at their original next nodes.
+    db::handle_compress_path(&pool, t, "n10", 5).await.unwrap();
+
+    // n10 and below should be at depth 1
+    for i in 1..=10 {
+        let did = format!("n{i}");
+        let depth = chain_depth(&pool, t, &did).await;
+        assert_eq!(
+            depth, 1,
+            "{did} (below compress point) should be at depth 1, got {depth}"
+        );
+    }
+
+    // n11..n25 still form a chain above the compress point.
+    // n11.next was originally n10. That's unchanged -- compression only
+    // touched nodes in the walk from n10 to root. n11 was NOT in that walk.
+    // So the chain from n25 is: n25 -> n24 -> ... -> n11 -> n10 -> n0
+    // (n10 was compressed to point directly at n0, shortening the chain)
+    let chain_n25 = collect_chain(&pool, t, "n25").await;
+    let dids: Vec<&str> = chain_n25.iter().map(|l| l.distinct_id.as_str()).collect();
+
+    assert_eq!(
+        *dids.last().unwrap(),
+        "n0",
+        "chain should still terminate at root n0"
+    );
+    // n25 through n11 should be in order (15 nodes), then n10 -> n0 (compressed)
+    assert_eq!(
+        chain_n25.len(),
+        17,
+        "chain from n25 should be 15 uncompressed (n25..n11) + n10 + n0 = 17, got {:?}",
+        dids
+    );
+
+    // All nodes still resolve correctly
+    for i in 0..=25 {
+        let did = format!("n{i}");
+        let resolved = resolve(&pool, t, &did).await.unwrap().unwrap();
+        assert_eq!(resolved.person_uuid, root.person_uuid);
+    }
+
+    assert_all_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn compress_fan_out_preserves_siblings() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    // Build a tree:
+    //   root
+    //    ├── branch_a (depth 25 via sequential aliases)
+    //    └── branch_b (depth 3, short)
+    let root_resp = db::handle_create(&pool, t, "root").await.unwrap();
+
+    // Build branch A: a1 -> a2 -> ... -> a25 -> root
+    handle_alias(&pool, t, "root", "a1").await.unwrap();
+    for i in 2..=25 {
+        let prev = format!("a{}", i - 1);
+        let curr = format!("a{i}");
+        handle_alias(&pool, t, &prev, &curr).await.unwrap();
+    }
+
+    // Build branch B: b1 -> b2 -> b3 -> root
+    handle_alias(&pool, t, "root", "b1").await.unwrap();
+    handle_alias(&pool, t, "b1", "b2").await.unwrap();
+    handle_alias(&pool, t, "b2", "b3").await.unwrap();
+
+    let depth_a = chain_depth(&pool, t, "a25").await;
+    let depth_b = chain_depth(&pool, t, "b3").await;
+    assert!(depth_a >= 25, "branch A should be deep, got {depth_a}");
+    assert_eq!(depth_b, 3, "branch B should be 3 deep");
+
+    // Snapshot branch B before compression
+    let chain_b_before = collect_chain(&pool, t, "b3").await;
+
+    // Compress branch A only
+    db::handle_compress_path(&pool, t, "a25", 5).await.unwrap();
+
+    // Branch A nodes should all be at depth 1
+    for i in 1..=25 {
+        let did = format!("a{i}");
+        let depth = chain_depth(&pool, t, &did).await;
+        assert_eq!(depth, 1, "branch A {did} should be at depth 1, got {depth}");
+    }
+
+    // Branch B must be completely untouched
+    let chain_b_after = collect_chain(&pool, t, "b3").await;
+    assert_eq!(
+        chain_b_before.len(),
+        chain_b_after.len(),
+        "branch B chain length should be unchanged"
+    );
+    for (before, after) in chain_b_before.iter().zip(chain_b_after.iter()) {
+        assert_eq!(
+            before.current, after.current,
+            "branch B node PKs should be unchanged"
+        );
+        assert_eq!(
+            before.next, after.next,
+            "branch B next pointers should be unchanged"
+        );
+    }
+
+    // All nodes still resolve to the same person
+    for did in &["root", "a1", "a25", "b1", "b3"] {
+        let resolved = resolve(&pool, t, did).await.unwrap().unwrap();
+        assert_eq!(
+            resolved.person_uuid, root_resp.person_uuid,
+            "{did} should resolve to root's person"
+        );
+    }
 
     assert_all_invariants(&pool, t).await;
 }
