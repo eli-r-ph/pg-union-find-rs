@@ -4,7 +4,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::models::{
-    AliasResponse, CreateResponse, DbError, DbOp, DbResult, DeleteDistinctIdResponse,
+    AliasResponse, CompressHint, CreateResponse, DbError, DbOp, DbResult, DeleteDistinctIdResponse,
     DeletePersonResponse, MergeResponse,
 };
 
@@ -85,7 +85,57 @@ pub struct ResolvedPerson {
 // Worker loop — pulls DbOps from the channel and executes them sequentially.
 // ---------------------------------------------------------------------------
 
-pub async fn worker_loop(pool: PgPool, mut rx: mpsc::Receiver<DbOp>) {
+/// Compress the chain starting at `distinct_id` if its depth exceeds `threshold`.
+/// Runs in an explicit transaction so partial failures roll back cleanly.
+pub async fn handle_compress_path(
+    pool: &PgPool,
+    team_id: i64,
+    distinct_id: &str,
+    threshold: i32,
+) -> DbResult<()> {
+    let mut tx = pool.begin().await?;
+
+    let did_pk = match lookup_did(&mut tx, team_id, distinct_id).await? {
+        Some(pk) => pk,
+        None => return Ok(()),
+    };
+
+    sqlx::query(
+        r#"
+        WITH RECURSIVE walk(node, depth) AS (
+            SELECT $2::bigint, 0
+            UNION ALL
+            SELECT uf.next, w.depth + 1
+            FROM walk w
+            JOIN union_find uf
+              ON uf.team_id = $1 AND uf.current = w.node AND uf.person_id IS NULL
+            WHERE w.depth < 1000
+        ),
+        path_info AS (
+            SELECT
+                (SELECT node FROM walk ORDER BY depth DESC LIMIT 1) AS root_pk,
+                (SELECT MAX(depth) FROM walk) AS max_depth
+        )
+        UPDATE union_find uf
+        SET next = pi.root_pk
+        FROM path_info pi
+        WHERE pi.max_depth >= $3
+          AND uf.team_id = $1
+          AND uf.current IN (SELECT node FROM walk WHERE node != pi.root_pk)
+          AND uf.person_id IS NULL
+        "#,
+    )
+    .bind(team_id)
+    .bind(did_pk)
+    .bind(threshold)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn worker_loop(pool: PgPool, mut rx: mpsc::Receiver<DbOp>, compress_threshold: i32) {
     while let Some(op) = rx.recv().await {
         match op {
             DbOp::Create {
@@ -101,7 +151,8 @@ pub async fn worker_loop(pool: PgPool, mut rx: mpsc::Receiver<DbOp>) {
                 source,
                 reply,
             } => {
-                let _ = reply.send(handle_alias(&pool, team_id, &target, &source).await);
+                let _ = reply
+                    .send(handle_alias(&pool, team_id, &target, &source, compress_threshold).await);
             }
             DbOp::Merge {
                 team_id,
@@ -109,7 +160,9 @@ pub async fn worker_loop(pool: PgPool, mut rx: mpsc::Receiver<DbOp>) {
                 sources,
                 reply,
             } => {
-                let _ = reply.send(handle_merge(&pool, team_id, &target, &sources).await);
+                let _ = reply.send(
+                    handle_merge(&pool, team_id, &target, &sources, compress_threshold).await,
+                );
             }
             DbOp::DeletePerson {
                 team_id,
@@ -124,6 +177,19 @@ pub async fn worker_loop(pool: PgPool, mut rx: mpsc::Receiver<DbOp>) {
                 reply,
             } => {
                 let _ = reply.send(handle_delete_distinct_id(&pool, team_id, &distinct_id).await);
+            }
+            DbOp::CompressPath {
+                team_id,
+                distinct_id,
+                depth,
+                reply,
+            } => {
+                let result =
+                    handle_compress_path(&pool, team_id, &distinct_id, compress_threshold).await;
+                if let Err(ref e) = result {
+                    tracing::error!(team_id, %distinct_id, depth, %e, "path compression failed");
+                }
+                let _ = reply.send(result);
             }
         }
     }
@@ -260,13 +326,13 @@ async fn unlink_did(conn: &mut PgConnection, team_id: i64, did_pk: i64) -> DbRes
 }
 
 /// Walk the union_find chain from a distinct_id PK to the root, returning
-/// the root's person_id and the corresponding person_uuid.
+/// the root's person_id, the corresponding person_uuid, and the chain depth.
 async fn resolve_by_pk(
     conn: &mut PgConnection,
     team_id: i64,
     did_pk: i64,
-) -> DbResult<Option<ResolvedPerson>> {
-    let row = sqlx::query_as::<_, (String, i64, bool)>(
+) -> DbResult<Option<(ResolvedPerson, i32)>> {
+    let row = sqlx::query_as::<_, (String, i64, bool, i32)>(
         r#"
         WITH RECURSIVE walk(node, depth) AS (
             SELECT $2::bigint, 0
@@ -278,12 +344,15 @@ async fn resolve_by_pk(
             JOIN union_find uf
               ON uf.team_id = $1 AND uf.current = w.node AND uf.person_id IS NULL
             WHERE w.depth < 1000
+        ),
+        walk_result AS (
+            SELECT node, depth FROM walk ORDER BY depth DESC LIMIT 1
         )
-        SELECT pm.person_uuid, uf.person_id, pm.is_identified
-        FROM union_find uf
+        SELECT pm.person_uuid, uf.person_id, pm.is_identified, wr.depth
+        FROM walk_result wr
+        JOIN union_find uf ON uf.team_id = $1 AND uf.current = wr.node
         JOIN person_mapping pm ON pm.person_id = uf.person_id
-        WHERE uf.team_id = $1
-          AND uf.current = (SELECT node FROM walk ORDER BY depth DESC LIMIT 1)
+        WHERE uf.person_id IS NOT NULL
           AND pm.deleted_at IS NULL
         "#,
     )
@@ -292,23 +361,26 @@ async fn resolve_by_pk(
     .fetch_optional(&mut *conn)
     .await?;
 
-    Ok(
-        row.map(|(person_uuid, person_id, is_identified)| ResolvedPerson {
-            person_uuid,
-            person_id,
-            is_identified,
-        }),
-    )
+    Ok(row.map(|(person_uuid, person_id, is_identified, depth)| {
+        (
+            ResolvedPerson {
+                person_uuid,
+                person_id,
+                is_identified,
+            },
+            depth,
+        )
+    }))
 }
 
 /// Walk the union_find chain from a distinct_id PK to the root, returning
-/// the root's (team_id, current) composite key and person_id.
+/// the root's (current, person_id, depth).
 async fn resolve_root(
     conn: &mut PgConnection,
     team_id: i64,
     did_pk: i64,
-) -> DbResult<Option<(i64, i64)>> {
-    let row = sqlx::query_as::<_, (i64, i64)>(
+) -> DbResult<Option<(i64, i64, i32)>> {
+    let row = sqlx::query_as::<_, (i64, i64, i32)>(
         r#"
         WITH RECURSIVE walk(node, depth) AS (
             SELECT $2::bigint, 0
@@ -320,12 +392,14 @@ async fn resolve_root(
             JOIN union_find uf
               ON uf.team_id = $1 AND uf.current = w.node AND uf.person_id IS NULL
             WHERE w.depth < 1000
+        ),
+        walk_result AS (
+            SELECT node, depth FROM walk ORDER BY depth DESC LIMIT 1
         )
-        SELECT uf.current, uf.person_id
-        FROM union_find uf
-        WHERE uf.team_id = $1
-          AND uf.current = (SELECT node FROM walk ORDER BY depth DESC LIMIT 1)
-          AND uf.person_id IS NOT NULL
+        SELECT uf.current, uf.person_id, wr.depth
+        FROM walk_result wr
+        JOIN union_find uf ON uf.team_id = $1 AND uf.current = wr.node
+        WHERE uf.person_id IS NOT NULL
           AND uf.deleted_at IS NULL
         "#,
     )
@@ -337,12 +411,12 @@ async fn resolve_root(
     Ok(row)
 }
 
-/// Resolve a distinct_id string all the way to a ResolvedPerson.
+/// Resolve a distinct_id string all the way to a ResolvedPerson and chain depth.
 pub async fn resolve_tx(
     conn: &mut PgConnection,
     team_id: i64,
     distinct_id: &str,
-) -> DbResult<Option<ResolvedPerson>> {
+) -> DbResult<Option<(ResolvedPerson, i32)>> {
     let did_pk = match lookup_did(&mut *conn, team_id, distinct_id).await? {
         Some(pk) => pk,
         None => return Ok(None),
@@ -359,7 +433,7 @@ pub async fn resolve_tx(
 enum DidState {
     NotFound,
     Orphaned(i64),
-    Live(i64, ResolvedPerson),
+    Live(i64, ResolvedPerson, i32),
 }
 
 /// Check whether a distinct_id is missing, orphaned (exists but its person is
@@ -371,7 +445,7 @@ async fn check_did(conn: &mut PgConnection, team_id: i64, distinct_id: &str) -> 
         None => return Ok(DidState::NotFound),
     };
     match resolve_by_pk(&mut *conn, team_id, did_pk).await? {
-        Some(person) => Ok(DidState::Live(did_pk, person)),
+        Some((person, depth)) => Ok(DidState::Live(did_pk, person, depth)),
         None => {
             unlink_did(&mut *conn, team_id, did_pk).await?;
             Ok(DidState::Orphaned(did_pk))
@@ -491,7 +565,7 @@ pub async fn identify_tx(
     distinct_id: &str,
 ) -> DbResult<ResolvedPerson> {
     match check_did(&mut *conn, team_id, distinct_id).await? {
-        DidState::Live(_pk, resolved) => Ok(resolved),
+        DidState::Live(_pk, resolved, _depth) => Ok(resolved),
 
         DidState::NotFound => {
             let person_uuid = Uuid::new_v4().to_string();
@@ -600,12 +674,12 @@ async fn link_root_to_target(
 // Public API — each operation wrapped in an explicit transaction.
 // ---------------------------------------------------------------------------
 
-/// Resolve a distinct_id to its canonical person through the union_find chain.
+/// Resolve a distinct_id to its canonical person and chain depth.
 pub async fn resolve(
     pool: &PgPool,
     team_id: i64,
     distinct_id: &str,
-) -> DbResult<Option<ResolvedPerson>> {
+) -> DbResult<Option<(ResolvedPerson, i32)>> {
     let mut conn = pool.acquire().await?;
     resolve_tx(&mut conn, team_id, distinct_id).await
 }
@@ -663,12 +737,14 @@ async fn insert_did_and_link(
 /// but reuse their existing did_pk via attach_did/attach_did_as_root.
 ///
 /// On success, sets is_identified = true on the resulting person.
+/// Returns a CompressHint when the resulting chain exceeds compress_threshold.
 pub async fn handle_alias(
     pool: &PgPool,
     team_id: i64,
     target: &str,
     source: &str,
-) -> DbResult<AliasResponse> {
+    compress_threshold: i32,
+) -> DbResult<(AliasResponse, Option<CompressHint>)> {
     validate_distinct_id(target)?;
     validate_distinct_id(source)?;
 
@@ -677,10 +753,13 @@ pub async fn handle_alias(
         let resolved = identify_tx(&mut tx, team_id, target).await?;
         set_identified(&mut tx, resolved.person_id).await?;
         tx.commit().await?;
-        return Ok(AliasResponse {
-            person_uuid: resolved.person_uuid,
-            is_identified: true,
-        });
+        return Ok((
+            AliasResponse {
+                person_uuid: resolved.person_uuid,
+                is_identified: true,
+            },
+            None,
+        ));
     }
 
     let mut tx = pool.begin().await?;
@@ -688,12 +767,11 @@ pub async fn handle_alias(
     let target_state = check_did(&mut tx, team_id, target).await?;
     let source_state = check_did(&mut tx, team_id, source).await?;
 
-    let person_uuid = match (target_state, source_state) {
-        // Both live — compare persons, merge if different
-        (DidState::Live(tpk, t_resolved), DidState::Live(spk, s_resolved)) => {
+    let (person_uuid, compress_hint) = match (target_state, source_state) {
+        (DidState::Live(tpk, t_resolved, t_depth), DidState::Live(spk, s_resolved, s_depth)) => {
             if t_resolved.person_id == s_resolved.person_id {
                 set_identified(&mut tx, t_resolved.person_id).await?;
-                t_resolved.person_uuid
+                (t_resolved.person_uuid, None)
             } else {
                 if s_resolved.is_identified {
                     return Err(DbError::AlreadyIdentified(
@@ -708,25 +786,50 @@ pub async fn handle_alias(
                 link_root_to_target(&mut tx, team_id, source_root.0, source_root.1, tpk).await?;
 
                 set_identified(&mut tx, t_resolved.person_id).await?;
-                t_resolved.person_uuid
+
+                let combined_depth = s_depth + t_depth + 1;
+                let hint = if combined_depth > compress_threshold {
+                    Some(CompressHint {
+                        distinct_id: source.to_string(),
+                        depth: combined_depth,
+                    })
+                } else {
+                    None
+                };
+                (t_resolved.person_uuid, hint)
             }
         }
 
-        // Target live, source not — attach source into target's chain
-        (DidState::Live(tpk, t_resolved), source_state) => {
+        (DidState::Live(tpk, t_resolved, t_depth), source_state) => {
             attach_did(&mut tx, team_id, source, source_state, tpk).await?;
             set_identified(&mut tx, t_resolved.person_id).await?;
-            t_resolved.person_uuid
+            let combined_depth = t_depth + 1;
+            let hint = if combined_depth > compress_threshold {
+                Some(CompressHint {
+                    distinct_id: source.to_string(),
+                    depth: combined_depth,
+                })
+            } else {
+                None
+            };
+            (t_resolved.person_uuid, hint)
         }
 
-        // Source live, target not — attach target into source's chain
-        (target_state, DidState::Live(spk, s_resolved)) => {
+        (target_state, DidState::Live(spk, s_resolved, s_depth)) => {
             attach_did(&mut tx, team_id, target, target_state, spk).await?;
             set_identified(&mut tx, s_resolved.person_id).await?;
-            s_resolved.person_uuid
+            let combined_depth = s_depth + 1;
+            let hint = if combined_depth > compress_threshold {
+                Some(CompressHint {
+                    distinct_id: target.to_string(),
+                    depth: combined_depth,
+                })
+            } else {
+                None
+            };
+            (s_resolved.person_uuid, hint)
         }
 
-        // Neither live — create new person with both distinct_ids
         (target_state, source_state) => {
             let person_uuid = Uuid::new_v4().to_string();
 
@@ -743,16 +846,19 @@ pub async fn handle_alias(
                 attach_did_as_root(&mut tx, team_id, target, target_state, person_id).await?;
             attach_did(&mut tx, team_id, source, source_state, target_pk).await?;
 
-            person_uuid
+            (person_uuid, None)
         }
     };
 
     tx.commit().await?;
 
-    Ok(AliasResponse {
-        person_uuid,
-        is_identified: true,
-    })
+    Ok((
+        AliasResponse {
+            person_uuid,
+            is_identified: true,
+        },
+        compress_hint,
+    ))
 }
 
 /// /merge — merge N source distinct_ids into target's person ($merge_dangerously).
@@ -760,12 +866,14 @@ pub async fn handle_alias(
 ///
 /// Uses check_did for the target and each source so that distinct_ids belonging
 /// to deleted persons are lazily unlinked and handled transparently.
+/// Returns a CompressHint for the deepest source chain when it exceeds threshold.
 pub async fn handle_merge(
     pool: &PgPool,
     team_id: i64,
     target: &str,
     sources: &[String],
-) -> DbResult<MergeResponse> {
+    compress_threshold: i32,
+) -> DbResult<(MergeResponse, Option<CompressHint>)> {
     validate_distinct_id(target)?;
     for src in sources {
         validate_distinct_id(src)?;
@@ -773,7 +881,7 @@ pub async fn handle_merge(
 
     let mut tx = pool.begin().await?;
 
-    let (target_pk, target_person_id, target_person_uuid) =
+    let (target_pk, target_person_id, target_person_uuid, target_depth) =
         match check_did(&mut tx, team_id, target).await? {
             DidState::NotFound => {
                 return Err(DbError::NotFound(format!(
@@ -791,26 +899,46 @@ pub async fn handle_merge(
                 .fetch_one(&mut *tx)
                 .await?;
                 root_did(&mut tx, team_id, pk, person_id).await?;
-                (pk, person_id, person_uuid)
+                (pk, person_id, person_uuid, 0i32)
             }
-            DidState::Live(pk, resolved) => (pk, resolved.person_id, resolved.person_uuid),
+            DidState::Live(pk, resolved, depth) => {
+                (pk, resolved.person_id, resolved.person_uuid, depth)
+            }
         };
+
+    let mut max_combined_depth = 0i32;
+    let mut deepest_source: Option<String> = None;
 
     for src in sources {
         match check_did(&mut tx, team_id, src).await? {
             DidState::NotFound => {
                 insert_did_and_link(&mut tx, team_id, src, target_pk).await?;
+                let combined = target_depth + 1;
+                if combined > max_combined_depth {
+                    max_combined_depth = combined;
+                    deepest_source = Some(src.clone());
+                }
             }
             DidState::Orphaned(pk) => {
                 link_did(&mut tx, team_id, pk, target_pk).await?;
+                let combined = target_depth + 1;
+                if combined > max_combined_depth {
+                    max_combined_depth = combined;
+                    deepest_source = Some(src.clone());
+                }
             }
-            DidState::Live(spk, _) => {
+            DidState::Live(spk, _, s_depth) => {
                 let root = resolve_root(&mut tx, team_id, spk).await?;
                 match root {
-                    Some((_, root_person)) if root_person == target_person_id => {}
-                    Some((root_current, old_person)) => {
+                    Some((_, root_person, _)) if root_person == target_person_id => {}
+                    Some((root_current, old_person, _)) => {
                         link_root_to_target(&mut tx, team_id, root_current, old_person, target_pk)
                             .await?;
+                        let combined = s_depth + target_depth + 1;
+                        if combined > max_combined_depth {
+                            max_combined_depth = combined;
+                            deepest_source = Some(src.clone());
+                        }
                     }
                     None => {
                         return Err(DbError::Internal(format!(
@@ -825,10 +953,22 @@ pub async fn handle_merge(
     set_identified(&mut tx, target_person_id).await?;
     tx.commit().await?;
 
-    Ok(MergeResponse {
-        person_uuid: target_person_uuid,
-        is_identified: true,
-    })
+    let compress_hint = if max_combined_depth > compress_threshold {
+        deepest_source.map(|did| CompressHint {
+            distinct_id: did,
+            depth: max_combined_depth,
+        })
+    } else {
+        None
+    };
+
+    Ok((
+        MergeResponse {
+            person_uuid: target_person_uuid,
+            is_identified: true,
+        },
+        compress_hint,
+    ))
 }
 
 /// /delete_person — soft-delete a person by setting deleted_at on the

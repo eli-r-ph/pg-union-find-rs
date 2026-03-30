@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use tokio::sync::{mpsc, oneshot};
@@ -7,14 +8,15 @@ use sqlx::PgPool;
 
 use crate::db;
 use crate::models::{
-    AliasRequest, CreateRequest, DbError, DbOp, DeleteDistinctIdRequest, DeletePersonRequest,
-    IdentifyRequest, MergeRequest, ResolveRequest, ResolveResponse,
+    AliasRequest, CompressHint, CreateRequest, DbError, DbOp, DeleteDistinctIdRequest,
+    DeletePersonRequest, IdentifyRequest, MergeRequest, ResolveRequest, ResolveResponse,
 };
 
 #[derive(Clone)]
 pub struct AppState {
     pub workers: Arc<[mpsc::Sender<DbOp>]>,
     pub pool: PgPool,
+    pub compress_threshold: i32,
 }
 
 impl AppState {
@@ -22,6 +24,45 @@ impl AppState {
         let idx = (team_id as u64 as usize) % self.workers.len();
         &self.workers[idx]
     }
+}
+
+fn enqueue_compress(state: &AppState, team_id: i64, hint: CompressHint) {
+    let sender = state.sender_for(team_id).clone();
+    tokio::spawn(async move {
+        for attempt in 0u64..3 {
+            let (reply_tx, _reply_rx) = oneshot::channel();
+            let op = DbOp::CompressPath {
+                team_id,
+                distinct_id: hint.distinct_id.clone(),
+                depth: hint.depth,
+                reply: reply_tx,
+            };
+            match tokio::time::timeout(Duration::from_millis(100), sender.send(op)).await {
+                Ok(Ok(())) => return,
+                Ok(Err(_)) => {
+                    tracing::error!(
+                        team_id,
+                        distinct_id = %hint.distinct_id,
+                        depth = hint.depth,
+                        "compress enqueue failed: worker closed"
+                    );
+                    return;
+                }
+                Err(_) => {
+                    if attempt < 2 {
+                        tokio::time::sleep(Duration::from_millis(50 * (attempt + 1))).await;
+                    } else {
+                        tracing::error!(
+                            team_id,
+                            distinct_id = %hint.distinct_id,
+                            depth = hint.depth,
+                            "compress enqueue failed after 3 attempts"
+                        );
+                    }
+                }
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -87,7 +128,12 @@ pub async fn identify(
     }
 
     match reply_rx.await {
-        Ok(Ok(resp)) => (StatusCode::OK, Json(serde_json::json!(resp))).into_response(),
+        Ok(Ok((resp, hint))) => {
+            if let Some(hint) = hint {
+                enqueue_compress(&state, team_id, hint);
+            }
+            (StatusCode::OK, Json(serde_json::json!(resp))).into_response()
+        }
         Ok(Err(e)) => db_error_response(e),
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -124,7 +170,12 @@ pub async fn alias(
     }
 
     match reply_rx.await {
-        Ok(Ok(resp)) => (StatusCode::OK, Json(serde_json::json!(resp))).into_response(),
+        Ok(Ok((resp, hint))) => {
+            if let Some(hint) = hint {
+                enqueue_compress(&state, team_id, hint);
+            }
+            (StatusCode::OK, Json(serde_json::json!(resp))).into_response()
+        }
         Ok(Err(e)) => db_error_response(e),
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -161,7 +212,12 @@ pub async fn merge(
     }
 
     match reply_rx.await {
-        Ok(Ok(resp)) => (StatusCode::OK, Json(serde_json::json!(resp))).into_response(),
+        Ok(Ok((resp, hint))) => {
+            if let Some(hint) = hint {
+                enqueue_compress(&state, team_id, hint);
+            }
+            (StatusCode::OK, Json(serde_json::json!(resp))).into_response()
+        }
         Ok(Err(e)) => db_error_response(e),
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -263,14 +319,36 @@ pub async fn resolve(
     Json(req): Json<ResolveRequest>,
 ) -> impl IntoResponse {
     match db::resolve(&state.pool, req.team_id, &req.distinct_id).await {
-        Ok(Some(person)) => (
-            StatusCode::OK,
-            Json(serde_json::json!(ResolveResponse {
-                person_uuid: person.person_uuid,
-                is_identified: person.is_identified,
-            })),
-        )
-            .into_response(),
+        Ok(Some((person, depth))) => {
+            if depth > state.compress_threshold {
+                let (reply_tx, _) = oneshot::channel();
+                if state
+                    .sender_for(req.team_id)
+                    .try_send(DbOp::CompressPath {
+                        team_id: req.team_id,
+                        distinct_id: req.distinct_id.clone(),
+                        depth,
+                        reply: reply_tx,
+                    })
+                    .is_err()
+                {
+                    tracing::error!(
+                        team_id = req.team_id,
+                        distinct_id = %req.distinct_id,
+                        depth,
+                        "compress enqueue failed: channel full"
+                    );
+                }
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!(ResolveResponse {
+                    person_uuid: person.person_uuid,
+                    is_identified: person.is_identified,
+                })),
+            )
+                .into_response()
+        }
         Ok(None) => db_error_response(DbError::NotFound(format!(
             "distinct_id '{}' not found",
             req.distinct_id

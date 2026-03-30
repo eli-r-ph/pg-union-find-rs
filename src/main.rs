@@ -33,8 +33,9 @@ async fn main() {
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:54320/union_find".into());
 
-    let pool_size = env_usize("WORKER_POOL_SIZE", 4);
-    let channel_capacity = env_usize("WORKER_CHANNEL_CAPACITY", 16);
+    let pool_size = env_usize("WORKER_POOL_SIZE", 100);
+    let channel_capacity = env_usize("WORKER_CHANNEL_CAPACITY", 1024);
+    let compress_threshold = env_usize("PATH_COMPRESS_THRESHOLD", 20) as i32;
     let max_conns = (pool_size + 1) as u32;
 
     if pool_size == 0 {
@@ -64,16 +65,23 @@ async fn main() {
         let (tx, rx) = mpsc::channel(channel_capacity);
         let worker_pool = pool.clone();
         tokio::spawn(async move {
-            db::worker_loop(worker_pool, rx).await;
+            db::worker_loop(worker_pool, rx, compress_threshold).await;
         });
         senders.push(tx);
     }
 
-    tracing::info!(pool_size, channel_capacity, max_conns, "spawned workers");
+    tracing::info!(
+        pool_size,
+        channel_capacity,
+        compress_threshold,
+        max_conns,
+        "spawned workers"
+    );
 
     let state = AppState {
         workers: Arc::from(senders.into_boxed_slice()),
         pool: pool.clone(),
+        compress_threshold,
     };
 
     let app = Router::new()

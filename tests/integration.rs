@@ -17,7 +17,7 @@ async fn create_new() {
     assert!(!resp.person_uuid.is_empty());
     assert!(!resp.is_identified);
 
-    let resolved = db::resolve(&pool, t, "user-1").await.unwrap();
+    let resolved = resolve(&pool, t, "user-1").await.unwrap();
     assert!(resolved.is_some());
     assert_eq!(resolved.unwrap().person_uuid, resp.person_uuid);
 
@@ -92,11 +92,11 @@ async fn alias_target_eq_source_new() {
     let pool = test_pool().await;
     let t = next_team_id();
 
-    let resp = db::handle_alias(&pool, t, "x", "x").await.unwrap();
+    let resp = handle_alias(&pool, t, "x", "x").await.unwrap();
     assert!(!resp.person_uuid.is_empty());
     assert!(resp.is_identified);
 
-    let resolved = db::resolve(&pool, t, "x").await.unwrap();
+    let resolved = resolve(&pool, t, "x").await.unwrap();
     assert_eq!(resolved.unwrap().person_uuid, resp.person_uuid);
 
     assert_eq!(count_person_mappings(&pool, t).await, 1);
@@ -118,7 +118,7 @@ async fn alias_target_eq_source_existing() {
     let r1 = db::handle_create(&pool, t, "x").await.unwrap();
     assert_chain_is_root(&pool, t, "x", &r1.person_uuid).await;
 
-    let r2 = db::handle_alias(&pool, t, "x", "x").await.unwrap();
+    let r2 = handle_alias(&pool, t, "x", "x").await.unwrap();
     assert_eq!(r1.person_uuid, r2.person_uuid);
     assert!(r2.is_identified);
 
@@ -138,11 +138,11 @@ async fn alias_case1a_target_exists() {
     let created = db::handle_create(&pool, t, "primary").await.unwrap();
     assert_chain_is_root(&pool, t, "primary", &created.person_uuid).await;
 
-    let aliased = db::handle_alias(&pool, t, "primary", "anon").await.unwrap();
+    let aliased = handle_alias(&pool, t, "primary", "anon").await.unwrap();
     assert_eq!(created.person_uuid, aliased.person_uuid);
     assert!(aliased.is_identified);
 
-    let resolved_anon = db::resolve(&pool, t, "anon").await.unwrap().unwrap();
+    let resolved_anon = resolve(&pool, t, "anon").await.unwrap().unwrap();
     assert_eq!(resolved_anon.person_uuid, created.person_uuid);
 
     assert_eq!(count_person_mappings(&pool, t).await, 1);
@@ -166,11 +166,11 @@ async fn alias_case1b_source_exists() {
     let created = db::handle_create(&pool, t, "anon").await.unwrap();
     assert_chain_is_root(&pool, t, "anon", &created.person_uuid).await;
 
-    let aliased = db::handle_alias(&pool, t, "primary", "anon").await.unwrap();
+    let aliased = handle_alias(&pool, t, "primary", "anon").await.unwrap();
     assert_eq!(created.person_uuid, aliased.person_uuid);
     assert!(aliased.is_identified);
 
-    let resolved_primary = db::resolve(&pool, t, "primary").await.unwrap().unwrap();
+    let resolved_primary = resolve(&pool, t, "primary").await.unwrap().unwrap();
     assert_eq!(resolved_primary.person_uuid, created.person_uuid);
 
     assert_eq!(count_person_mappings(&pool, t).await, 1);
@@ -199,7 +199,7 @@ async fn alias_case2a_same_person() {
     let t = next_team_id();
 
     let r_a = db::handle_create(&pool, t, "a").await.unwrap();
-    db::handle_alias(&pool, t, "a", "b").await.unwrap();
+    handle_alias(&pool, t, "a", "b").await.unwrap();
 
     assert_chain_is_root(&pool, t, "a", &r_a.person_uuid).await;
     assert_chain_matches(&pool, t, "b", &["b", "a"], &r_a.person_uuid).await;
@@ -208,7 +208,7 @@ async fn alias_case2a_same_person() {
     let before_uf = count_union_find(&pool, t).await;
 
     // b already linked to a's person — calling alias(a, b) again is a no-op
-    let resp = db::handle_alias(&pool, t, "a", "b").await.unwrap();
+    let resp = handle_alias(&pool, t, "a", "b").await.unwrap();
     assert!(resp.is_identified);
     assert_eq!(resp.person_uuid, r_a.person_uuid);
 
@@ -232,11 +232,11 @@ async fn alias_case2b_both_unidentified_succeeds() {
     assert_chain_is_root(&pool, t, "a", &person_a.person_uuid).await;
     assert_chain_is_root(&pool, t, "b", &person_b.person_uuid).await;
 
-    let result = db::handle_alias(&pool, t, "a", "b").await.unwrap();
+    let result = handle_alias(&pool, t, "a", "b").await.unwrap();
     assert_eq!(result.person_uuid, person_a.person_uuid);
     assert!(result.is_identified);
 
-    let resolved_b = db::resolve(&pool, t, "b").await.unwrap().unwrap();
+    let resolved_b = resolve(&pool, t, "b").await.unwrap().unwrap();
     assert_eq!(resolved_b.person_uuid, person_a.person_uuid);
 
     assert_eq!(count_person_mappings(&pool, t).await, 1);
@@ -256,7 +256,7 @@ async fn alias_case2b_source_identified_rejected() {
     let r_b = db::handle_create(&pool, t, "b").await.unwrap();
 
     // Identify B by aliasing B to C
-    db::handle_alias(&pool, t, "b", "c").await.unwrap();
+    handle_alias(&pool, t, "b", "c").await.unwrap();
     let chain_b = collect_chain(&pool, t, "b").await;
     let pid_b = chain_b.last().unwrap().person_id.unwrap();
     assert!(is_person_identified(&pool, pid_b).await);
@@ -266,7 +266,7 @@ async fn alias_case2b_source_identified_rejected() {
     assert_chain_matches(&pool, t, "c", &["c", "b"], &r_b.person_uuid).await;
 
     // alias(target=a, source=b): source (b) is identified → reject
-    let result = db::handle_alias(&pool, t, "a", "b").await;
+    let result = handle_alias(&pool, t, "a", "b").await;
     assert!(result.is_err());
     match result.unwrap_err() {
         DbError::AlreadyIdentified(_) => {}
@@ -290,7 +290,7 @@ async fn alias_case2b_target_identified_source_not() {
     let r_b = db::handle_create(&pool, t, "b").await.unwrap();
 
     // Identify A by aliasing A to C
-    let alias_resp = db::handle_alias(&pool, t, "a", "c").await.unwrap();
+    let alias_resp = handle_alias(&pool, t, "a", "c").await.unwrap();
     assert!(alias_resp.is_identified);
 
     assert_chain_is_root(&pool, t, "a", &r_a.person_uuid).await;
@@ -303,7 +303,7 @@ async fn alias_case2b_target_identified_source_not() {
     assert!(!is_person_identified(&pool, chain_b[0].person_id.unwrap()).await);
 
     // alias(target=a, source=b): source (b) is NOT identified → merge succeeds
-    let result = db::handle_alias(&pool, t, "a", "b").await.unwrap();
+    let result = handle_alias(&pool, t, "a", "b").await.unwrap();
     assert!(result.is_identified);
 
     assert_chain_is_root(&pool, t, "a", &r_a.person_uuid).await;
@@ -318,12 +318,12 @@ async fn alias_case3_neither_exists() {
     let pool = test_pool().await;
     let t = next_team_id();
 
-    let resp = db::handle_alias(&pool, t, "primary", "anon").await.unwrap();
+    let resp = handle_alias(&pool, t, "primary", "anon").await.unwrap();
     assert!(!resp.person_uuid.is_empty());
     assert!(resp.is_identified);
 
-    let resolved_primary = db::resolve(&pool, t, "primary").await.unwrap().unwrap();
-    let resolved_anon = db::resolve(&pool, t, "anon").await.unwrap().unwrap();
+    let resolved_primary = resolve(&pool, t, "primary").await.unwrap().unwrap();
+    let resolved_anon = resolve(&pool, t, "anon").await.unwrap().unwrap();
     assert_eq!(resolved_primary.person_uuid, resp.person_uuid);
     assert_eq!(resolved_anon.person_uuid, resp.person_uuid);
 
@@ -356,7 +356,7 @@ async fn alias_sets_identified() {
     assert!(!is_person_identified(&pool, chain_x[0].person_id.unwrap()).await);
     assert!(!is_person_identified(&pool, chain_y[0].person_id.unwrap()).await);
 
-    let resp = db::handle_alias(&pool, t, "x", "y").await.unwrap();
+    let resp = handle_alias(&pool, t, "x", "y").await.unwrap();
     assert!(resp.is_identified);
 
     assert_chain_is_root(&pool, t, "x", &r_x.person_uuid).await;
@@ -375,7 +375,7 @@ async fn merge_target_not_found() {
     let pool = test_pool().await;
     let t = next_team_id();
 
-    let result = db::handle_merge(&pool, t, "nonexistent", &["a".into()]).await;
+    let result = handle_merge(&pool, t, "nonexistent", &["a".into()]).await;
     assert!(result.is_err());
     match result.unwrap_err() {
         DbError::NotFound(_) => {}
@@ -391,13 +391,13 @@ async fn merge_source_not_found() {
     let tgt = db::handle_create(&pool, t, "tgt").await.unwrap();
     assert_chain_is_root(&pool, t, "tgt", &tgt.person_uuid).await;
 
-    let resp = db::handle_merge(&pool, t, "tgt", &["new-source".into()])
+    let resp = handle_merge(&pool, t, "tgt", &["new-source".into()])
         .await
         .unwrap();
     assert_eq!(resp.person_uuid, tgt.person_uuid);
     assert!(resp.is_identified);
 
-    let resolved = db::resolve(&pool, t, "new-source").await.unwrap().unwrap();
+    let resolved = resolve(&pool, t, "new-source").await.unwrap().unwrap();
     assert_eq!(resolved.person_uuid, tgt.person_uuid);
 
     assert_eq!(count_distinct_ids(&pool, t).await, 2);
@@ -422,15 +422,13 @@ async fn merge_same_person() {
     let t = next_team_id();
 
     let r_a = db::handle_create(&pool, t, "a").await.unwrap();
-    db::handle_alias(&pool, t, "a", "b").await.unwrap();
+    handle_alias(&pool, t, "a", "b").await.unwrap();
 
     assert_chain_is_root(&pool, t, "a", &r_a.person_uuid).await;
     assert_chain_matches(&pool, t, "b", &["b", "a"], &r_a.person_uuid).await;
 
     let before_uf = count_union_find(&pool, t).await;
-    let resp = db::handle_merge(&pool, t, "a", &["b".into()])
-        .await
-        .unwrap();
+    let resp = handle_merge(&pool, t, "a", &["b".into()]).await.unwrap();
     assert!(resp.is_identified);
     assert_eq!(resp.person_uuid, r_a.person_uuid);
 
@@ -455,9 +453,7 @@ async fn merge_different_person() {
 
     let old_root_pid = collect_chain(&pool, t, "b").await[0].person_id.unwrap();
 
-    let resp = db::handle_merge(&pool, t, "a", &["b".into()])
-        .await
-        .unwrap();
+    let resp = handle_merge(&pool, t, "a", &["b".into()]).await.unwrap();
     assert_eq!(resp.person_uuid, person_a.person_uuid);
     assert!(resp.is_identified);
 
@@ -484,7 +480,7 @@ async fn merge_shared_person_cleanup() {
 
     let person_a = db::handle_create(&pool, t, "a").await.unwrap();
     let person_b = db::handle_create(&pool, t, "b").await.unwrap();
-    db::handle_alias(&pool, t, "b", "c").await.unwrap();
+    handle_alias(&pool, t, "b", "c").await.unwrap();
 
     assert_chain_is_root(&pool, t, "a", &person_a.person_uuid).await;
     assert_chain_is_root(&pool, t, "b", &person_b.person_uuid).await;
@@ -492,7 +488,7 @@ async fn merge_shared_person_cleanup() {
 
     let old_person_b_id = collect_chain(&pool, t, "b").await[0].person_id.unwrap();
 
-    let resp = db::handle_merge(&pool, t, "a", &["b".into(), "c".into()])
+    let resp = handle_merge(&pool, t, "a", &["b".into(), "c".into()])
         .await
         .unwrap();
     assert_eq!(resp.person_uuid, person_a.person_uuid);
@@ -517,7 +513,7 @@ async fn merge_empty_sources() {
     let t = next_team_id();
 
     let tgt = db::handle_create(&pool, t, "tgt").await.unwrap();
-    let resp = db::handle_merge(&pool, t, "tgt", &[]).await.unwrap();
+    let resp = handle_merge(&pool, t, "tgt", &[]).await.unwrap();
     assert_eq!(resp.person_uuid, tgt.person_uuid);
     assert!(resp.is_identified);
 
@@ -537,9 +533,9 @@ async fn merge_multiple_sources() {
 
     let person_a = db::handle_create(&pool, t, "a").await.unwrap();
     db::handle_create(&pool, t, "b").await.unwrap();
-    db::handle_alias(&pool, t, "a", "c").await.unwrap();
+    handle_alias(&pool, t, "a", "c").await.unwrap();
 
-    let resp = db::handle_merge(&pool, t, "a", &["b".into(), "c".into(), "brand-new".into()])
+    let resp = handle_merge(&pool, t, "a", &["b".into(), "c".into(), "brand-new".into()])
         .await
         .unwrap();
     assert_eq!(resp.person_uuid, person_a.person_uuid);
@@ -566,9 +562,7 @@ async fn merge_target_in_sources() {
     let t = next_team_id();
 
     let tgt = db::handle_create(&pool, t, "a").await.unwrap();
-    let resp = db::handle_merge(&pool, t, "a", &["a".into()])
-        .await
-        .unwrap();
+    let resp = handle_merge(&pool, t, "a", &["a".into()]).await.unwrap();
     assert_eq!(resp.person_uuid, tgt.person_uuid);
 
     assert_eq!(count_person_mappings(&pool, t).await, 1);
@@ -590,18 +584,14 @@ async fn merge_chain_all_ids_follow() {
     let person_c = db::handle_create(&pool, t, "c").await.unwrap();
 
     // Step 1: merge b into a
-    db::handle_merge(&pool, t, "a", &["b".into()])
-        .await
-        .unwrap();
+    handle_merge(&pool, t, "a", &["b".into()]).await.unwrap();
 
     assert_chain_is_root(&pool, t, "a", &person_a.person_uuid).await;
     assert_chain_matches(&pool, t, "b", &["b", "a"], &person_a.person_uuid).await;
 
     // Step 2: merge a into c — b is part of a's tree, so b should also
     // resolve to c's person through the chain b -> a -> c.
-    db::handle_merge(&pool, t, "c", &["a".into()])
-        .await
-        .unwrap();
+    handle_merge(&pool, t, "c", &["a".into()]).await.unwrap();
 
     assert_chain_is_root(&pool, t, "c", &person_c.person_uuid).await;
     assert_chain_matches(&pool, t, "a", &["a", "c"], &person_c.person_uuid).await;
@@ -626,7 +616,7 @@ async fn merge_chain_deep_transitive() {
     db::handle_create(&pool, t, "c").await.unwrap();
     let person_d = db::handle_create(&pool, t, "d").await.unwrap();
 
-    db::handle_merge(&pool, t, "a", &["b".into(), "c".into()])
+    handle_merge(&pool, t, "a", &["b".into(), "c".into()])
         .await
         .unwrap();
 
@@ -635,9 +625,7 @@ async fn merge_chain_deep_transitive() {
     assert_chain_matches(&pool, t, "c", &["c", "a"], &person_a.person_uuid).await;
 
     // Merge a into d — all of a's tree (b, c) should follow through a -> d
-    db::handle_merge(&pool, t, "d", &["a".into()])
-        .await
-        .unwrap();
+    handle_merge(&pool, t, "d", &["a".into()]).await.unwrap();
 
     assert_chain_is_root(&pool, t, "d", &person_d.person_uuid).await;
     assert_chain_matches(&pool, t, "a", &["a", "d"], &person_d.person_uuid).await;
@@ -660,9 +648,7 @@ async fn merge_sets_identified() {
     let pid_x = chain_x[0].person_id.unwrap();
     assert!(!is_person_identified(&pool, pid_x).await);
 
-    let resp = db::handle_merge(&pool, t, "x", &["y".into()])
-        .await
-        .unwrap();
+    let resp = handle_merge(&pool, t, "x", &["y".into()]).await.unwrap();
     assert!(resp.is_identified);
 
     assert_chain_is_root(&pool, t, "x", &r_x.person_uuid).await;
@@ -679,7 +665,7 @@ async fn resolve_nonexistent() {
     let pool = test_pool().await;
     let t = next_team_id();
 
-    let resolved = db::resolve(&pool, t, "ghost").await.unwrap();
+    let resolved = resolve(&pool, t, "ghost").await.unwrap();
     assert!(resolved.is_none());
 }
 
@@ -689,7 +675,7 @@ async fn resolve_root() {
     let t = next_team_id();
 
     let created = db::handle_create(&pool, t, "root-did").await.unwrap();
-    let resolved = db::resolve(&pool, t, "root-did").await.unwrap().unwrap();
+    let resolved = resolve(&pool, t, "root-did").await.unwrap().unwrap();
     assert_eq!(resolved.person_uuid, created.person_uuid);
 
     assert_chain_is_root(&pool, t, "root-did", &created.person_uuid).await;
@@ -701,9 +687,9 @@ async fn resolve_one_hop() {
     let t = next_team_id();
 
     let created = db::handle_create(&pool, t, "root").await.unwrap();
-    db::handle_alias(&pool, t, "root", "leaf").await.unwrap();
+    handle_alias(&pool, t, "root", "leaf").await.unwrap();
 
-    let resolved = db::resolve(&pool, t, "leaf").await.unwrap().unwrap();
+    let resolved = resolve(&pool, t, "leaf").await.unwrap().unwrap();
     assert_eq!(resolved.person_uuid, created.person_uuid);
 
     assert_chain_matches(&pool, t, "leaf", &["leaf", "root"], &created.person_uuid).await;
@@ -715,11 +701,11 @@ async fn resolve_multi_hop() {
     let t = next_team_id();
 
     let created = db::handle_create(&pool, t, "a").await.unwrap();
-    db::handle_alias(&pool, t, "a", "b").await.unwrap();
-    db::handle_alias(&pool, t, "b", "c").await.unwrap();
-    db::handle_alias(&pool, t, "c", "d").await.unwrap();
+    handle_alias(&pool, t, "a", "b").await.unwrap();
+    handle_alias(&pool, t, "b", "c").await.unwrap();
+    handle_alias(&pool, t, "c", "d").await.unwrap();
 
-    let resolved = db::resolve(&pool, t, "d").await.unwrap().unwrap();
+    let resolved = resolve(&pool, t, "d").await.unwrap().unwrap();
     assert_eq!(resolved.person_uuid, created.person_uuid);
 
     assert_chain_matches(&pool, t, "d", &["d", "c", "b", "a"], &created.person_uuid).await;
@@ -739,7 +725,7 @@ async fn create_then_alias() {
     let person_a = db::handle_create(&pool, t, "a").await.unwrap();
     assert_chain_is_root(&pool, t, "a", &person_a.person_uuid).await;
 
-    db::handle_alias(&pool, t, "a", "b").await.unwrap();
+    handle_alias(&pool, t, "a", "b").await.unwrap();
 
     assert_chain_is_root(&pool, t, "a", &person_a.person_uuid).await;
     assert_chain_matches(&pool, t, "b", &["b", "a"], &person_a.person_uuid).await;
@@ -755,7 +741,7 @@ async fn create_alias_merge_workflow() {
     let person_a = db::handle_create(&pool, t, "a").await.unwrap();
     db::handle_create(&pool, t, "b").await.unwrap();
 
-    let alias_result = db::handle_alias(&pool, t, "a", "b").await.unwrap();
+    let alias_result = handle_alias(&pool, t, "a", "b").await.unwrap();
     assert_eq!(alias_result.person_uuid, person_a.person_uuid);
     assert!(alias_result.is_identified);
 
@@ -777,11 +763,9 @@ async fn team_isolation() {
     let p2 = db::handle_create(&pool, t2, "shared").await.unwrap();
     assert_ne!(p1.person_uuid, p2.person_uuid);
 
-    db::handle_alias(&pool, t1, "shared", "alias-1")
-        .await
-        .unwrap();
+    handle_alias(&pool, t1, "shared", "alias-1").await.unwrap();
 
-    let resolved_t2 = db::resolve(&pool, t2, "alias-1").await.unwrap();
+    let resolved_t2 = resolve(&pool, t2, "alias-1").await.unwrap();
     assert!(resolved_t2.is_none());
 
     assert_chain_matches(
@@ -811,41 +795,35 @@ async fn invariants_after_complex_operations() {
     db::handle_create(&pool, t, "p2").await.unwrap();
     db::handle_create(&pool, t, "p3").await.unwrap();
 
-    db::handle_alias(&pool, t, "p1", "a1").await.unwrap();
-    db::handle_alias(&pool, t, "p1", "a2").await.unwrap();
-    db::handle_alias(&pool, t, "p2", "b1").await.unwrap();
+    handle_alias(&pool, t, "p1", "a1").await.unwrap();
+    handle_alias(&pool, t, "p1", "a2").await.unwrap();
+    handle_alias(&pool, t, "p2", "b1").await.unwrap();
 
-    db::handle_alias(&pool, t, "fresh-src", "fresh-dest")
+    handle_alias(&pool, t, "fresh-src", "fresh-dest")
         .await
         .unwrap();
 
-    db::handle_merge(&pool, t, "p1", &["p2".into()])
+    handle_merge(&pool, t, "p1", &["p2".into()]).await.unwrap();
+
+    handle_merge(&pool, t, "p1", &["p3".into(), "brand-new".into()])
         .await
         .unwrap();
 
-    db::handle_merge(&pool, t, "p1", &["p3".into(), "brand-new".into()])
-        .await
-        .unwrap();
-
-    let p1_uuid = db::resolve(&pool, t, "p1")
-        .await
-        .unwrap()
-        .unwrap()
-        .person_uuid;
+    let p1_uuid = resolve(&pool, t, "p1").await.unwrap().unwrap().person_uuid;
     for did in &["p1", "p2", "p3", "a1", "a2", "b1", "brand-new"] {
-        let r = db::resolve(&pool, t, did).await.unwrap().unwrap();
+        let r = resolve(&pool, t, did).await.unwrap().unwrap();
         assert_eq!(
             r.person_uuid, p1_uuid,
             "expected {did} to resolve to p1's person"
         );
     }
 
-    let fresh_uuid = db::resolve(&pool, t, "fresh-src")
+    let fresh_uuid = resolve(&pool, t, "fresh-src")
         .await
         .unwrap()
         .unwrap()
         .person_uuid;
-    let fresh_dest_uuid = db::resolve(&pool, t, "fresh-dest")
+    let fresh_dest_uuid = resolve(&pool, t, "fresh-dest")
         .await
         .unwrap()
         .unwrap()
@@ -1021,14 +999,14 @@ async fn alias_rejects_illegal_ids() {
 
     db::handle_create(&pool, t, "legit").await.unwrap();
 
-    let result = db::handle_alias(&pool, t, "legit", "null").await;
+    let result = handle_alias(&pool, t, "legit", "null").await;
     assert!(result.is_err());
     match result.unwrap_err() {
         DbError::IllegalDistinctId(_) => {}
         other => panic!("expected IllegalDistinctId, got: {other}"),
     }
 
-    let result = db::handle_alias(&pool, t, "guest", "legit").await;
+    let result = handle_alias(&pool, t, "guest", "legit").await;
     assert!(result.is_err());
     match result.unwrap_err() {
         DbError::IllegalDistinctId(_) => {}
@@ -1043,14 +1021,14 @@ async fn merge_rejects_illegal_ids() {
 
     db::handle_create(&pool, t, "legit").await.unwrap();
 
-    let result = db::handle_merge(&pool, t, "anonymous", &[]).await;
+    let result = handle_merge(&pool, t, "anonymous", &[]).await;
     assert!(result.is_err());
     match result.unwrap_err() {
         DbError::IllegalDistinctId(_) => {}
         other => panic!("expected IllegalDistinctId, got: {other}"),
     }
 
-    let result = db::handle_merge(&pool, t, "legit", &["undefined".into()]).await;
+    let result = handle_merge(&pool, t, "legit", &["undefined".into()]).await;
     assert!(result.is_err());
     match result.unwrap_err() {
         DbError::IllegalDistinctId(_) => {}
@@ -1073,9 +1051,7 @@ async fn merge_link_structure() {
     assert_chain_is_root(&pool, t, "a", &r_a.person_uuid).await;
     assert_chain_is_root(&pool, t, "b", &r_b.person_uuid).await;
 
-    db::handle_merge(&pool, t, "a", &["b".into()])
-        .await
-        .unwrap();
+    handle_merge(&pool, t, "a", &["b".into()]).await.unwrap();
 
     assert_chain_is_root(&pool, t, "a", &r_a.person_uuid).await;
     assert_chain_matches(&pool, t, "b", &["b", "a"], &r_a.person_uuid).await;
@@ -1094,7 +1070,7 @@ async fn alias_case2b_link_structure() {
     assert_chain_is_root(&pool, t, "a", &r_a.person_uuid).await;
     assert_chain_is_root(&pool, t, "b", &r_b.person_uuid).await;
 
-    db::handle_alias(&pool, t, "a", "b").await.unwrap();
+    handle_alias(&pool, t, "a", "b").await.unwrap();
 
     assert_chain_is_root(&pool, t, "a", &r_a.person_uuid).await;
     assert_chain_matches(&pool, t, "b", &["b", "a"], &r_a.person_uuid).await;
@@ -1115,14 +1091,12 @@ async fn alias_after_merge() {
     let person_b = db::handle_create(&pool, t, "b").await.unwrap();
     let person_c = db::handle_create(&pool, t, "c").await.unwrap();
 
-    db::handle_merge(&pool, t, "c", &["a".into()])
-        .await
-        .unwrap();
+    handle_merge(&pool, t, "c", &["a".into()]).await.unwrap();
 
     assert_chain_is_root(&pool, t, "c", &person_c.person_uuid).await;
     assert_chain_matches(&pool, t, "a", &["a", "c"], &person_c.person_uuid).await;
 
-    db::handle_alias(&pool, t, "a", "d-new").await.unwrap();
+    handle_alias(&pool, t, "a", "d-new").await.unwrap();
 
     assert_chain_matches(
         &pool,
@@ -1142,13 +1116,13 @@ async fn alias_reverse_direction() {
     let pool = test_pool().await;
     let t = next_team_id();
 
-    let resp1 = db::handle_alias(&pool, t, "a", "b").await.unwrap();
+    let resp1 = handle_alias(&pool, t, "a", "b").await.unwrap();
 
     assert_chain_is_root(&pool, t, "a", &resp1.person_uuid).await;
     assert_chain_matches(&pool, t, "b", &["b", "a"], &resp1.person_uuid).await;
 
     // Reverse: alias(b, a) — both exist, same person → case 2a no-op
-    let resp2 = db::handle_alias(&pool, t, "b", "a").await.unwrap();
+    let resp2 = handle_alias(&pool, t, "b", "a").await.unwrap();
     assert_eq!(resp1.person_uuid, resp2.person_uuid);
     assert!(resp2.is_identified);
 
@@ -1163,9 +1137,9 @@ async fn alias_fan_out() {
     let pool = test_pool().await;
     let t = next_team_id();
 
-    let resp_ab = db::handle_alias(&pool, t, "a", "b").await.unwrap();
-    db::handle_alias(&pool, t, "a", "c").await.unwrap();
-    db::handle_alias(&pool, t, "b", "d").await.unwrap();
+    let resp_ab = handle_alias(&pool, t, "a", "b").await.unwrap();
+    handle_alias(&pool, t, "a", "c").await.unwrap();
+    handle_alias(&pool, t, "b", "d").await.unwrap();
 
     assert_chain_is_root(&pool, t, "a", &resp_ab.person_uuid).await;
     assert_chain_matches(&pool, t, "b", &["b", "a"], &resp_ab.person_uuid).await;
@@ -1187,7 +1161,7 @@ async fn merge_duplicate_sources() {
     let person_a = db::handle_create(&pool, t, "a").await.unwrap();
     db::handle_create(&pool, t, "b").await.unwrap();
 
-    let resp = db::handle_merge(&pool, t, "a", &["b".into(), "b".into()])
+    let resp = handle_merge(&pool, t, "a", &["b".into(), "b".into()])
         .await
         .unwrap();
     assert_eq!(resp.person_uuid, person_a.person_uuid);
@@ -1208,7 +1182,7 @@ async fn merge_target_plus_others_in_sources() {
     let person_a = db::handle_create(&pool, t, "a").await.unwrap();
     db::handle_create(&pool, t, "b").await.unwrap();
 
-    let resp = db::handle_merge(&pool, t, "a", &["a".into(), "b".into()])
+    let resp = handle_merge(&pool, t, "a", &["a".into(), "b".into()])
         .await
         .unwrap();
     assert_eq!(resp.person_uuid, person_a.person_uuid);
@@ -1230,12 +1204,10 @@ async fn full_pipeline_create_alias_merge_alias_resolve() {
     let t = next_team_id();
 
     let person_a = db::handle_create(&pool, t, "a").await.unwrap();
-    db::handle_alias(&pool, t, "a", "b").await.unwrap();
+    handle_alias(&pool, t, "a", "b").await.unwrap();
     db::handle_create(&pool, t, "c").await.unwrap();
-    db::handle_merge(&pool, t, "a", &["c".into()])
-        .await
-        .unwrap();
-    db::handle_alias(&pool, t, "a", "d").await.unwrap();
+    handle_merge(&pool, t, "a", &["c".into()]).await.unwrap();
+    handle_alias(&pool, t, "a", "d").await.unwrap();
 
     assert_chain_is_root(&pool, t, "a", &person_a.person_uuid).await;
     assert_chain_matches(&pool, t, "b", &["b", "a"], &person_a.person_uuid).await;
@@ -1259,7 +1231,7 @@ async fn create_idempotent_after_identify() {
     assert!(!r1.is_identified);
     assert_chain_is_root(&pool, t, "x", &r1.person_uuid).await;
 
-    db::handle_alias(&pool, t, "x", "y").await.unwrap();
+    handle_alias(&pool, t, "x", "y").await.unwrap();
     assert_chain_is_root(&pool, t, "x", &r1.person_uuid).await;
     assert_chain_matches(&pool, t, "y", &["y", "x"], &r1.person_uuid).await;
 
@@ -1273,15 +1245,13 @@ async fn merge_already_identified_target() {
     let pool = test_pool().await;
     let t = next_team_id();
 
-    let resp_x = db::handle_alias(&pool, t, "x", "x").await.unwrap();
+    let resp_x = handle_alias(&pool, t, "x", "x").await.unwrap();
     assert!(resp_x.is_identified);
     assert_chain_is_root(&pool, t, "x", &resp_x.person_uuid).await;
 
     db::handle_create(&pool, t, "y").await.unwrap();
 
-    let resp = db::handle_merge(&pool, t, "x", &["y".into()])
-        .await
-        .unwrap();
+    let resp = handle_merge(&pool, t, "x", &["y".into()]).await.unwrap();
     assert_eq!(resp.person_uuid, resp_x.person_uuid);
     assert!(resp.is_identified);
 
@@ -1308,15 +1278,11 @@ async fn orphan_cleanup_stepwise() {
     db::handle_create(&pool, t, "c").await.unwrap();
     assert_eq!(count_person_mappings(&pool, t).await, 3);
 
-    db::handle_merge(&pool, t, "a", &["b".into()])
-        .await
-        .unwrap();
+    handle_merge(&pool, t, "a", &["b".into()]).await.unwrap();
     assert_eq!(count_person_mappings(&pool, t).await, 2);
     assert_chain_matches(&pool, t, "b", &["b", "a"], &r_a.person_uuid).await;
 
-    db::handle_merge(&pool, t, "a", &["c".into()])
-        .await
-        .unwrap();
+    handle_merge(&pool, t, "a", &["c".into()]).await.unwrap();
     assert_eq!(count_person_mappings(&pool, t).await, 1);
     assert_chain_matches(&pool, t, "c", &["c", "a"], &r_a.person_uuid).await;
 
@@ -1343,7 +1309,7 @@ async fn delete_person_basic() {
         .unwrap();
     assert_eq!(resp.person_uuid, created.person_uuid);
 
-    let resolved = db::resolve(&pool, t, "a").await.unwrap();
+    let resolved = resolve(&pool, t, "a").await.unwrap();
     assert!(
         resolved.is_none(),
         "resolve should return None after delete"
@@ -1395,8 +1361,8 @@ async fn delete_person_with_chain() {
     let t = next_team_id();
 
     let created = db::handle_create(&pool, t, "a").await.unwrap();
-    db::handle_alias(&pool, t, "a", "b").await.unwrap();
-    db::handle_alias(&pool, t, "a", "c").await.unwrap();
+    handle_alias(&pool, t, "a", "b").await.unwrap();
+    handle_alias(&pool, t, "a", "c").await.unwrap();
 
     assert_chain_is_root(&pool, t, "a", &created.person_uuid).await;
     assert_chain_matches(&pool, t, "b", &["b", "a"], &created.person_uuid).await;
@@ -1407,7 +1373,7 @@ async fn delete_person_with_chain() {
         .unwrap();
 
     for did in &["a", "b", "c"] {
-        let resolved = db::resolve(&pool, t, did).await.unwrap();
+        let resolved = resolve(&pool, t, did).await.unwrap();
         assert!(
             resolved.is_none(),
             "{did} should resolve to None after person delete"
@@ -1431,10 +1397,10 @@ async fn delete_person_team_isolation() {
         .await
         .unwrap();
 
-    let resolved_t1 = db::resolve(&pool, t1, "shared").await.unwrap();
+    let resolved_t1 = resolve(&pool, t1, "shared").await.unwrap();
     assert!(resolved_t1.is_none(), "team1 person should be deleted");
 
-    let resolved_t2 = db::resolve(&pool, t2, "shared").await.unwrap();
+    let resolved_t2 = resolve(&pool, t2, "shared").await.unwrap();
     assert!(resolved_t2.is_some(), "team2 person should be unaffected");
     assert_eq!(resolved_t2.unwrap().person_uuid, p2.person_uuid);
 
@@ -1467,7 +1433,7 @@ async fn delete_did_sole_node() {
     assert_eq!(count_union_find(&pool, t).await, 0);
     assert!(is_person_deleted(&pool, pid).await);
 
-    let resolved = db::resolve(&pool, t, "a").await.unwrap();
+    let resolved = resolve(&pool, t, "a").await.unwrap();
     assert!(resolved.is_none());
 
     assert!(person_exists(&pool, pid).await);
@@ -1494,7 +1460,7 @@ async fn delete_did_leaf() {
     let t = next_team_id();
 
     let created = db::handle_create(&pool, t, "a").await.unwrap();
-    db::handle_alias(&pool, t, "a", "b").await.unwrap();
+    handle_alias(&pool, t, "a", "b").await.unwrap();
 
     assert_chain_matches(&pool, t, "b", &["b", "a"], &created.person_uuid).await;
 
@@ -1503,7 +1469,7 @@ async fn delete_did_leaf() {
     assert!(!resp.person_deleted);
 
     assert_chain_is_root(&pool, t, "a", &created.person_uuid).await;
-    assert!(db::resolve(&pool, t, "b").await.unwrap().is_none());
+    assert!(resolve(&pool, t, "b").await.unwrap().is_none());
 
     assert_eq!(count_distinct_ids(&pool, t).await, 1);
     assert_eq!(count_union_find(&pool, t).await, 1);
@@ -1517,7 +1483,7 @@ async fn delete_did_root() {
     let t = next_team_id();
 
     let created = db::handle_create(&pool, t, "a").await.unwrap();
-    db::handle_alias(&pool, t, "a", "b").await.unwrap();
+    handle_alias(&pool, t, "a", "b").await.unwrap();
 
     assert_chain_matches(&pool, t, "b", &["b", "a"], &created.person_uuid).await;
 
@@ -1525,7 +1491,7 @@ async fn delete_did_root() {
     assert_eq!(resp.distinct_id, "a");
     assert!(!resp.person_deleted);
 
-    assert!(db::resolve(&pool, t, "a").await.unwrap().is_none());
+    assert!(resolve(&pool, t, "a").await.unwrap().is_none());
     assert_chain_is_root(&pool, t, "b", &created.person_uuid).await;
 
     assert_eq!(count_distinct_ids(&pool, t).await, 1);
@@ -1540,8 +1506,8 @@ async fn delete_did_mid_chain() {
     let t = next_team_id();
 
     let created = db::handle_create(&pool, t, "a").await.unwrap();
-    db::handle_alias(&pool, t, "a", "b").await.unwrap();
-    db::handle_alias(&pool, t, "b", "c").await.unwrap();
+    handle_alias(&pool, t, "a", "b").await.unwrap();
+    handle_alias(&pool, t, "b", "c").await.unwrap();
 
     assert_chain_matches(&pool, t, "c", &["c", "b", "a"], &created.person_uuid).await;
 
@@ -1549,7 +1515,7 @@ async fn delete_did_mid_chain() {
     assert_eq!(resp.distinct_id, "b");
     assert!(!resp.person_deleted);
 
-    assert!(db::resolve(&pool, t, "b").await.unwrap().is_none());
+    assert!(resolve(&pool, t, "b").await.unwrap().is_none());
 
     assert_eq!(count_distinct_ids(&pool, t).await, 2);
     assert_eq!(count_union_find(&pool, t).await, 2);
@@ -1566,7 +1532,7 @@ async fn delete_did_preserves_siblings() {
     let t = next_team_id();
 
     let created = db::handle_create(&pool, t, "a").await.unwrap();
-    db::handle_merge(&pool, t, "a", &["b".into(), "c".into()])
+    handle_merge(&pool, t, "a", &["b".into(), "c".into()])
         .await
         .unwrap();
 
@@ -1577,7 +1543,7 @@ async fn delete_did_preserves_siblings() {
     assert_eq!(resp.distinct_id, "b");
     assert!(!resp.person_deleted);
 
-    assert!(db::resolve(&pool, t, "b").await.unwrap().is_none());
+    assert!(resolve(&pool, t, "b").await.unwrap().is_none());
     assert_chain_is_root(&pool, t, "a", &created.person_uuid).await;
     assert_chain_matches(&pool, t, "c", &["c", "a"], &created.person_uuid).await;
 
@@ -1648,7 +1614,7 @@ async fn alias_with_deleted_target() {
         .await
         .unwrap();
 
-    let resp = db::handle_alias(&pool, t, "a", "b").await.unwrap();
+    let resp = handle_alias(&pool, t, "a", "b").await.unwrap();
     assert_eq!(resp.person_uuid, pb.person_uuid);
     assert!(resp.is_identified);
 
@@ -1672,7 +1638,7 @@ async fn alias_with_deleted_source() {
         .await
         .unwrap();
 
-    let resp = db::handle_alias(&pool, t, "a", "b").await.unwrap();
+    let resp = handle_alias(&pool, t, "a", "b").await.unwrap();
     assert_eq!(resp.person_uuid, pa.person_uuid);
     assert!(resp.is_identified);
 
@@ -1697,7 +1663,7 @@ async fn alias_both_deleted() {
         .await
         .unwrap();
 
-    let resp = db::handle_alias(&pool, t, "a", "b").await.unwrap();
+    let resp = handle_alias(&pool, t, "a", "b").await.unwrap();
     assert_ne!(resp.person_uuid, pa.person_uuid);
     assert_ne!(resp.person_uuid, pb.person_uuid);
     assert!(resp.is_identified);
@@ -1721,9 +1687,7 @@ async fn merge_with_deleted_target() {
         .await
         .unwrap();
 
-    let resp = db::handle_merge(&pool, t, "a", &["b".into()])
-        .await
-        .unwrap();
+    let resp = handle_merge(&pool, t, "a", &["b".into()]).await.unwrap();
     assert_ne!(resp.person_uuid, pa.person_uuid);
     assert!(resp.is_identified);
 
@@ -1745,9 +1709,7 @@ async fn merge_with_deleted_source() {
         .await
         .unwrap();
 
-    let resp = db::handle_merge(&pool, t, "a", &["b".into()])
-        .await
-        .unwrap();
+    let resp = handle_merge(&pool, t, "a", &["b".into()]).await.unwrap();
     assert_eq!(resp.person_uuid, pa.person_uuid);
     assert!(resp.is_identified);
 
@@ -1767,7 +1729,7 @@ async fn resolve_after_delete_person() {
         .await
         .unwrap();
 
-    let resolved = db::resolve(&pool, t, "a").await.unwrap();
+    let resolved = resolve(&pool, t, "a").await.unwrap();
     assert!(
         resolved.is_none(),
         "resolve should return None for deleted person"
@@ -1784,7 +1746,7 @@ async fn delete_person_then_full_lifecycle() {
     let t = next_team_id();
 
     let old = db::handle_create(&pool, t, "a").await.unwrap();
-    db::handle_alias(&pool, t, "a", "b").await.unwrap();
+    handle_alias(&pool, t, "a", "b").await.unwrap();
 
     assert_chain_is_root(&pool, t, "a", &old.person_uuid).await;
     assert_chain_matches(&pool, t, "b", &["b", "a"], &old.person_uuid).await;
@@ -1796,7 +1758,7 @@ async fn delete_person_then_full_lifecycle() {
     let new = db::handle_create(&pool, t, "a").await.unwrap();
     assert_ne!(old.person_uuid, new.person_uuid);
 
-    db::handle_alias(&pool, t, "a", "c").await.unwrap();
+    handle_alias(&pool, t, "a", "c").await.unwrap();
 
     assert_chain_is_root(&pool, t, "a", &new.person_uuid).await;
     assert_chain_matches(&pool, t, "c", &["c", "a"], &new.person_uuid).await;
@@ -1811,7 +1773,7 @@ async fn delete_did_then_recreate() {
     let t = next_team_id();
 
     let pa = db::handle_create(&pool, t, "a").await.unwrap();
-    db::handle_alias(&pool, t, "a", "b").await.unwrap();
+    handle_alias(&pool, t, "a", "b").await.unwrap();
 
     assert_chain_matches(&pool, t, "b", &["b", "a"], &pa.person_uuid).await;
 
@@ -1833,7 +1795,7 @@ async fn delete_person_merge_recovery() {
 
     let pa = db::handle_create(&pool, t, "a").await.unwrap();
     let pb = db::handle_create(&pool, t, "b").await.unwrap();
-    db::handle_alias(&pool, t, "a", "c").await.unwrap();
+    handle_alias(&pool, t, "a", "c").await.unwrap();
 
     assert_chain_is_root(&pool, t, "a", &pa.person_uuid).await;
     assert_chain_matches(&pool, t, "c", &["c", "a"], &pa.person_uuid).await;
@@ -1842,7 +1804,7 @@ async fn delete_person_merge_recovery() {
         .await
         .unwrap();
 
-    let resp = db::handle_merge(&pool, t, "b", &["a".into(), "c".into()])
+    let resp = handle_merge(&pool, t, "b", &["a".into(), "c".into()])
         .await
         .unwrap();
     assert_eq!(resp.person_uuid, pb.person_uuid);
@@ -1865,9 +1827,9 @@ async fn delete_did_root_with_multiple_parents() {
     let t = next_team_id();
 
     let created = db::handle_create(&pool, t, "r").await.unwrap();
-    db::handle_alias(&pool, t, "r", "a").await.unwrap();
-    db::handle_alias(&pool, t, "r", "b").await.unwrap();
-    db::handle_alias(&pool, t, "r", "c").await.unwrap();
+    handle_alias(&pool, t, "r", "a").await.unwrap();
+    handle_alias(&pool, t, "r", "b").await.unwrap();
+    handle_alias(&pool, t, "r", "c").await.unwrap();
 
     assert_chain_is_root(&pool, t, "r", &created.person_uuid).await;
     assert_chain_matches(&pool, t, "a", &["a", "r"], &created.person_uuid).await;
@@ -1882,7 +1844,7 @@ async fn delete_did_root_with_multiple_parents() {
     assert_eq!(resp.distinct_id, "r");
     assert!(!resp.person_deleted);
 
-    assert!(db::resolve(&pool, t, "r").await.unwrap().is_none());
+    assert!(resolve(&pool, t, "r").await.unwrap().is_none());
 
     // Structural verification: exactly one former parent became root.
     // Which parent was promoted is nondeterministic -- we verify invariants.
@@ -1898,7 +1860,7 @@ async fn delete_did_root_with_multiple_parents() {
             root.next.is_none(),
             "{did} chain root should have next=NULL"
         );
-        let resolved = db::resolve(&pool, t, did).await.unwrap().unwrap();
+        let resolved = resolve(&pool, t, did).await.unwrap().unwrap();
         assert_eq!(
             resolved.person_uuid, created.person_uuid,
             "{did} should resolve to original person"
@@ -1930,10 +1892,10 @@ async fn delete_did_root_with_multiple_parents_and_chain() {
     let t = next_team_id();
 
     let created = db::handle_create(&pool, t, "r").await.unwrap();
-    db::handle_alias(&pool, t, "r", "a").await.unwrap();
-    db::handle_alias(&pool, t, "a", "d").await.unwrap();
-    db::handle_alias(&pool, t, "r", "b").await.unwrap();
-    db::handle_alias(&pool, t, "r", "c").await.unwrap();
+    handle_alias(&pool, t, "r", "a").await.unwrap();
+    handle_alias(&pool, t, "a", "d").await.unwrap();
+    handle_alias(&pool, t, "r", "b").await.unwrap();
+    handle_alias(&pool, t, "r", "c").await.unwrap();
 
     assert_chain_is_root(&pool, t, "r", &created.person_uuid).await;
     assert_chain_matches(&pool, t, "d", &["d", "a", "r"], &created.person_uuid).await;
@@ -1955,7 +1917,7 @@ async fn delete_did_root_with_multiple_parents_and_chain() {
             root.next.is_none(),
             "{did} chain root should have next=NULL"
         );
-        let resolved = db::resolve(&pool, t, did).await.unwrap().unwrap();
+        let resolved = resolve(&pool, t, did).await.unwrap().unwrap();
         assert_eq!(
             resolved.person_uuid, created.person_uuid,
             "{did} should resolve to original person after root deletion"
@@ -1998,7 +1960,7 @@ async fn delete_did_root_no_parents() {
     assert_eq!(count_union_find(&pool, t).await, 0);
     assert!(is_person_deleted(&pool, pid).await);
 
-    assert!(db::resolve(&pool, t, "solo").await.unwrap().is_none());
+    assert!(resolve(&pool, t, "solo").await.unwrap().is_none());
 
     assert_structural_invariants(&pool, t).await;
 }
@@ -2009,7 +1971,7 @@ async fn unlink_root_after_delete_person() {
     let t = next_team_id();
 
     let pa = db::handle_create(&pool, t, "a").await.unwrap();
-    db::handle_alias(&pool, t, "a", "b").await.unwrap();
+    handle_alias(&pool, t, "a", "b").await.unwrap();
 
     assert_chain_matches(&pool, t, "b", &["b", "a"], &pa.person_uuid).await;
 
@@ -2017,14 +1979,14 @@ async fn unlink_root_after_delete_person() {
         .await
         .unwrap();
 
-    assert!(db::resolve(&pool, t, "a").await.unwrap().is_none());
-    assert!(db::resolve(&pool, t, "b").await.unwrap().is_none());
+    assert!(resolve(&pool, t, "a").await.unwrap().is_none());
+    assert!(resolve(&pool, t, "b").await.unwrap().is_none());
 
     let new_b = db::handle_create(&pool, t, "b").await.unwrap();
     assert_ne!(new_b.person_uuid, pa.person_uuid);
     assert_chain_is_root(&pool, t, "b", &new_b.person_uuid).await;
 
-    assert!(db::resolve(&pool, t, "a").await.unwrap().is_none());
+    assert!(resolve(&pool, t, "a").await.unwrap().is_none());
 
     let new_a = db::handle_create(&pool, t, "a").await.unwrap();
     assert_ne!(new_a.person_uuid, pa.person_uuid);
@@ -2039,9 +2001,9 @@ async fn unlink_root_with_fan_out_after_delete_person() {
     let t = next_team_id();
 
     let pr = db::handle_create(&pool, t, "r").await.unwrap();
-    db::handle_alias(&pool, t, "r", "a").await.unwrap();
-    db::handle_alias(&pool, t, "r", "b").await.unwrap();
-    db::handle_alias(&pool, t, "r", "c").await.unwrap();
+    handle_alias(&pool, t, "r", "a").await.unwrap();
+    handle_alias(&pool, t, "r", "b").await.unwrap();
+    handle_alias(&pool, t, "r", "c").await.unwrap();
 
     assert_chain_is_root(&pool, t, "r", &pr.person_uuid).await;
     assert_chain_matches(&pool, t, "a", &["a", "r"], &pr.person_uuid).await;
@@ -2054,7 +2016,7 @@ async fn unlink_root_with_fan_out_after_delete_person() {
 
     for did in &["r", "a", "b", "c"] {
         assert!(
-            db::resolve(&pool, t, did).await.unwrap().is_none(),
+            resolve(&pool, t, did).await.unwrap().is_none(),
             "{did} should resolve to None after person delete"
         );
     }
@@ -2064,4 +2026,297 @@ async fn unlink_root_with_fan_out_after_delete_person() {
     assert_chain_is_root(&pool, t, "a", &new_a.person_uuid).await;
 
     assert_structural_invariants(&pool, t).await;
+}
+
+// ===========================================================================
+// S. Path compression
+// ===========================================================================
+
+#[tokio::test]
+async fn compress_deep_alias_chain() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let root = db::handle_create(&pool, t, "n0").await.unwrap();
+
+    for i in 1..=25 {
+        let prev = format!("n{}", i - 1);
+        let curr = format!("n{i}");
+        handle_alias(&pool, t, &prev, &curr).await.unwrap();
+    }
+
+    let depth_before = chain_depth(&pool, t, "n25").await;
+    assert!(
+        depth_before >= 25,
+        "chain should be at least 25 deep before compression, got {depth_before}"
+    );
+
+    db::handle_compress_path(&pool, t, "n25", 5).await.unwrap();
+
+    let depth_after = chain_depth(&pool, t, "n25").await;
+    assert_eq!(
+        depth_after, 1,
+        "after compression all non-root nodes should point directly at root"
+    );
+
+    for i in 1..=25 {
+        let did = format!("n{i}");
+        let resolved = resolve(&pool, t, &did).await.unwrap().unwrap();
+        assert_eq!(
+            resolved.person_uuid, root.person_uuid,
+            "{did} should still resolve to the original person"
+        );
+    }
+
+    assert_all_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn compress_deep_merge_chain() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let root = db::handle_create(&pool, t, "m0").await.unwrap();
+
+    for i in 1..=25 {
+        let prev = format!("m{}", i - 1);
+        let curr = format!("m{i}");
+        db::handle_create(&pool, t, &curr).await.unwrap();
+        handle_merge(&pool, t, &prev, std::slice::from_ref(&curr))
+            .await
+            .unwrap();
+    }
+
+    let depth_before = chain_depth(&pool, t, "m25").await;
+    assert!(depth_before >= 25);
+
+    db::handle_compress_path(&pool, t, "m25", 5).await.unwrap();
+
+    let depth_after = chain_depth(&pool, t, "m25").await;
+    assert_eq!(depth_after, 1);
+
+    for i in 0..=25 {
+        let did = format!("m{i}");
+        let resolved = resolve(&pool, t, &did).await.unwrap().unwrap();
+        assert_eq!(resolved.person_uuid, root.person_uuid);
+    }
+
+    assert_all_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn compress_noop_short_chain() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    db::handle_create(&pool, t, "a").await.unwrap();
+    handle_alias(&pool, t, "a", "b").await.unwrap();
+    handle_alias(&pool, t, "b", "c").await.unwrap();
+    handle_alias(&pool, t, "c", "d").await.unwrap();
+    handle_alias(&pool, t, "d", "e").await.unwrap();
+
+    let depth_before = chain_depth(&pool, t, "e").await;
+    assert_eq!(depth_before, 4);
+
+    let chain_before = collect_chain(&pool, t, "e").await;
+
+    db::handle_compress_path(&pool, t, "e", 20).await.unwrap();
+
+    let chain_after = collect_chain(&pool, t, "e").await;
+    assert_eq!(
+        chain_before.len(),
+        chain_after.len(),
+        "chain should be unchanged when depth < threshold"
+    );
+    for (before, after) in chain_before.iter().zip(chain_after.iter()) {
+        assert_eq!(before.current, after.current);
+        assert_eq!(before.next, after.next);
+    }
+
+    assert_all_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn compress_bail_out_already_compressed() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let root = db::handle_create(&pool, t, "r0").await.unwrap();
+
+    for i in 1..=30 {
+        let prev = format!("r{}", i - 1);
+        let curr = format!("r{i}");
+        handle_alias(&pool, t, &prev, &curr).await.unwrap();
+    }
+
+    db::handle_compress_path(&pool, t, "r30", 5).await.unwrap();
+    let depth_after_first = chain_depth(&pool, t, "r30").await;
+    assert_eq!(depth_after_first, 1);
+
+    let chain_snapshot = collect_chain(&pool, t, "r30").await;
+
+    db::handle_compress_path(&pool, t, "r30", 5).await.unwrap();
+
+    let chain_after_second = collect_chain(&pool, t, "r30").await;
+    assert_eq!(chain_snapshot.len(), chain_after_second.len());
+    for (a, b) in chain_snapshot.iter().zip(chain_after_second.iter()) {
+        assert_eq!(a.current, b.current);
+        assert_eq!(a.next, b.next);
+    }
+
+    let resolved = resolve(&pool, t, "r30").await.unwrap().unwrap();
+    assert_eq!(resolved.person_uuid, root.person_uuid);
+
+    assert_all_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn compress_preserves_soft_deleted_root() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let created = db::handle_create(&pool, t, "s0").await.unwrap();
+    for i in 1..=25 {
+        let prev = format!("s{}", i - 1);
+        let curr = format!("s{i}");
+        handle_alias(&pool, t, &prev, &curr).await.unwrap();
+    }
+
+    db::handle_delete_person(&pool, t, &created.person_uuid)
+        .await
+        .unwrap();
+
+    db::handle_compress_path(&pool, t, "s25", 5).await.unwrap();
+
+    for i in 0..=25 {
+        let did = format!("s{i}");
+        let resolved = resolve(&pool, t, &did).await.unwrap();
+        assert!(
+            resolved.is_none(),
+            "{did} should still resolve to None after compression of deleted chain"
+        );
+    }
+
+    assert_structural_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn compress_idempotent() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let root = db::handle_create(&pool, t, "i0").await.unwrap();
+
+    for i in 1..=25 {
+        let prev = format!("i{}", i - 1);
+        let curr = format!("i{i}");
+        handle_alias(&pool, t, &prev, &curr).await.unwrap();
+    }
+
+    db::handle_compress_path(&pool, t, "i25", 5).await.unwrap();
+
+    let chain_first = collect_chain(&pool, t, "i25").await;
+
+    db::handle_compress_path(&pool, t, "i25", 5).await.unwrap();
+    db::handle_compress_path(&pool, t, "i25", 5).await.unwrap();
+
+    let chain_third = collect_chain(&pool, t, "i25").await;
+    assert_eq!(chain_first.len(), chain_third.len());
+    for (a, b) in chain_first.iter().zip(chain_third.iter()) {
+        assert_eq!(a.current, b.current);
+        assert_eq!(a.next, b.next);
+    }
+
+    for i in 0..=25 {
+        let did = format!("i{i}");
+        let resolved = resolve(&pool, t, &did).await.unwrap().unwrap();
+        assert_eq!(resolved.person_uuid, root.person_uuid);
+    }
+
+    assert_all_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn compress_nonexistent_did_is_noop() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let result = db::handle_compress_path(&pool, t, "no-such-did", 5).await;
+    assert!(
+        result.is_ok(),
+        "compressing nonexistent DID should be a no-op"
+    );
+}
+
+#[tokio::test]
+async fn alias_returns_compress_hint_above_threshold() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    db::handle_create(&pool, t, "h0").await.unwrap();
+    for i in 1..=10 {
+        let prev = format!("h{}", i - 1);
+        let curr = format!("h{i}");
+        handle_alias(&pool, t, &prev, &curr).await.unwrap();
+    }
+
+    db::handle_create(&pool, t, "h-other").await.unwrap();
+
+    let (_, hint) = db::handle_alias(&pool, t, "h10", "h-other", 5)
+        .await
+        .unwrap();
+    assert!(
+        hint.is_some(),
+        "should return CompressHint when combined depth > threshold"
+    );
+    let hint = hint.unwrap();
+    assert!(hint.depth > 5);
+
+    assert_all_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn alias_no_compress_hint_below_threshold() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    db::handle_create(&pool, t, "lo-a").await.unwrap();
+    db::handle_create(&pool, t, "lo-b").await.unwrap();
+
+    let (_, hint) = db::handle_alias(&pool, t, "lo-a", "lo-b", 20)
+        .await
+        .unwrap();
+    assert!(
+        hint.is_none(),
+        "should not return CompressHint for short chains"
+    );
+
+    assert_all_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn merge_returns_compress_hint_above_threshold() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    db::handle_create(&pool, t, "mg0").await.unwrap();
+    for i in 1..=10 {
+        let prev = format!("mg{}", i - 1);
+        let curr = format!("mg{i}");
+        handle_alias(&pool, t, &prev, &curr).await.unwrap();
+    }
+
+    db::handle_create(&pool, t, "mg-src").await.unwrap();
+
+    let (_, hint) = db::handle_merge(&pool, t, "mg10", &["mg-src".into()], 5)
+        .await
+        .unwrap();
+    assert!(
+        hint.is_some(),
+        "merge should return CompressHint when combined depth > threshold"
+    );
+    let hint = hint.unwrap();
+    assert!(hint.depth > 5);
+
+    assert_all_invariants(&pool, t).await;
 }

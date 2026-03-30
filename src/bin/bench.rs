@@ -368,7 +368,7 @@ async fn phase_alias(pool: &PgPool, ops: &[AliasOp]) {
 
     for op in ops {
         let t0 = Instant::now();
-        db::handle_alias(pool, op.team_id, &op.target, &op.source)
+        db::handle_alias(pool, op.team_id, &op.target, &op.source, i32::MAX)
             .await
             .expect("alias failed");
         latencies.push(t0.elapsed());
@@ -451,7 +451,7 @@ async fn phase_merge(pool: &PgPool, pregen: &MergePregen) {
     let mut latencies = Vec::with_capacity(n_ops);
     for op in &pregen.ops {
         let t0 = Instant::now();
-        db::handle_merge(pool, op.team_id, &op.target, &op.sources)
+        db::handle_merge(pool, op.team_id, &op.target, &op.sources, i32::MAX)
             .await
             .expect("merge failed");
         latencies.push(t0.elapsed());
@@ -569,7 +569,7 @@ async fn phase_chain_deepen(
         for chain in chains {
             for i in 0..chain.len().saturating_sub(1) {
                 let t_op = Instant::now();
-                db::handle_merge(pool, *team_id, &chain[i + 1], &[chain[i].clone()])
+                db::handle_merge(pool, *team_id, &chain[i + 1], &[chain[i].clone()], i32::MAX)
                     .await
                     .expect("chain deepen merge failed");
                 latencies.push(t_op.elapsed());

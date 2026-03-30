@@ -3,6 +3,9 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 
+use pg_union_find_rs::db::{self, ResolvedPerson};
+use pg_union_find_rs::models::{AliasResponse, DbResult, MergeResponse};
+
 static TEAM_COUNTER: AtomicI64 = AtomicI64::new(0);
 
 pub fn next_team_id() -> i64 {
@@ -468,4 +471,44 @@ pub async fn assert_structural_invariants(pool: &PgPool, team_id: i64) {
 pub async fn assert_all_invariants(pool: &PgPool, team_id: i64) {
     assert_structural_invariants(pool, team_id).await;
     assert_no_deleted_rows(pool, team_id).await;
+}
+
+// ---- Test wrappers that hide the compress_threshold parameter ---------------
+
+pub async fn handle_alias(
+    pool: &PgPool,
+    team_id: i64,
+    target: &str,
+    source: &str,
+) -> DbResult<AliasResponse> {
+    db::handle_alias(pool, team_id, target, source, i32::MAX)
+        .await
+        .map(|(r, _)| r)
+}
+
+pub async fn handle_merge(
+    pool: &PgPool,
+    team_id: i64,
+    target: &str,
+    sources: &[String],
+) -> DbResult<MergeResponse> {
+    db::handle_merge(pool, team_id, target, sources, i32::MAX)
+        .await
+        .map(|(r, _)| r)
+}
+
+pub async fn resolve(
+    pool: &PgPool,
+    team_id: i64,
+    distinct_id: &str,
+) -> DbResult<Option<ResolvedPerson>> {
+    db::resolve(pool, team_id, distinct_id)
+        .await
+        .map(|opt| opt.map(|(p, _)| p))
+}
+
+/// Walk the chain and return its depth (number of hops from start to root).
+pub async fn chain_depth(pool: &PgPool, team_id: i64, distinct_id: &str) -> i32 {
+    let chain = collect_chain(pool, team_id, distinct_id).await;
+    (chain.len() as i32).saturating_sub(1)
 }
