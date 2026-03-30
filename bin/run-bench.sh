@@ -63,7 +63,7 @@ echo "    Postgres is ready."
 # ---- 3. Build release binaries ---------------------------------------------
 
 echo "==> Building release binaries..."
-cargo build --release --bin migrate --bin bench --bin pg-union-find-rs
+cargo build --release --bin migrate --bin bench --bin server
 
 # ---- 4. Run migrations -----------------------------------------------------
 
@@ -73,7 +73,7 @@ echo "==> Running migrations..."
 # ---- 5. Start the server ---------------------------------------------------
 
 echo "==> Starting server..."
-./target/release/pg-union-find-rs &
+./target/release/server &
 SERVER_PID=$!
 
 echo "==> Waiting for server on port ${SERVER_PORT}..."

@@ -336,34 +336,23 @@ async fn phase_warm(pool: &PgPool, n: usize, team_ids: &[i64]) -> WarmupResult {
 // Phase 1b: /create benchmark — parallel HTTP POST /create
 // ---------------------------------------------------------------------------
 
-struct CreatePregen {
-    ops: Vec<ScopedId>,
-    new_ids: Vec<ScopedId>,
-}
-
 fn pregen_create_ops(
     n: usize,
     all_targets: &[ScopedId],
     hot_set: &[ScopedId],
     team_ids: &[i64],
-) -> CreatePregen {
+) -> Vec<ScopedId> {
     let mut rng = rand::rng();
     let n_new = n * 4 / 5;
     let n_get = n - n_new;
 
     let mut ops = Vec::with_capacity(n);
-    let mut new_ids = Vec::with_capacity(n_new);
 
     for i in 0..n_new {
         let team_id = team_ids[i % team_ids.len()];
-        let did = format!("create-{i}");
-        new_ids.push(ScopedId {
-            team_id,
-            distinct_id: did.clone(),
-        });
         ops.push(ScopedId {
             team_id,
-            distinct_id: did,
+            distinct_id: format!("create-{i}"),
         });
     }
 
@@ -373,8 +362,7 @@ fn pregen_create_ops(
     }
 
     ops.shuffle(&mut rng);
-
-    CreatePregen { ops, new_ids }
+    ops
 }
 
 async fn phase_create(client: &Client, sem: &Arc<Semaphore>, base_url: &str, ops: &[ScopedId]) {
@@ -422,10 +410,9 @@ fn pregen_alias_ops(
     team_ids: &[i64],
 ) -> AliasPregen {
     let mut rng = rand::rng();
-    let n_case2a = n / 20;
     let n_tgt_eq_src = n / 20;
     let n_case3 = n / 20;
-    let n_case1a = n - n_case2a - n_tgt_eq_src - n_case3;
+    let n_case1a = n - n_tgt_eq_src - n_case3;
 
     let mut ops = Vec::with_capacity(n);
 
@@ -435,15 +422,6 @@ fn pregen_alias_ops(
             team_id: tgt.team_id,
             target: tgt.distinct_id.clone(),
             source: format!("alias-{i}"),
-        });
-    }
-
-    for _ in 0..n_case2a {
-        let donor = &ops[rng.random_range(0..n_case1a)];
-        ops.push(AliasOp {
-            team_id: donor.team_id,
-            target: donor.target.clone(),
-            source: donor.source.clone(),
         });
     }
 
@@ -464,6 +442,8 @@ fn pregen_alias_ops(
             source: format!("fresh-src-{i}"),
         });
     }
+
+    ops.shuffle(&mut rng);
 
     AliasPregen { ops }
 }
@@ -512,6 +492,11 @@ struct MergePregen {
     all_merge_ids: Vec<ScopedId>,
 }
 
+/// Cross-team safety: person_id is a BIGSERIAL PK on person_mapping (globally
+/// unique, one row = one team). All merge SQL filters by the single team_id in
+/// each request. `pick_target_for_team` selects targets from the same team's
+/// warm-up primaries, and `merge_by_team` groups sources per team. Person IDs
+/// are never shared across teams.
 fn pregen_merge(
     n: usize,
     batch_size: usize,
@@ -911,7 +896,7 @@ async fn main() {
     // Pregenerate all operation data so timed loops measure only server work.
     let t_pregen = Instant::now();
 
-    let create_pregen = pregen_create_ops(n_create, &warm.all_targets, &warm.hot_set, &team_ids);
+    let create_ops = pregen_create_ops(n_create, &warm.all_targets, &warm.hot_set, &team_ids);
     let alias_pregen = pregen_alias_ops(n_alias, &warm.all_targets, &warm.hot_set, &team_ids);
     let merge_pregen = pregen_merge(
         n_merge,
@@ -921,35 +906,21 @@ async fn main() {
         &warm.hot_by_team,
     );
 
-    // Build read lookup pool from resolvable distinct_ids across all phases.
-    let mut lookup_ids: Vec<ScopedId> = Vec::new();
-    for op in &alias_pregen.ops {
-        if op.target != op.source {
-            lookup_ids.push(ScopedId {
-                team_id: op.team_id,
-                distinct_id: op.source.clone(),
-            });
-            if !op.target.starts_with("primary-") {
-                lookup_ids.push(ScopedId {
-                    team_id: op.team_id,
-                    distinct_id: op.target.clone(),
-                });
-            }
-        }
-    }
-    lookup_ids.extend(create_pregen.new_ids.iter().cloned());
+    // Build read lookup pool from DB-seeded IDs only — no dependency on HTTP phases.
+    // Warm-up primaries test root-node resolution; merge IDs test chain traversal.
+    let mut lookup_ids: Vec<ScopedId> = warm.all_targets.clone();
     lookup_ids.extend(merge_pregen.all_merge_ids.iter().cloned());
 
     println!(
         "pregenerated {} create + {} alias + {} merge ops in {:.2?}\n",
-        create_pregen.ops.len(),
+        create_ops.len(),
         alias_pregen.ops.len(),
         merge_pregen.ops.len(),
         t_pregen.elapsed(),
     );
 
     // Phase 1b: create benchmark (parallel HTTP)
-    phase_create(&client, &sem, &base_url, &create_pregen.ops).await;
+    phase_create(&client, &sem, &base_url, &create_ops).await;
 
     // Phase 2: alias benchmark (parallel HTTP)
     phase_alias(&client, &sem, &base_url, &alias_pregen.ops).await;
