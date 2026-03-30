@@ -29,9 +29,9 @@ services:
       - -c
       - wal_compression=lz4
       - -c
-      - commit_delay=10
+      - commit_delay=200
       - -c
-      - commit_siblings=5
+      - commit_siblings=20
       - -c
       - max_connections=200
       - -c
