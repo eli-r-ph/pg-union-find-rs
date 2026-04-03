@@ -230,6 +230,44 @@ pub async fn merge(
 }
 
 // ---------------------------------------------------------------------------
+// POST /batched_merge
+// ---------------------------------------------------------------------------
+
+pub async fn batched_merge(
+    State(state): State<AppState>,
+    Json(req): Json<MergeRequest>,
+) -> impl IntoResponse {
+    let (reply_tx, reply_rx) = oneshot::channel();
+
+    let team_id = req.team_id;
+    let op = DbOp::BatchedMerge {
+        team_id,
+        target: req.target,
+        sources: req.sources,
+        reply: reply_tx,
+    };
+
+    if let Err(resp) = enqueue_op(state.sender_for(team_id), op).await {
+        return resp;
+    }
+
+    match reply_rx.await {
+        Ok(Ok((resp, hint))) => {
+            if let Some(hint) = hint {
+                enqueue_compress(&state, team_id, hint);
+            }
+            (StatusCode::OK, Json(serde_json::json!(resp))).into_response()
+        }
+        Ok(Err(e)) => db_error_response(e),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "worker dropped reply"})),
+        )
+            .into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // GET /health — lightweight check (bypasses the worker channel)
 // ---------------------------------------------------------------------------
 

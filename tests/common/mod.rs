@@ -497,6 +497,17 @@ pub async fn handle_merge(
         .map(|(r, _)| r)
 }
 
+pub async fn handle_batched_merge(
+    pool: &PgPool,
+    team_id: i64,
+    target: &str,
+    sources: &[String],
+) -> DbResult<MergeResponse> {
+    db::handle_batched_merge(pool, team_id, target, sources, i32::MAX)
+        .await
+        .map(|(r, _)| r)
+}
+
 pub async fn resolve(
     pool: &PgPool,
     team_id: i64,

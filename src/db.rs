@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use sqlx::PgPool;
 use sqlx::postgres::PgConnection;
 use tokio::sync::mpsc;
@@ -162,6 +164,17 @@ pub async fn worker_loop(pool: PgPool, mut rx: mpsc::Receiver<DbOp>, compress_th
             } => {
                 let _ = reply.send(
                     handle_merge(&pool, team_id, &target, &sources, compress_threshold).await,
+                );
+            }
+            DbOp::BatchedMerge {
+                team_id,
+                target,
+                sources,
+                reply,
+            } => {
+                let _ = reply.send(
+                    handle_batched_merge(&pool, team_id, &target, &sources, compress_threshold)
+                        .await,
                 );
             }
             DbOp::DeletePerson {
@@ -409,6 +422,93 @@ async fn resolve_root(
     .await?;
 
     Ok(row)
+}
+
+/// Batch-lookup multiple distinct_id strings, returning a map from
+/// distinct_id string to its `distinct_id_mappings.id` PK.
+/// Strings not present in the DB are simply absent from the result.
+async fn batch_lookup_dids(
+    conn: &mut PgConnection,
+    team_id: i64,
+    dids: &[String],
+) -> DbResult<HashMap<String, i64>> {
+    if dids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows = sqlx::query_as::<_, (i64, String)>(
+        "SELECT id, distinct_id FROM distinct_id_mappings \
+         WHERE team_id = $1 AND distinct_id = ANY($2)",
+    )
+    .bind(team_id)
+    .bind(dids)
+    .fetch_all(&mut *conn)
+    .await?;
+
+    Ok(rows.into_iter().map(|(id, did)| (did, id)).collect())
+}
+
+/// Result of resolving one PK through the union-find chain in a batch.
+struct BatchResolveRow {
+    start_node: i64,
+    root_current: i64,
+    person_id: i64,
+    depth: i32,
+}
+
+/// Batch-resolve multiple distinct_id PKs to their roots in a single
+/// recursive CTE. Each returned row carries the `start_node` so the
+/// caller can map results back to individual sources.
+///
+/// PKs whose chain leads to a soft-deleted person (or has no root)
+/// are absent from the result — the caller should treat them as orphaned.
+async fn batch_resolve_pks(
+    conn: &mut PgConnection,
+    team_id: i64,
+    pks: &[i64],
+) -> DbResult<Vec<BatchResolveRow>> {
+    if pks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query_as::<_, (i64, i64, i64, i32)>(
+        r#"
+        WITH RECURSIVE walk(start_node, node, depth) AS (
+            SELECT v, v, 0 FROM unnest($2::bigint[]) AS v
+
+            UNION ALL
+
+            SELECT w.start_node, uf.next, w.depth + 1
+            FROM walk w
+            JOIN union_find uf
+              ON uf.team_id = $1 AND uf.current = w.node AND uf.person_id IS NULL
+            WHERE w.depth < 1000
+        ),
+        roots AS (
+            SELECT DISTINCT ON (start_node) start_node, node AS root_current, depth
+            FROM walk
+            ORDER BY start_node, depth DESC
+        )
+        SELECT r.start_node, r.root_current, uf.person_id, r.depth
+        FROM roots r
+        JOIN union_find uf ON uf.team_id = $1 AND uf.current = r.root_current
+        JOIN person_mapping pm ON pm.person_id = uf.person_id
+        WHERE uf.person_id IS NOT NULL
+          AND pm.deleted_at IS NULL
+        "#,
+    )
+    .bind(team_id)
+    .bind(pks)
+    .fetch_all(&mut *conn)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(start_node, root_current, person_id, depth)| BatchResolveRow {
+            start_node,
+            root_current,
+            person_id,
+            depth,
+        })
+        .collect())
 }
 
 /// Resolve a distinct_id string all the way to a ResolvedPerson and chain depth.
@@ -950,6 +1050,214 @@ pub async fn handle_merge(
         }
     }
 
+    set_identified(&mut tx, target_person_id).await?;
+    tx.commit().await?;
+
+    let compress_hint = if max_combined_depth > compress_threshold {
+        deepest_source.map(|did| CompressHint {
+            distinct_id: did,
+            depth: max_combined_depth,
+        })
+    } else {
+        None
+    };
+
+    Ok((
+        MergeResponse {
+            person_uuid: target_person_uuid,
+            is_identified: true,
+        },
+        compress_hint,
+    ))
+}
+
+/// /batched_merge — same semantics as handle_merge but uses batched SQL
+/// to resolve and link all sources in bulk rather than one-at-a-time.
+///
+/// The algorithm:
+///   1. Resolve target via check_did (same as handle_merge).
+///   2. Batch-lookup all source distinct_ids in one query.
+///   3. Batch-resolve all found PKs to their roots in one recursive CTE.
+///   4. Classify each source: NotFound / Orphaned / Live-same / Live-different.
+///   5. Batch-insert all NotFound sources (2 queries).
+///   6. Process orphaned sources sequentially (rare; reuses unlink_did + link_did).
+///   7. Batch-link all Live-different roots to target (2 queries, deduped by root).
+///   8. set_identified + commit.
+pub async fn handle_batched_merge(
+    pool: &PgPool,
+    team_id: i64,
+    target: &str,
+    sources: &[String],
+    compress_threshold: i32,
+) -> DbResult<(MergeResponse, Option<CompressHint>)> {
+    validate_distinct_id(target)?;
+    for src in sources {
+        validate_distinct_id(src)?;
+    }
+
+    let mut tx = pool.begin().await?;
+
+    // --- Step 1: resolve target (identical to handle_merge) -----------------
+    let (target_pk, target_person_id, target_person_uuid, target_depth) =
+        match check_did(&mut tx, team_id, target).await? {
+            DidState::NotFound => {
+                return Err(DbError::NotFound(format!(
+                    "target distinct_id '{target}' not found"
+                )));
+            }
+            DidState::Orphaned(pk) => {
+                let person_uuid = Uuid::new_v4().to_string();
+                let person_id: i64 = sqlx::query_scalar(
+                    "INSERT INTO person_mapping (team_id, person_uuid) \
+                     VALUES ($1, $2) RETURNING person_id",
+                )
+                .bind(team_id)
+                .bind(&person_uuid)
+                .fetch_one(&mut *tx)
+                .await?;
+                root_did(&mut tx, team_id, pk, person_id).await?;
+                (pk, person_id, person_uuid, 0i32)
+            }
+            DidState::Live(pk, resolved, depth) => {
+                (pk, resolved.person_id, resolved.person_uuid, depth)
+            }
+        };
+
+    if sources.is_empty() {
+        set_identified(&mut tx, target_person_id).await?;
+        tx.commit().await?;
+        return Ok((
+            MergeResponse {
+                person_uuid: target_person_uuid,
+                is_identified: true,
+            },
+            None,
+        ));
+    }
+
+    // Dedup sources while preserving first-occurrence order.
+    let unique_sources: Vec<&String> = {
+        let mut seen = std::collections::HashSet::new();
+        sources.iter().filter(|s| seen.insert(s.as_str())).collect()
+    };
+
+    // --- Step 2: batch lookup -----------------------------------------------
+    let source_strs: Vec<String> = unique_sources.iter().map(|s| s.to_string()).collect();
+    let did_map = batch_lookup_dids(&mut tx, team_id, &source_strs).await?;
+
+    // --- Step 3: batch resolve found PKs ------------------------------------
+    let found_pks: Vec<i64> = did_map.values().copied().collect();
+    let resolve_rows = batch_resolve_pks(&mut tx, team_id, &found_pks).await?;
+
+    let resolve_map: HashMap<i64, &BatchResolveRow> =
+        resolve_rows.iter().map(|r| (r.start_node, r)).collect();
+
+    // --- Step 4: classify ---------------------------------------------------
+    let mut not_found: Vec<&str> = Vec::new();
+    let mut orphaned_pks: Vec<i64> = Vec::new();
+    // (root_current, old_person_id) — will be deduped before writing
+    let mut live_diff: Vec<(i64, i64)> = Vec::new();
+
+    let mut max_combined_depth = 0i32;
+    let mut deepest_source: Option<String> = None;
+
+    for src in &unique_sources {
+        let src_str = src.as_str();
+        match did_map.get(src_str) {
+            None => {
+                not_found.push(src_str);
+                let combined = target_depth + 1;
+                if combined > max_combined_depth {
+                    max_combined_depth = combined;
+                    deepest_source = Some(src_str.to_string());
+                }
+            }
+            Some(&pk) => match resolve_map.get(&pk) {
+                None => {
+                    orphaned_pks.push(pk);
+                    let combined = target_depth + 1;
+                    if combined > max_combined_depth {
+                        max_combined_depth = combined;
+                        deepest_source = Some(src_str.to_string());
+                    }
+                }
+                Some(row) if row.person_id == target_person_id => {
+                    // already same person — skip
+                }
+                Some(row) => {
+                    live_diff.push((row.root_current, row.person_id));
+                    let combined = row.depth + target_depth + 1;
+                    if combined > max_combined_depth {
+                        max_combined_depth = combined;
+                        deepest_source = Some(src_str.to_string());
+                    }
+                }
+            },
+        }
+    }
+
+    // --- Step 5: batch insert NotFound sources ------------------------------
+    if !not_found.is_empty() {
+        let new_rows = sqlx::query_as::<_, (i64,)>(
+            "INSERT INTO distinct_id_mappings (team_id, distinct_id) \
+             SELECT $1, unnest($2::text[]) RETURNING id",
+        )
+        .bind(team_id)
+        .bind(&not_found)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let new_pks: Vec<i64> = new_rows.into_iter().map(|(id,)| id).collect();
+
+        for &new_pk in &new_pks {
+            sqlx::query(
+                "INSERT INTO union_find (team_id, current, next, person_id) \
+                 VALUES ($1, $2, $3, NULL)",
+            )
+            .bind(team_id)
+            .bind(new_pk)
+            .bind(target_pk)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+
+    // --- Step 6: orphaned sources (sequential — rare case) ------------------
+    for pk in &orphaned_pks {
+        unlink_did(&mut tx, team_id, *pk).await?;
+        link_did(&mut tx, team_id, *pk, target_pk).await?;
+    }
+
+    // --- Step 7: batch link Live-different roots ----------------------------
+    // Dedup by root_current so we only link each root once.
+    let mut seen_roots = std::collections::HashSet::new();
+    let mut unique_roots: Vec<i64> = Vec::new();
+    let mut old_person_ids: Vec<i64> = Vec::new();
+    for (root_current, old_person) in &live_diff {
+        if seen_roots.insert(*root_current) {
+            unique_roots.push(*root_current);
+            old_person_ids.push(*old_person);
+        }
+    }
+
+    if !unique_roots.is_empty() {
+        sqlx::query(
+            "UPDATE union_find SET person_id = NULL, next = $3 \
+             WHERE team_id = $1 AND current = ANY($2::bigint[])",
+        )
+        .bind(team_id)
+        .bind(&unique_roots)
+        .bind(target_pk)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query("DELETE FROM person_mapping WHERE person_id = ANY($1::bigint[])")
+            .bind(&old_person_ids)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    // --- Step 8: set_identified + commit ------------------------------------
     set_identified(&mut tx, target_person_id).await?;
     tx.commit().await?;
 

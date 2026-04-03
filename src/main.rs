@@ -90,6 +90,7 @@ async fn main() {
         .route("/identify", post(handlers::identify))
         .route("/alias", post(handlers::alias))
         .route("/merge", post(handlers::merge))
+        .route("/batched_merge", post(handlers::batched_merge))
         .route("/delete_person", post(handlers::delete_person))
         .route("/delete_distinct_id", post(handlers::delete_distinct_id))
         .route("/resolve", post(handlers::resolve))

@@ -148,6 +148,12 @@ pub enum DbOp {
         sources: Vec<String>,
         reply: oneshot::Sender<DbResult<(MergeResponse, Option<CompressHint>)>>,
     },
+    BatchedMerge {
+        team_id: i64,
+        target: String,
+        sources: Vec<String>,
+        reply: oneshot::Sender<DbResult<(MergeResponse, Option<CompressHint>)>>,
+    },
     DeletePerson {
         team_id: i64,
         person_uuid: String,

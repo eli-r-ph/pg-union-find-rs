@@ -2476,3 +2476,613 @@ async fn compress_fan_out_preserves_siblings() {
 
     assert_all_invariants(&pool, t).await;
 }
+
+// ===========================================================================
+// Batched merge — mirrors of all /merge tests above
+// ===========================================================================
+
+#[tokio::test]
+async fn batched_merge_target_not_found() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let result = handle_batched_merge(&pool, t, "nonexistent", &["a".into()]).await;
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        DbError::NotFound(_) => {}
+        other => panic!("expected NotFound, got: {other}"),
+    }
+}
+
+#[tokio::test]
+async fn batched_merge_source_not_found() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let tgt = db::handle_create(&pool, t, "tgt").await.unwrap();
+    assert_chain_is_root(&pool, t, "tgt", &tgt.person_uuid).await;
+
+    let resp = handle_batched_merge(&pool, t, "tgt", &["new-source".into()])
+        .await
+        .unwrap();
+    assert_eq!(resp.person_uuid, tgt.person_uuid);
+    assert!(resp.is_identified);
+
+    let resolved = resolve(&pool, t, "new-source").await.unwrap().unwrap();
+    assert_eq!(resolved.person_uuid, tgt.person_uuid);
+
+    assert_eq!(count_distinct_ids(&pool, t).await, 2);
+    assert_eq!(count_union_find(&pool, t).await, 2);
+
+    assert_chain_is_root(&pool, t, "tgt", &tgt.person_uuid).await;
+    assert_chain_matches(
+        &pool,
+        t,
+        "new-source",
+        &["new-source", "tgt"],
+        &tgt.person_uuid,
+    )
+    .await;
+
+    assert_all_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn batched_merge_same_person() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let r_a = db::handle_create(&pool, t, "a").await.unwrap();
+    handle_alias(&pool, t, "a", "b").await.unwrap();
+
+    assert_chain_is_root(&pool, t, "a", &r_a.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &r_a.person_uuid).await;
+
+    let before_uf = count_union_find(&pool, t).await;
+    let resp = handle_batched_merge(&pool, t, "a", &["b".into()]).await.unwrap();
+    assert!(resp.is_identified);
+    assert_eq!(resp.person_uuid, r_a.person_uuid);
+
+    assert_eq!(count_union_find(&pool, t).await, before_uf);
+
+    assert_chain_is_root(&pool, t, "a", &r_a.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &r_a.person_uuid).await;
+
+    assert_all_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn batched_merge_different_person() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let person_a = db::handle_create(&pool, t, "a").await.unwrap();
+    let person_b = db::handle_create(&pool, t, "b").await.unwrap();
+
+    assert_chain_is_root(&pool, t, "a", &person_a.person_uuid).await;
+    assert_chain_is_root(&pool, t, "b", &person_b.person_uuid).await;
+
+    let old_root_pid = collect_chain(&pool, t, "b").await[0].person_id.unwrap();
+
+    let resp = handle_batched_merge(&pool, t, "a", &["b".into()]).await.unwrap();
+    assert_eq!(resp.person_uuid, person_a.person_uuid);
+    assert!(resp.is_identified);
+
+    assert!(
+        !person_exists(&pool, old_root_pid).await,
+        "orphaned person_mapping should have been deleted"
+    );
+
+    assert_eq!(count_person_mappings(&pool, t).await, 1);
+
+    assert_chain_is_root(&pool, t, "a", &person_a.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &person_a.person_uuid).await;
+
+    let chain = collect_chain(&pool, t, "a").await;
+    assert!(is_person_identified(&pool, chain[0].person_id.unwrap()).await);
+
+    assert_all_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn batched_merge_shared_person_cleanup() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let person_a = db::handle_create(&pool, t, "a").await.unwrap();
+    let person_b = db::handle_create(&pool, t, "b").await.unwrap();
+    handle_alias(&pool, t, "b", "c").await.unwrap();
+
+    assert_chain_is_root(&pool, t, "a", &person_a.person_uuid).await;
+    assert_chain_is_root(&pool, t, "b", &person_b.person_uuid).await;
+    assert_chain_matches(&pool, t, "c", &["c", "b"], &person_b.person_uuid).await;
+
+    let old_person_b_id = collect_chain(&pool, t, "b").await[0].person_id.unwrap();
+
+    let resp = handle_batched_merge(&pool, t, "a", &["b".into(), "c".into()])
+        .await
+        .unwrap();
+    assert_eq!(resp.person_uuid, person_a.person_uuid);
+    assert!(resp.is_identified);
+
+    assert!(
+        !person_exists(&pool, old_person_b_id).await,
+        "person B should be deleted after merge"
+    );
+    assert_eq!(count_person_mappings(&pool, t).await, 1);
+
+    assert_chain_is_root(&pool, t, "a", &person_a.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &person_a.person_uuid).await;
+    assert_chain_matches(&pool, t, "c", &["c", "b", "a"], &person_a.person_uuid).await;
+
+    assert_all_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn batched_merge_empty_sources() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let tgt = db::handle_create(&pool, t, "tgt").await.unwrap();
+    let resp = handle_batched_merge(&pool, t, "tgt", &[]).await.unwrap();
+    assert_eq!(resp.person_uuid, tgt.person_uuid);
+    assert!(resp.is_identified);
+
+    assert_eq!(count_person_mappings(&pool, t).await, 1);
+    assert_eq!(count_distinct_ids(&pool, t).await, 1);
+    assert_eq!(count_union_find(&pool, t).await, 1);
+
+    assert_chain_is_root(&pool, t, "tgt", &tgt.person_uuid).await;
+
+    assert_all_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn batched_merge_multiple_sources() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let person_a = db::handle_create(&pool, t, "a").await.unwrap();
+    db::handle_create(&pool, t, "b").await.unwrap();
+    handle_alias(&pool, t, "a", "c").await.unwrap();
+
+    let resp = handle_batched_merge(&pool, t, "a", &["b".into(), "c".into(), "brand-new".into()])
+        .await
+        .unwrap();
+    assert_eq!(resp.person_uuid, person_a.person_uuid);
+    assert!(resp.is_identified);
+
+    assert_chain_is_root(&pool, t, "a", &person_a.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &person_a.person_uuid).await;
+    assert_chain_matches(&pool, t, "c", &["c", "a"], &person_a.person_uuid).await;
+    assert_chain_matches(
+        &pool,
+        t,
+        "brand-new",
+        &["brand-new", "a"],
+        &person_a.person_uuid,
+    )
+    .await;
+
+    assert_all_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn batched_merge_target_in_sources() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let tgt = db::handle_create(&pool, t, "a").await.unwrap();
+    let resp = handle_batched_merge(&pool, t, "a", &["a".into()]).await.unwrap();
+    assert_eq!(resp.person_uuid, tgt.person_uuid);
+
+    assert_eq!(count_person_mappings(&pool, t).await, 1);
+    assert_eq!(count_distinct_ids(&pool, t).await, 1);
+    assert_eq!(count_union_find(&pool, t).await, 1);
+
+    assert_chain_is_root(&pool, t, "a", &tgt.person_uuid).await;
+
+    assert_all_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn batched_merge_chain_all_ids_follow() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let person_a = db::handle_create(&pool, t, "a").await.unwrap();
+    db::handle_create(&pool, t, "b").await.unwrap();
+    let person_c = db::handle_create(&pool, t, "c").await.unwrap();
+
+    handle_batched_merge(&pool, t, "a", &["b".into()]).await.unwrap();
+
+    assert_chain_is_root(&pool, t, "a", &person_a.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &person_a.person_uuid).await;
+
+    handle_batched_merge(&pool, t, "c", &["a".into()]).await.unwrap();
+
+    assert_chain_is_root(&pool, t, "c", &person_c.person_uuid).await;
+    assert_chain_matches(&pool, t, "a", &["a", "c"], &person_c.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a", "c"], &person_c.person_uuid).await;
+
+    assert_eq!(
+        count_person_mappings(&pool, t).await,
+        1,
+        "only c's person should remain"
+    );
+
+    assert_all_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn batched_merge_chain_deep_transitive() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let person_a = db::handle_create(&pool, t, "a").await.unwrap();
+    db::handle_create(&pool, t, "b").await.unwrap();
+    db::handle_create(&pool, t, "c").await.unwrap();
+    let person_d = db::handle_create(&pool, t, "d").await.unwrap();
+
+    handle_batched_merge(&pool, t, "a", &["b".into(), "c".into()])
+        .await
+        .unwrap();
+
+    assert_chain_is_root(&pool, t, "a", &person_a.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &person_a.person_uuid).await;
+    assert_chain_matches(&pool, t, "c", &["c", "a"], &person_a.person_uuid).await;
+
+    handle_batched_merge(&pool, t, "d", &["a".into()]).await.unwrap();
+
+    assert_chain_is_root(&pool, t, "d", &person_d.person_uuid).await;
+    assert_chain_matches(&pool, t, "a", &["a", "d"], &person_d.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a", "d"], &person_d.person_uuid).await;
+    assert_chain_matches(&pool, t, "c", &["c", "a", "d"], &person_d.person_uuid).await;
+
+    assert_eq!(count_person_mappings(&pool, t).await, 1);
+    assert_all_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn batched_merge_sets_identified() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let r_x = db::handle_create(&pool, t, "x").await.unwrap();
+    db::handle_create(&pool, t, "y").await.unwrap();
+
+    let chain_x = collect_chain(&pool, t, "x").await;
+    let pid_x = chain_x[0].person_id.unwrap();
+    assert!(!is_person_identified(&pool, pid_x).await);
+
+    let resp = handle_batched_merge(&pool, t, "x", &["y".into()]).await.unwrap();
+    assert!(resp.is_identified);
+
+    assert_chain_is_root(&pool, t, "x", &r_x.person_uuid).await;
+    assert_chain_matches(&pool, t, "y", &["y", "x"], &r_x.person_uuid).await;
+    assert!(is_person_identified(&pool, pid_x).await);
+}
+
+#[tokio::test]
+async fn batched_merge_rejects_illegal_ids() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    db::handle_create(&pool, t, "legit").await.unwrap();
+
+    let result = handle_batched_merge(&pool, t, "anonymous", &[]).await;
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        DbError::IllegalDistinctId(_) => {}
+        other => panic!("expected IllegalDistinctId, got: {other}"),
+    }
+
+    let result = handle_batched_merge(&pool, t, "legit", &["undefined".into()]).await;
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        DbError::IllegalDistinctId(_) => {}
+        other => panic!("expected IllegalDistinctId, got: {other}"),
+    }
+}
+
+#[tokio::test]
+async fn batched_merge_link_structure() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let r_a = db::handle_create(&pool, t, "a").await.unwrap();
+    let r_b = db::handle_create(&pool, t, "b").await.unwrap();
+
+    assert_chain_is_root(&pool, t, "a", &r_a.person_uuid).await;
+    assert_chain_is_root(&pool, t, "b", &r_b.person_uuid).await;
+
+    handle_batched_merge(&pool, t, "a", &["b".into()]).await.unwrap();
+
+    assert_chain_is_root(&pool, t, "a", &r_a.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &r_a.person_uuid).await;
+
+    assert_all_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn batched_merge_duplicate_sources() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let person_a = db::handle_create(&pool, t, "a").await.unwrap();
+    db::handle_create(&pool, t, "b").await.unwrap();
+
+    let resp = handle_batched_merge(&pool, t, "a", &["b".into(), "b".into()])
+        .await
+        .unwrap();
+    assert_eq!(resp.person_uuid, person_a.person_uuid);
+    assert!(resp.is_identified);
+
+    assert_chain_is_root(&pool, t, "a", &person_a.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &person_a.person_uuid).await;
+
+    assert_eq!(count_person_mappings(&pool, t).await, 1);
+    assert_all_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn batched_merge_target_plus_others_in_sources() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let person_a = db::handle_create(&pool, t, "a").await.unwrap();
+    db::handle_create(&pool, t, "b").await.unwrap();
+
+    let resp = handle_batched_merge(&pool, t, "a", &["a".into(), "b".into()])
+        .await
+        .unwrap();
+    assert_eq!(resp.person_uuid, person_a.person_uuid);
+
+    assert_chain_is_root(&pool, t, "a", &person_a.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &person_a.person_uuid).await;
+
+    assert_eq!(count_person_mappings(&pool, t).await, 1);
+    assert_all_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn batched_merge_already_identified_target() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let resp_x = handle_alias(&pool, t, "x", "x").await.unwrap();
+    assert!(resp_x.is_identified);
+    assert_chain_is_root(&pool, t, "x", &resp_x.person_uuid).await;
+
+    db::handle_create(&pool, t, "y").await.unwrap();
+
+    let resp = handle_batched_merge(&pool, t, "x", &["y".into()]).await.unwrap();
+    assert_eq!(resp.person_uuid, resp_x.person_uuid);
+    assert!(resp.is_identified);
+
+    assert_chain_is_root(&pool, t, "x", &resp_x.person_uuid).await;
+    assert_chain_matches(&pool, t, "y", &["y", "x"], &resp_x.person_uuid).await;
+
+    let chain = collect_chain(&pool, t, "x").await;
+    assert!(is_person_identified(&pool, chain[0].person_id.unwrap()).await);
+
+    assert_all_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn batched_merge_with_deleted_target() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let pa = db::handle_create(&pool, t, "a").await.unwrap();
+    db::handle_delete_person(&pool, t, &pa.person_uuid)
+        .await
+        .unwrap();
+
+    let resp = handle_batched_merge(&pool, t, "a", &["b".into()]).await.unwrap();
+    assert_ne!(resp.person_uuid, pa.person_uuid);
+    assert!(resp.is_identified);
+
+    assert_chain_is_root(&pool, t, "a", &resp.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &resp.person_uuid).await;
+
+    assert_structural_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn batched_merge_with_deleted_source() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let pa = db::handle_create(&pool, t, "a").await.unwrap();
+    let pb = db::handle_create(&pool, t, "b").await.unwrap();
+
+    db::handle_delete_person(&pool, t, &pb.person_uuid)
+        .await
+        .unwrap();
+
+    let resp = handle_batched_merge(&pool, t, "a", &["b".into()]).await.unwrap();
+    assert_eq!(resp.person_uuid, pa.person_uuid);
+    assert!(resp.is_identified);
+
+    assert_chain_is_root(&pool, t, "a", &pa.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &pa.person_uuid).await;
+
+    assert_structural_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn batched_merge_returns_compress_hint_above_threshold() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    db::handle_create(&pool, t, "mg0").await.unwrap();
+    for i in 1..=10 {
+        let prev = format!("mg{}", i - 1);
+        let curr = format!("mg{i}");
+        handle_alias(&pool, t, &prev, &curr).await.unwrap();
+    }
+
+    db::handle_create(&pool, t, "mg-src").await.unwrap();
+
+    let (_, hint) = db::handle_batched_merge(&pool, t, "mg10", &["mg-src".into()], 5)
+        .await
+        .unwrap();
+    assert!(
+        hint.is_some(),
+        "batched_merge should return CompressHint when combined depth > threshold"
+    );
+    let hint = hint.unwrap();
+    assert!(hint.depth > 5);
+
+    assert_all_invariants(&pool, t).await;
+}
+
+// ===========================================================================
+// Batched merge — new tests specific to batched behavior
+// ===========================================================================
+
+#[tokio::test]
+async fn batched_merge_multiple_sources_same_root() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let person_a = db::handle_create(&pool, t, "a").await.unwrap();
+    let person_b = db::handle_create(&pool, t, "b").await.unwrap();
+    handle_alias(&pool, t, "b", "c").await.unwrap();
+    handle_alias(&pool, t, "b", "d").await.unwrap();
+
+    assert_chain_is_root(&pool, t, "b", &person_b.person_uuid).await;
+    assert_chain_matches(&pool, t, "c", &["c", "b"], &person_b.person_uuid).await;
+    assert_chain_matches(&pool, t, "d", &["d", "b"], &person_b.person_uuid).await;
+
+    let old_person_b_id = collect_chain(&pool, t, "b").await[0].person_id.unwrap();
+
+    let resp = handle_batched_merge(&pool, t, "a", &["b".into(), "c".into(), "d".into()])
+        .await
+        .unwrap();
+    assert_eq!(resp.person_uuid, person_a.person_uuid);
+    assert!(resp.is_identified);
+
+    assert!(
+        !person_exists(&pool, old_person_b_id).await,
+        "person B should be deleted exactly once"
+    );
+    assert_eq!(count_person_mappings(&pool, t).await, 1);
+
+    assert_chain_is_root(&pool, t, "a", &person_a.person_uuid).await;
+
+    for did in &["b", "c", "d"] {
+        let resolved = resolve(&pool, t, did).await.unwrap().unwrap();
+        assert_eq!(resolved.person_uuid, person_a.person_uuid);
+    }
+
+    assert_all_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn batched_merge_large_batch() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let target = db::handle_create(&pool, t, "target").await.unwrap();
+
+    let mut sources: Vec<String> = Vec::new();
+    for i in 0..60 {
+        let did = format!("src-{i}");
+        if i < 30 {
+            db::handle_create(&pool, t, &did).await.unwrap();
+        }
+        sources.push(did);
+    }
+
+    let resp = handle_batched_merge(&pool, t, "target", &sources)
+        .await
+        .unwrap();
+    assert_eq!(resp.person_uuid, target.person_uuid);
+    assert!(resp.is_identified);
+
+    assert_eq!(
+        count_person_mappings(&pool, t).await,
+        1,
+        "all persons should be merged into one"
+    );
+    assert_eq!(count_distinct_ids(&pool, t).await, 61); // target + 60 sources
+    assert_eq!(count_union_find(&pool, t).await, 61);
+
+    for src in &sources {
+        let resolved = resolve(&pool, t, src).await.unwrap().unwrap();
+        assert_eq!(resolved.person_uuid, target.person_uuid);
+    }
+
+    assert_all_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn batched_merge_matches_merge_output() {
+    let pool = test_pool().await;
+
+    let setup = |team_id: i64| {
+        let pool = pool.clone();
+        async move {
+            db::handle_create(&pool, team_id, "tgt").await.unwrap();
+            db::handle_create(&pool, team_id, "s1").await.unwrap();
+            db::handle_create(&pool, team_id, "s2").await.unwrap();
+            db::handle_create(&pool, team_id, "s3").await.unwrap();
+            handle_alias(&pool, team_id, "s2", "s2-child")
+                .await
+                .unwrap();
+        }
+    };
+
+    let sources: Vec<String> = vec![
+        "s1".into(),
+        "s2".into(),
+        "s3".into(),
+        "s2-child".into(),
+        "brand-new".into(),
+    ];
+
+    let t1 = next_team_id();
+    setup(t1).await;
+    let resp1 = handle_merge(&pool, t1, "tgt", &sources).await.unwrap();
+
+    let t2 = next_team_id();
+    setup(t2).await;
+    let resp2 = handle_batched_merge(&pool, t2, "tgt", &sources).await.unwrap();
+
+    assert!(resp1.is_identified);
+    assert!(resp2.is_identified);
+
+    assert_eq!(
+        count_person_mappings(&pool, t1).await,
+        count_person_mappings(&pool, t2).await,
+        "person_mapping count mismatch"
+    );
+    assert_eq!(
+        count_distinct_ids(&pool, t1).await,
+        count_distinct_ids(&pool, t2).await,
+        "distinct_id count mismatch"
+    );
+    assert_eq!(
+        count_union_find(&pool, t1).await,
+        count_union_find(&pool, t2).await,
+        "union_find count mismatch"
+    );
+
+    for did in &["tgt", "s1", "s2", "s3", "s2-child", "brand-new"] {
+        let r1 = resolve(&pool, t1, did).await.unwrap().unwrap();
+        let r2 = resolve(&pool, t2, did).await.unwrap().unwrap();
+        assert_eq!(
+            r1.person_uuid, resp1.person_uuid,
+            "merge: {did} should resolve to target person"
+        );
+        assert_eq!(
+            r2.person_uuid, resp2.person_uuid,
+            "batched_merge: {did} should resolve to target person"
+        );
+    }
+
+    assert_all_invariants(&pool, t1).await;
+    assert_all_invariants(&pool, t2).await;
+}
