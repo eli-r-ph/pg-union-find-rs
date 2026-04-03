@@ -31,7 +31,7 @@ The approach is **viable with caveats**. At production scale on a vertically sca
 
 - **Writes need the batched merge path.** The per-source merge at 236 batch ops/s would not survive production merge storms. The batched merge at 1,141 batch ops/s (11,410 individual merges/s) is a minimum viable starting point. With 64 partitions distributing writes across teams, cross-team contention is eliminated by the worker-per-team design, so write throughput scales roughly linearly with partition count.
 
-- **The union-find chain depth is the scaling risk.** With billions of DIDs, chains could grow deep without aggressive path compression. The current `PATH_COMPRESS_THRESHOLD=20` triggers async compression, but at production scale, a background compaction job (periodic full-tree flattening per team) would be essential to keep CTE recursion bounded.
+- **The union-find chain depth is the scaling risk.** With billions of DIDs, chains could grow deep without aggressive path compression. Path compression is triggered lazily on reads (`/resolve`) when chain depth exceeds `PATH_COMPRESS_THRESHOLD=20`. At production scale, a background compaction job (periodic full-tree flattening per team) would be essential to keep CTE recursion bounded.
 
 - **Table and index size at scale.** Today's 450K-row dataset is 190MB total. Extrapolating to 100M persons with an average of 10 DIDs each (1B DID rows): ~400GB for `union_find` + indexes, ~200GB for `distinct_id_mappings`, ~100GB for `person_mapping`. This fits comfortably on a vertically scaled instance with 1TB+ storage, but demands careful shared\_buffers sizing (128-256GB) and autovacuum tuning to handle the dead-tuple churn from merges.
 
@@ -191,7 +191,7 @@ Chain depth distribution:
 
 **Improvement from parallelization:** This phase uses `JoinSet` to process each team's chains concurrently (100 teams, 50 DB connections). Previous runs (before parallelization) took **239s** for the same workload. The 18.91s result is a **12.6× improvement**.
 
-**Observation:** Chain deepening is a synthetic stress-test that builds unrealistically long chains to exercise the recursive CTE. In production, `PATH_COMPRESS_THRESHOLD=20` would trigger async path compression long before chains reach depth 100.
+**Observation:** Chain deepening is a synthetic stress-test that builds unrealistically long chains to exercise the recursive CTE. In production, `PATH_COMPRESS_THRESHOLD=20` triggers lazy path compression on reads long before chains reach depth 100.
 
 ---
 
@@ -384,7 +384,7 @@ The current default `BENCH_BATCH=10` was chosen conservatively. Batched merge am
 
 ### I3: Background path compaction (critical for production)
 
-The current `PATH_COMPRESS_THRESHOLD=20` triggers async compression on read. At production scale with billions of DIDs, this reactive approach may not keep chains short enough. A periodic background job (per team, off-peak) that flattens all chains to depth 1 would guarantee O(1) resolve latency regardless of merge history.
+Path compression is triggered lazily on reads when chain depth exceeds `PATH_COMPRESS_THRESHOLD=20`. At production scale with billions of DIDs, this reactive approach may not keep chains short enough. A periodic background job (per team, off-peak) that flattens all chains to depth 1 would guarantee O(1) resolve latency regardless of merge history.
 
 ### I4: Stress-test queue saturation (validation)
 

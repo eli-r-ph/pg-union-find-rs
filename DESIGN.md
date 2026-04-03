@@ -526,7 +526,7 @@ Steps:
 3. `DELETE FROM person_mapping WHERE person_id = 9`
 4. `UPDATE person_mapping SET is_identified = true WHERE person_id = 7`
 
-If the combined chain depth exceeds `PATH_COMPRESS_THRESHOLD`, background compression is enqueued.
+Path compression is triggered lazily at read time (see [Path Compression](#path-compression)).
 
 **Constraint:** if the source person is already `is_identified = true`, the merge is refused with HTTP 409. The caller must use `/merge` to force-merge identified persons.
 
@@ -857,8 +857,9 @@ Every non-root node on the path is updated to point directly at the root.
 
 **When compression is triggered:**
 
-1. **After writes** (`/alias`, `/identify`, `/merge`): the operation returns a `CompressHint` when the combined chain depth exceeds `PATH_COMPRESS_THRESHOLD` (default 20). The handler enqueues a `CompressPath` operation to the worker channel in a background task (up to 3 retry attempts with backoff).
-2. **After reads** (`/resolve`): if the resolved chain depth exceeds the threshold, a `try_send` fires compression into the worker channel. This is fire-and-forget — if the channel is full, the attempt is silently dropped.
+Compression is triggered lazily by **reads** (`/resolve`): if the resolved chain depth exceeds `PATH_COMPRESS_THRESHOLD` (default 20), a `try_send` fires a `CompressPath` operation into the worker channel. This is fire-and-forget — if the channel is full, the attempt is silently dropped and retried on the next access.
+
+Write operations (`/alias`, `/identify`, `/merge`, `/batched_merge`) do **not** enqueue compression. This avoids write-amplification and worker channel contention during heavy mutation workloads. Any chains that grow deep will be compressed organically when they are next read.
 
 **SQL implementation** (single statement within a transaction):
 
