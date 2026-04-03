@@ -847,12 +847,11 @@ struct PersonTarget {
 }
 
 async fn collect_person_targets(pool: &PgPool) -> Vec<PersonTarget> {
-    let rows: Vec<(i64, String)> = sqlx::query_as(
-        "SELECT team_id, person_uuid FROM person_mapping WHERE deleted_at IS NULL",
-    )
-    .fetch_all(pool)
-    .await
-    .expect("failed to query person_mapping for benchmark targets");
+    let rows: Vec<(i64, String)> =
+        sqlx::query_as("SELECT team_id, person_uuid FROM person_mapping WHERE deleted_at IS NULL")
+            .fetch_all(pool)
+            .await
+            .expect("failed to query person_mapping for benchmark targets");
     rows.into_iter()
         .map(|(team_id, person_uuid)| PersonTarget {
             team_id,
