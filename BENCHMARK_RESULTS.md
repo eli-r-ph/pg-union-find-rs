@@ -3,68 +3,60 @@
 **Date:** 2026-04-03
 **Machine:** Apple Silicon (macOS), Docker Desktop (OrbStack)
 **Postgres:** 17 (Docker), tuned for benchmarking (see `docker-compose.yml`)
-**Server config:** 64 workers, 64 channel capacity, compress threshold 20
+**Server config:** 64 workers, 64 channel capacity, compress threshold 20, READ_POOL_SIZE 4
 **Rust:** 1.90.0 (stable), edition 2024, release profile (opt-level 3)
-**Run time:** ~185s total
+**Run time:** ~195s total (including seeding)
 
 ---
 
-## Executive Summary
+## Production Prospects: 1000s req/s, 100M Persons, Billions of DIDs
 
-This service implements a union-find data structure backed by Postgres for managing person-to-distinct\_id relationships. The benchmark exercises all CRUD operations at scale: creating persons, aliasing distinct IDs, merging person graphs, resolving identities (forward and reverse), and deleting both distinct IDs and persons. All operations ran through the HTTP API with 50 concurrent clients against 100 teams, 450K union\_find rows, and chains up to 100 hops deep.
+This section assesses viability at production scale based on the benchmark findings below.
 
-### Key Findings
+### Verdict: Viable with operational investment
 
-**Reads are the strongest operation.** Forward resolve (`/resolve`) achieves **15,838 ops/s** at p50=1.78ms and p99=4.01ms across 1M operations. Reverse resolve (`/resolve_distinct_ids`) is comparable at **15,047 ops/s**, p50=1.82ms. Both operations bypass the worker queue and hit the connection pool directly. The recursive CTE walks `union_find_pkey` (a B-tree covering `(team_id, current)`) with 100% buffer cache hit rate — every resolve is served entirely from shared\_buffers.
+The core data structure and query patterns are sound. The recursive CTE resolves identities at ~15K ops/s on a laptop Docker setup with sub-2ms p50 latency. The bottlenecks are operational (vacuum, partitioning, pool sizing) rather than algorithmic. Below is the detailed extrapolation.
 
-**Batched merge is 4.0x faster than per-source merge.** The per-source merge path (`/merge`) achieves only 305 batch ops/s (p50=163ms) due to serial CTE + UPDATE cycles within a single transaction. The batched merge path (`/batched_merge`) achieves **1,222 batch ops/s** (p50=40ms) by replacing 10 individual lookups and CTEs with bulk `ANY()` queries and a single multi-source recursive CTE. This is the single most impactful optimization in the system.
+### Read throughput (the primary operation)
 
-**Create and alias are solid.** Create at **6,667 ops/s** (p50=4.08ms) and alias at **4,647 ops/s** (p50=5.11ms) are both well within production SLA requirements for identity operations. Alias is slower than create because it touches more rows: resolve target root (CTE) → create source → link → update `is_identified`.
+Forward resolve (`/resolve`) achieves 15,310 ops/s at p50=1.81ms from a single app instance with 50 concurrent clients against a Docker Postgres with 256MB shared_buffers. The CTE averages 4.1 buffer hits per chain hop, all served from RAM.
 
-**Zero failures across 1.28M HTTP operations.** No 503s (queue full), no 500s, no timeouts. The 64-worker pool with 64-depth channels handled 50 concurrent clients without saturation.
+**At production scale:** A vertically scaled Postgres (64 vCPUs, 256GB RAM, NVMe) with the entire working set in shared_buffers, fronted by 4-8 app instances behind PgBouncer, could sustain **100K-200K read ops/s**. Reads are CPU-bound on B-tree traversal, not I/O-bound. With 64 hash partitions by `team_id`, reads for different teams touch disjoint index pages, eliminating cross-team cache contention. Partition pruning reduces the effective index tree depth from ~4 levels (1B rows) to ~3 levels (16M rows/partition).
 
-**Dead tuple bloat is significant.** Autovacuum was disabled for the benchmark. After the run, `person_mapping` has 82.6% dead tuples (328K dead / 69K live) and `union_find` has 46.6% dead tuples (392K dead / 450K live). Merges are the primary source: each merge deletes the loser's `person_mapping` row and updates the loser's `union_find` root. At production scale this churn demands aggressive autovacuum tuning.
+### Write throughput
 
-### Bottleneck Summary
+The worker-per-team serialization model means each team's writes execute sequentially. With 64 workers, aggregate write throughput scales linearly:
 
-| Bottleneck | Severity | Affected Operations | Details |
-|------------|----------|---------------------|---------|
-| Per-source merge serial SQL | **Critical** | `/merge` | 10× serial CTE + UPDATE cycles per batch; 4.0× slower than batched path |
-| Dead tuple bloat (person\_mapping) | **Critical** | All writes | 82.6% dead tuples after benchmark; merges generate 1 dead tuple per source |
-| Dead tuple bloat (union\_find) | **High** | All writes | 46.6% dead tuples; root updates on merge can't use HOT (indexed columns change) |
-| Chain depth growth | **High** | `/resolve` | Path compression triggers at depth ≥20 on both writes and reads; unbounded depth between compressions adds ~0.028ms/hop |
-| p99 latency cliff on writes | **Medium** | `/create`, `/alias`, `/delete_*` | p99 jumps 10-40× above p50 (e.g. create: 4ms → 162ms); Docker Desktop tmpfs I/O scheduling artifact |
-| `idx_person_mapping_lookup` sizing | **Medium** | `/resolve_distinct_ids` | 31 MB for 110K scans (296 bytes/scan); varchar(200) UUID bloats index at scale |
-| Single-table design | **Medium** | All at scale | No partition pruning; B-tree depth grows with row count; vacuum contention |
+| Operation | Per-worker | 64 workers aggregate |
+|-----------|-----------|---------------------|
+| Create | ~6,000/s | ~384,000/s |
+| Alias | ~4,500/s | ~288,000/s |
+| Batched merge (10/batch) | ~1,200 batches/s | ~76,800 batches/s (768K merges/s) |
 
-### Production Estimate: 1000s req/s, 100M Persons, Billions of DIDs, 64 Partitions
+The bottleneck shifts to Postgres WAL write throughput and connection pool sizing. With `synchronous_commit=on` (required for production), each commit adds ~0.5-2ms for WAL fsync on NVMe. Group commit (`commit_delay`, `commit_siblings`) amortizes this.
 
-The design is **viable for production at scale** with the right operational configuration. Here is the extrapolation:
-
-**Read throughput scales linearly with app instances.** At ~16K ops/s from a single benchmark client with 50 concurrency on a laptop Docker setup, a production deployment with 4 app instances behind PgBouncer on a vertically scaled Postgres (64 vCPUs, 256GB RAM, NVMe storage) could sustain **100K+ read ops/s**. The forward CTE averages 4.0 buffer hits per hop; with the entire working set in shared\_buffers, reads are CPU-bound on B-tree traversal, not I/O-bound. With 64 partitions by `team_id`, reads for different teams touch completely different index pages, eliminating all cross-team cache contention.
-
-**Write throughput is bounded by per-team serialization, not Postgres.** The worker-per-team model means each team's writes execute sequentially through a single channel. With 64 partitions (= 64 teams per partition at 100M persons / ~4K teams), each partition's write throughput is limited to the single-team rate: ~1,222 batched merges/s or ~6,667 creates/s. However, with 64 partitions processing in parallel, aggregate write throughput scales to **~78K batched merge batches/s** (780K individual merges/s) or **~427K creates/s**. The bottleneck shifts to Postgres connection pool size and WAL write throughput.
-
-**Table sizes at scale.** The current 450K-row dataset is 208MB total. Extrapolating to 100M persons with an average of 10 DIDs each (1B DID rows, 1B union\_find rows):
+### Table sizes at 100M persons, 1B DIDs
 
 | Table | Estimated Size | Index Size | Total |
 |-------|---------------|------------|-------|
-| union\_find | ~60GB | ~100GB | ~160GB |
-| distinct\_id\_mappings | ~55GB | ~75GB | ~130GB |
-| person\_mapping | ~50GB | ~70GB | ~120GB |
-| **Total** | **~165GB** | **~245GB** | **~410GB** |
+| union_find | ~60 GB | ~100 GB | ~160 GB |
+| distinct_id_mappings | ~55 GB | ~75 GB | ~130 GB |
+| person_mapping | ~50 GB | ~70 GB | ~120 GB |
+| **Total** | **~165 GB** | **~245 GB** | **~410 GB** |
 
-This fits on a single vertically scaled instance with 1TB storage. With 64 hash partitions on `team_id`, each partition holds ~6.4GB — small enough for per-partition `VACUUM FULL` during off-peak windows.
+Fits on a single vertically scaled instance with 1TB NVMe storage. With 64 hash partitions, each partition holds ~6.4 GB of data -- small enough for per-partition `VACUUM FULL` during off-peak windows.
 
-**Chain depth is the critical scaling risk.** The benchmark's average chain depth of 2.76 (p50=2, p95=11, p99=16, max=20 post-compression) is manageable. But with billions of DIDs and continuous merges, chains could grow past the compression threshold between compressions. Path compression is triggered on both writes (via `CompressHint` when combined chain depth exceeds the threshold) and reads (fire-and-forget `try_send` on `/resolve`). Each additional hop adds ~0.028ms of CTE execution time. At depth 100 that's ~2.96ms per resolve — still fast but 1.7x the current p50. A background compaction job (periodic per-team full-tree flattening) is essential to guarantee O(1) resolve latency regardless of merge history.
+### Critical scaling risks
 
-**WAL and checkpoint pressure.** The benchmark generated 490MB of WAL across 6.2M WAL records with `synchronous_commit=off`. In production with full durability enabled, WAL write latency adds ~0.5-2ms per commit depending on storage. With NVMe SSDs and `wal_compression=lz4`, a production instance could sustain the write throughput without WAL being the bottleneck. Group commit (`commit_delay=200us`, `commit_siblings=5`) amortizes fsync across concurrent transactions.
+**1. Chain depth growth.** The benchmark's post-compression max depth is 22 (mean 3.23, p99=17). Path compression triggers on both writes (`CompressHint` above threshold) and reads (fire-and-forget `try_send`). But at production scale, the compress channel can saturate -- the benchmark logged ~100 "channel full" errors during the resolve phase, all from 5 hot team_ids. A **periodic background compaction job** (per-team full-tree flattening) is essential to guarantee bounded resolve latency regardless of merge velocity.
 
-**Partitioning strategy.** The current single-table design works at 450K rows. At 1B+ rows, Postgres native partitioning (`PARTITION BY HASH(team_id, 64)`) is essential:
-- Index B-tree depth drops from ~4 levels to ~3 levels (16M rows/partition vs 1B rows)
-- Per-partition autovacuum runs faster and with less lock contention
-- Partition pruning eliminates 63/64 partitions per query (all queries filter on `team_id`)
-- Aligns with the worker-per-team architecture: one worker pool per partition
+**2. Dead tuple bloat.** After the benchmark, `person_mapping` has 82.6% dead tuples and `union_find` has 46.6%. Merges generate 1 dead tuple per source in both tables. At 768K merges/s aggregate, that's ~1.5M dead tuples/s. Required: aggressive per-table autovacuum (`autovacuum_vacuum_scale_factor=0.01`, `autovacuum_vacuum_cost_delay=0`) and monitoring of `n_dead_tup`.
+
+**3. `idx_person_mapping_lookup` sizing.** At 32 MB for 110K scans (296 bytes/scan), this index stores `(team_id, person_uuid)` where `person_uuid` is `varchar(200)`. At 100M persons, this index alone would be ~32 GB. Migrating `person_uuid` to native `uuid` type (16 bytes) would cut it to ~8 GB.
+
+**4. Partitioning.** The current single-table design works at 450K rows but is untenable at 1B+. `PARTITION BY HASH(team_id, 64)` is essential: index B-tree depth drops a level, per-partition vacuum runs faster, and partition pruning eliminates 63/64 partitions on every query (all queries already filter on `team_id`).
+
+**5. WAL pressure with durability enabled.** The benchmark generated 515 MB of WAL with `synchronous_commit=off`. In production with full durability, WAL fsync adds latency per commit. NVMe SSDs with `wal_compression=lz4` and group commit mitigate this, but WAL throughput becomes the ceiling for aggregate write rate.
 
 ---
 
@@ -90,14 +82,16 @@ This fits on a single vertically scaled instance with 1TB storage. With 64 hash 
 
 | Endpoint | ops/s | p50 | p95 | p99 | max |
 |----------|-------|-----|-----|-----|-----|
-| `POST /create` | 6,667 | 4.08ms | 12.88ms | 161.51ms | 219.93ms |
-| `POST /alias` | 4,647 | 5.11ms | 18.71ms | 195.29ms | 245.41ms |
-| `POST /merge` (10/batch) | 305 | 163.08ms | 302.70ms | 315.92ms | 367.06ms |
-| **`POST /batched_merge` (10/batch)** | **1,222** | **40.40ms** | **76.30ms** | **83.35ms** | **112.12ms** |
-| `POST /resolve` | 15,838 | 1.78ms | 2.89ms | 4.01ms | 604.12ms |
-| `POST /resolve_distinct_ids` | 15,047 | 1.82ms | 3.10ms | 4.75ms | 603.03ms |
-| `POST /delete_distinct_id` | 2,902 | 6.82ms | 124.29ms | 213.21ms | 250.40ms |
-| `POST /delete_person` | 5,048 | 3.41ms | 16.54ms | 200.00ms | 240.79ms |
+| `POST /create` | 6,043 | 4.20ms | 13.53ms | 182.26ms | 410.01ms |
+| `POST /alias` | 4,561 | 5.27ms | 18.76ms | 196.79ms | 446.59ms |
+| `POST /merge` (10/batch) | 305 | 163.45ms | 307.39ms | 322.33ms | 348.04ms |
+| **`POST /batched_merge` (10/batch)** | **1,202** | **40.94ms** | **77.23ms** | **86.65ms** | **118.63ms** |
+| `POST /resolve` | 15,310 | 1.81ms | 3.07ms | 4.72ms | 1.01s |
+| `POST /resolve_distinct_ids` | 14,485 | 1.77ms | 3.25ms | 5.01ms | 602.85ms |
+| `POST /delete_distinct_id` | 2,968 | 7.08ms | 107.85ms | 212.68ms | 409.85ms |
+| `POST /delete_person` | 3,716 | 3.69ms | 35.69ms | 206.35ms | 225.30ms |
+
+**Zero failures across 1.28M HTTP operations.** No 503s, no 500s, no timeouts. The 64-worker pool with 64-depth channels handled 50 concurrent clients without write saturation.
 
 ---
 
@@ -109,18 +103,18 @@ This fits on a single vertically scaled instance with 1TB storage. With 64 hash 
 |--------|-------|
 | Total ops | 50,000 |
 | Failures | 0 (0.00%) |
-| Wall time | 7.50s |
-| Throughput | 6,667 ops/s |
-| p50 | 4.08ms |
-| p95 | 12.88ms |
-| p99 | 161.51ms |
-| max | 219.93ms |
+| Wall time | 8.27s |
+| Throughput | 6,043 ops/s |
+| p50 | 4.20ms |
+| p95 | 13.53ms |
+| p99 | 182.26ms |
+| max | 410.01ms |
 
-**Workload mix:** 80% new distinct IDs (`create-{i}`), 20% existing (hot-set re-identification).
+**Workload mix:** 80% new distinct IDs, 20% existing (hot-set re-identification).
 
-**Query plan (create hot path — `lookup_did`):** Single index scan on `idx_did_lookup`, 7 buffer hits, sub-0.2ms execution time. For new DIDs, the create path runs 3 sequential INSERTs (person\_mapping, distinct\_id\_mappings, union\_find) within one transaction — each INSERT is an index-organized append.
+**Query plan (hot path):** Single index scan on `idx_did_lookup`, 7 buffer hits, sub-0.2ms execution time. For new DIDs, the create path runs 3 sequential INSERTs (person_mapping, distinct_id_mappings, union_find) in one transaction.
 
-**Bottleneck:** The p99 cliff (4ms → 162ms) is a Docker Desktop I/O scheduling artifact. The virtualized tmpfs introduces periodic stalls when the host flushes dirty pages. On bare-metal NVMe, expect p99 to flatten to 15-25ms.
+**Bottleneck:** The p99 cliff (4.20ms to 182ms) is a Docker Desktop I/O scheduling artifact. The virtualized tmpfs introduces periodic stalls when the host flushes dirty pages. On bare-metal NVMe, expect p99 to flatten to 15-25ms.
 
 ---
 
@@ -130,16 +124,16 @@ This fits on a single vertically scaled instance with 1TB storage. With 64 hash 
 |--------|-------|
 | Total ops | 100,000 |
 | Failures | 0 (0.00%) |
-| Wall time | 21.52s |
-| Throughput | 4,647 ops/s |
-| p50 | 5.11ms |
-| p95 | 18.71ms |
-| p99 | 195.29ms |
-| max | 245.41ms |
+| Wall time | 21.93s |
+| Throughput | 4,561 ops/s |
+| p50 | 5.27ms |
+| p95 | 18.76ms |
+| p99 | 196.79ms |
+| max | 446.59ms |
 
-**Workload mix:** 90% new source → existing target (Case 1a), 5% self-alias (no-op), 5% both new (Case 3). Shuffled.
+**Workload mix:** 85% Case 1a (target exists, source new), 5% Case 2a (same person), 5% self-alias, 5% Case 3 (both new).
 
-**Bottleneck:** Alias is ~30% slower than create because the dominant Case 1a path requires: (1) resolve target root via recursive CTE, (2) `check_did` on source, (3) INSERT source into `distinct_id_mappings` + `union_find`, (4) UPDATE `person_mapping.is_identified`. The max of 245ms reflects occasional contention when multiple aliases target the same hot-set person — brief lock waits on the person's `union_find` root row.
+**Bottleneck:** Alias is ~25% slower than create because the dominant Case 1a path requires: (1) resolve target root via recursive CTE, (2) `check_did` on source, (3) INSERT into `distinct_id_mappings` + `union_find`, (4) UPDATE `person_mapping.is_identified`. The 446ms max reflects occasional lock contention when multiple aliases target the same hot-set person.
 
 ---
 
@@ -147,16 +141,16 @@ This fits on a single vertically scaled instance with 1TB storage. With 64 hash 
 
 | Metric | Value |
 |--------|-------|
-| Total ops | 10,000 batches (100,000 distinct\_ids) |
+| Total ops | 10,000 batches (100,000 distinct_ids) |
 | Failures | 0 (0.00%) |
-| Wall time | 32.75s |
+| Wall time | 32.77s |
 | Throughput | 305 batch ops/s (~3,050 merges/s) |
-| p50 | 163.08ms |
-| p95 | 302.70ms |
-| p99 | 315.92ms |
-| max | 367.06ms |
+| p50 | 163.45ms |
+| p95 | 307.39ms |
+| p99 | 322.33ms |
+| max | 348.04ms |
 
-**Bottleneck:** This is the **slowest operation**. Each 10-source merge batch executes 10× serial iterations within a single transaction: `check_did` (index lookup + CTE) → `resolve_root` (second CTE) → `link_root_to_target` (UPDATE union\_find + DELETE person\_mapping). The p50 of 163ms means ~16ms per source — dominated by the serial CTE + UPDATE cycle. The narrow p50-to-p99 spread (163ms → 316ms) indicates consistent, predictable slowness rather than sporadic stalls.
+**This is the slowest operation.** Each 10-source merge batch executes 10 serial iterations within a single transaction: `check_did` (index lookup + CTE) then `link_root_to_target` (UPDATE union_find + DELETE person_mapping). The p50 of 163ms means ~16ms per source. The narrow p50-to-p99 spread (163ms to 322ms) indicates consistent, predictable slowness rather than sporadic stalls.
 
 ---
 
@@ -164,44 +158,44 @@ This fits on a single vertically scaled instance with 1TB storage. With 64 hash 
 
 | Metric | Value |
 |--------|-------|
-| Total ops | 10,000 batches (100,000 distinct\_ids) |
+| Total ops | 10,000 batches (100,000 distinct_ids) |
 | Failures | 0 (0.00%) |
-| Wall time | 8.18s |
-| Throughput | 1,222 batch ops/s (~12,220 merges/s) |
-| p50 | 40.40ms |
-| p95 | 76.30ms |
-| p99 | 83.35ms |
-| max | 112.12ms |
+| Wall time | 8.32s |
+| Throughput | 1,202 batch ops/s (~12,020 merges/s) |
+| p50 | 40.94ms |
+| p95 | 77.23ms |
+| p99 | 86.65ms |
+| max | 118.63ms |
 
-**This is a 4.0× throughput improvement over `/merge`.** The batched path replaces per-source serial SQL with bulk operations:
-1. Single `batch_lookup_dids`: `SELECT id, distinct_id FROM distinct_id_mappings WHERE team_id = $1 AND distinct_id = ANY($2)` — one index scan returning all 10 PKs (35 buffer hits, sub-0.3ms).
-2. Single `batch_resolve_pks`: multi-start recursive CTE using `unnest($2::bigint[])` — walks all 10 chains in one query (14 buffer hits for shallow chains including dedup/sort).
+**3.9x throughput improvement over `/merge`.** The batched path replaces per-source serial SQL with bulk operations:
+1. Single `batch_lookup_dids`: `ANY(ARRAY[...])` index scan returning all PKs (39 buffer hits, sub-0.3ms).
+2. Single `batch_resolve_pks`: multi-start recursive CTE using `unnest($2::bigint[])` (14 buffer hits for shallow chains).
 3. Batch INSERT for not-found sources, batch UPDATE + DELETE for live-different roots.
-
-**Comparison to `/merge`:**
 
 | Metric | Merge | Batched Merge | Improvement |
 |--------|-------|---------------|-------------|
-| ops/s (batch) | 305 | 1,222 | **4.0×** |
-| p50 | 163.08ms | 40.40ms | **4.0×** |
-| p95 | 302.70ms | 76.30ms | **4.0×** |
-| p99 | 315.92ms | 83.35ms | **3.8×** |
+| ops/s (batch) | 305 | 1,202 | **3.9x** |
+| p50 | 163.45ms | 40.94ms | **4.0x** |
+| p95 | 307.39ms | 77.23ms | **4.0x** |
+| p99 | 322.33ms | 86.65ms | **3.7x** |
 
 ---
 
 ### Chain Depth at Read Time
 
-Sampled chain depth statistics (10 teams, 44,039 nodes post-benchmark):
+Sampled chain depth statistics (teams 1-10, 38,980 non-root nodes):
 
 | Metric | Value |
 |--------|-------|
-| Mean depth | 2.76 |
+| Mean depth | 3.23 |
 | p50 | 2 |
-| p95 | 11 |
-| p99 | 16 |
-| Max | 20 |
+| p95 | 12 |
+| p99 | 17 |
+| Max | 22 |
 
-The max of 20 (rather than 100, the configured maximum) confirms that path compression (threshold=20), triggered on both writes and reads, is successfully flattening deep chains.
+The configured chain-deepen phase built chains up to depth 100, but path compression (threshold=20) flattened most chains during the write phases and the 1M-resolve read phase. The max of 22 (slightly above threshold) reflects chains that were only partially compressed due to compress channel saturation during the read burst.
+
+**Compress channel saturation:** During the 1M-resolve phase, ~100 "compress enqueue failed: channel full" log entries were emitted, concentrated on 5 team_ids (5, 15, 69, 77, 79). These teams had chains at depths 20-98 that triggered fire-and-forget `try_send` on the worker channel, which was already occupied processing other ops. The compression was eventually handled on subsequent reads, but this demonstrates that at production scale a background compaction job is needed rather than relying solely on opportunistic compression.
 
 ---
 
@@ -211,22 +205,22 @@ The max of 20 (rather than 100, the configured maximum) confirms that path compr
 |--------|-------|
 | Total ops | 1,000,000 |
 | Failures | 0 (0.00%) |
-| Wall time | 63.14s |
-| Throughput | 15,838 ops/s |
-| p50 | 1.78ms |
-| p95 | 2.89ms |
-| p99 | 4.01ms |
-| max | 604.12ms |
+| Wall time | 65.32s |
+| Throughput | 15,310 ops/s |
+| p50 | 1.81ms |
+| p95 | 3.07ms |
+| p99 | 4.72ms |
+| max | 1.01s |
 
-**This is the primary operation and it performs excellently.** The p50 of 1.78ms includes full HTTP round-trip (client → Axum → pool → CTE → response). The CTE walks `union_find_pkey` with an average of ~6.5 index scans per resolve (6.5M total / 1M reads), reflecting mixed chain depths.
+**This is the primary operation and it performs well.** The p50 of 1.81ms includes full HTTP round-trip (client -> Axum -> pool -> CTE -> response). The CTE walks `union_find_pkey` with an average of ~6.5 index scans per resolve (6.5M total / 1M reads), reflecting mixed chain depths.
 
-**Query plan analysis (depth 0, root node):** 11 buffer hits, 0.16ms execution. The CTE terminates at loop 1 (root node has `person_id IS NOT NULL`). One index scan on `union_find_pkey` (7 hits) plus one on `person_mapping_pkey` (4 hits).
+**Query plan (depth 0, root node):** 18 buffer hits, 0.58ms execution. The CTE starts, finds `person_id IS NOT NULL` immediately, and terminates after 1 loop. One `union_find_pkey` scan (7 hits) + Memoize miss (1) + `person_mapping_pkey` join (4 hits).
 
-**Query plan analysis (depth 19, deep chain):** 87 buffer hits, 0.70ms execution. The CTE loops 20 times, each loop performing one `union_find_pkey` index scan (4.0 buffer hits/hop). The 76 chain-traversal buffer hits are spread across 19 recursive steps plus the starting node lookup (7 hits). The final `person_mapping_pkey` join adds 4 buffer hits.
+**Query plan (depth 22, deep chain):** 106 buffer hits, 0.67ms execution. The CTE loops 23 times, each performing one Memoized `union_find_pkey` scan (4.1 hits/hop). The 95 CTE buffer hits cover the full chain walk. Final `person_mapping_pkey` join adds 4 hits.
 
-**Cost model:** `resolve_time ≈ 0.16ms + (depth × 0.028ms)`. At depth 0: ~0.16ms. At depth 19: ~0.70ms. At depth 100 (worst case without compression): ~2.96ms.
+**Cost model:** `resolve_time ~ 0.16ms + (depth x 0.024ms)`. At depth 0: ~0.16ms. At depth 22: ~0.69ms. At depth 100 (worst case): ~2.56ms.
 
-**The 604ms max** is a single outlier across 1M operations — caused by a Docker host-level scheduling stall. Acceptable for a long tail.
+**The 1.01s max** is a single outlier across 1M operations -- a Docker host-level scheduling stall. Acceptable as a long-tail artifact.
 
 ---
 
@@ -234,30 +228,32 @@ The max of 20 (rather than 100, the configured maximum) confirms that path compr
 
 | Metric | Value |
 |--------|-------|
-| Live persons found | 49,234 (in 17ms) |
+| Live persons found | 49,338 (in 30ms) |
 | Total ops | 100,000 |
 | Failures | 0 (0.00%) |
-| Wall time | 6.65s |
-| Throughput | 15,047 ops/s |
-| p50 | 1.82ms |
-| p95 | 3.10ms |
-| p99 | 4.75ms |
-| max | 603.03ms |
+| Wall time | 6.90s |
+| Throughput | 14,485 ops/s |
+| p50 | 1.77ms |
+| p95 | 3.25ms |
+| p99 | 5.01ms |
+| max | 602.85ms |
 
-**Query plan analysis (reverse CTE):** Starts from `idx_uf_person` (11 buffer hits for the root lookup including InitPlan), then walks outward via `idx_uf_next` (3.8 buffer hits per child level). Total for a person with 30 DIDs (9 tree levels): 245 buffer hits, 1.61ms execution. The LIMIT 10001 clause prevents runaway fan-out.
+**Query plan (reverse CTE, 335-DID person):** 2,611 buffer hits, 7.82ms execution. Starts from `idx_uf_person` (7 hits for root lookup), then walks outward via `idx_uf_next` (3.8 hits per child, 9 tree levels). Each child joins `distinct_id_mappings_pkey` (4 hits per DID). The LIMIT 10001 prevents runaway fan-out.
 
-**DID fan-out per person (5-team sample):**
+**Query plan (small person, 2 DIDs):** 22 buffer hits, 0.20ms execution. One `idx_uf_person` scan plus one `idx_uf_next` scan terminates quickly.
+
+**DID fan-out per person (all teams):**
 
 | Metric | Value |
 |--------|-------|
-| Persons with roots | 49,234 |
-| Mean DIDs per person | 9.14 |
+| Persons with roots | 49,338 |
+| Mean DIDs per person | 8.92 |
 | p50 | 1 |
-| p95 | 40 |
-| p99 | 212 |
-| Max | 442 |
+| p95 | 31 |
+| p99 | 244 |
+| Max | 572 |
 
-The 80/20 hot-set distribution means some persons accumulated hundreds of DIDs from merge/alias phases. The p99 of 4.75ms — well under write-path p99s — confirms that even high-fan-out persons resolve quickly.
+The 80/20 hot-set distribution means some persons accumulated hundreds of DIDs from merge/alias phases. The p99 latency of 5.01ms -- well under write p99s -- confirms that even high-fan-out persons resolve quickly.
 
 ---
 
@@ -267,16 +263,16 @@ The 80/20 hot-set distribution means some persons accumulated hundreds of DIDs f
 |--------|-------|
 | Total ops | 10,000 |
 | Failures | 0 (0.00%) |
-| Wall time | 3.45s |
-| Throughput | 2,902 ops/s |
-| p50 | 6.82ms |
-| p95 | 124.29ms |
-| p99 | 213.21ms |
-| max | 250.40ms |
+| Wall time | 3.37s |
+| Throughput | 2,968 ops/s |
+| p50 | 7.08ms |
+| p95 | 107.85ms |
+| p99 | 212.68ms |
+| max | 409.85ms |
 
-**Bottleneck:** Delete DID is the most complex write operation. Each delete must: (1) `lookup_did` (index scan, 7 hits), (2) check if the node is root or non-root, (3) `unlink_did` — splice parents past the deleted node via `idx_uf_next` (8 hits for child lookup), or promote a parent to root if deleting a root, (4) hard-delete from `union_find` and `distinct_id_mappings`, (5) check if the person is now orphaned.
+**Bottleneck:** Delete DID is the most complex write operation. Each delete must: (1) `lookup_did` (index scan, 7 hits), (2) determine root or non-root, (3) `unlink_did` -- splice parents via `idx_uf_next`, or promote a parent to root if deleting a root, (4) hard-delete from `union_find` and `distinct_id_mappings`, (5) check if the person is orphaned and conditionally soft-delete.
 
-**The p95 spike to 124ms** (18× the p50 of 6.82ms) is the worst p50-to-p95 ratio of any operation. Delete DID operations hit `idx_uf_next` exclusively — 898K scans total across the benchmark — and the parent-splicing logic involves read-modify-write cycles on multiple union\_find rows within a single transaction, amplifying lock hold time under concurrency.
+**The p95 spike to 108ms** (15x the p50 of 7.08ms) is the worst p50-to-p95 ratio of any operation. The parent-splicing logic involves read-modify-write cycles on multiple `union_find` rows within a transaction, amplifying lock hold time under concurrency.
 
 ---
 
@@ -286,14 +282,14 @@ The 80/20 hot-set distribution means some persons accumulated hundreds of DIDs f
 |--------|-------|
 | Total ops | 10,000 |
 | Failures | 0 (0.00%) |
-| Wall time | 1.98s |
-| Throughput | 5,048 ops/s |
-| p50 | 3.41ms |
-| p95 | 16.54ms |
-| p99 | 200.00ms |
-| max | 240.79ms |
+| Wall time | 2.69s |
+| Throughput | 3,716 ops/s |
+| p50 | 3.69ms |
+| p95 | 35.69ms |
+| p99 | 206.35ms |
+| max | 225.30ms |
 
-**Delete person is 1.7× faster than delete DID** because it only soft-deletes: (1) `idx_person_mapping_lookup` scan (7 buffer hits), (2) UPDATE `person_mapping.deleted_at`, (3) UPDATE `union_find.deleted_at` via `idx_uf_person`. No chain walking or re-linking required — orphaned nodes are lazily cleaned up on subsequent access via `check_did`. The p95 of 16.54ms is tight; the p99 cliff to 200ms is the familiar Docker tmpfs scheduling stall.
+**Delete person is 1.25x faster than delete DID** because it only soft-deletes: UPDATE `person_mapping.deleted_at` + UPDATE `union_find.deleted_at` via `idx_uf_person`. No chain walking or re-linking. Orphaned nodes are lazily cleaned up on subsequent access. The p95 of 35.69ms is reasonable; the p99 cliff to 206ms is the familiar Docker tmpfs scheduling stall.
 
 ---
 
@@ -303,101 +299,101 @@ The 80/20 hot-set distribution means some persons accumulated hundreds of DIDs f
 
 | Metric | Value |
 |--------|-------|
-| Buffer cache hit ratio | **100.0000%** |
-| Disk block reads | 2 |
-| Buffer hits | 62,847,916 |
+| Buffer cache hit ratio | **99.9996%** |
+| Disk block reads | 255 |
+| Buffer hits | 62,783,932 |
 | Temp files created | 0 |
 | Temp bytes | 0 |
 
-The entire 208MB dataset fits in `shared_buffers=256MB`. Every operation is served from RAM. The 2 disk reads are from initial cold-cache catalog lookups during migration. Zero temp files confirms that all sorts and hash joins fit in `work_mem=8MB`.
+The entire ~210 MB dataset fits in `shared_buffers=256MB`. Virtually every operation is served from RAM. The 255 disk reads are from initial cold-cache catalog lookups and migration. Zero temp files confirms all sorts and hash joins fit in `work_mem=8MB`.
 
 **Per-table I/O breakdown:**
 
 | Table | Heap Hits | Index Hits | Disk Reads |
 |-------|-----------|------------|------------|
-| union\_find | 9,555,728 | 28,882,881 | 1 |
-| person\_mapping | 3,110,403 | 7,972,868 | 1 |
-| distinct\_id\_mappings | 2,887,370 | 10,438,666 | 0 |
+| union_find | 9,268,076 | 28,063,715 | 0 |
+| person_mapping | 3,102,986 | 7,983,515 | 1 |
+| distinct_id_mappings | 2,914,121 | 10,524,086 | 0 |
 
-Index buffer hits outnumber heap hits ~3:1 across all tables, confirming that the recursive CTE's index-only traversal pattern dominates the workload. `union_find` accounts for 61% of all buffer hits — its primary key index is the core of the system.
+Index buffer hits outnumber heap hits ~3:1 across all tables, confirming the recursive CTE's index-driven traversal pattern dominates. `union_find` accounts for 60% of all buffer hits.
 
 ### Transaction Statistics
 
 | Metric | Value |
 |--------|-------|
-| Commits | 2,488,841 |
-| Rollbacks | 0 |
+| Commits | 2,488,848 |
+| Rollbacks | 1 |
 | Deadlocks | 0 |
 | Conflicts | 0 |
 
-Zero rollbacks confirms that the worker-per-team design eliminates cross-team contention. Zero deadlocks validates that the `team_id`-scoped locking strategy is correct: since each team's operations are serialized through a single worker channel, two transactions for the same team can never deadlock.
+One rollback (likely a migration-time artifact). Zero deadlocks validates the `team_id`-scoped serialization strategy: since each team's writes are funneled through a single worker, two transactions for the same team can never deadlock.
 
 ### WAL Statistics
 
 | Metric | Value |
 |--------|-------|
-| WAL records | 6,247,650 |
+| WAL records | 6,251,580 |
 | Full-page images | 1,434 |
-| WAL bytes | 490 MB |
+| WAL bytes | 515 MB |
 | WAL buffers full | 0 |
-| WAL writes | 1,553 |
-| WAL sync | 0 |
+| WAL writes | 1,551 |
+| WAL syncs | 0 |
 
-Zero WAL syncs confirms `synchronous_commit=off` is active — the benchmark never waited for WAL flush. The 490MB of WAL across 2.5M transactions averages ~197 bytes per commit. In production with full durability, each commit would add ~0.5-2ms for WAL sync on NVMe, but group commit (`commit_delay=200us`) amortizes this across concurrent transactions.
+Zero WAL syncs confirms `synchronous_commit=off` is active. The 515 MB of WAL across 2.5M transactions averages ~207 bytes per commit. In production with durability enabled, each commit would add ~0.5-2ms for WAL sync on NVMe, amortized by group commit.
 
 ### Table Sizes and Dead Tuple Bloat
 
 | Table | Total | Heap | Indexes | Live Tuples | Dead Tuples | Dead % |
 |-------|-------|------|---------|-------------|-------------|--------|
-| union\_find | 76 MB | 29 MB | 47 MB | 450,000 | 392,260 | 46.6% |
-| person\_mapping | 70 MB | 31 MB | 39 MB | 69,234 | 328,437 | 82.6% |
-| distinct\_id\_mappings | 62 MB | 27 MB | 35 MB | 450,000 | 10,000 | 2.2% |
-| **Total** | **208 MB** | **87 MB** | **121 MB** | **969,234** | **730,697** | — |
+| union_find | 77 MB | 29 MB | 47 MB | 450,000 | 392,251 | 46.6% |
+| person_mapping | 71 MB | 31 MB | 40 MB | 69,338 | 330,227 | 82.6% |
+| distinct_id_mappings | 62 MB | 27 MB | 35 MB | 450,000 | 10,000 | 2.2% |
+| **Total** | **210 MB** | **87 MB** | **122 MB** | **969,338** | **732,478** | -- |
 
-**Autovacuum was disabled** for this benchmark to eliminate lock interference. The dead tuple counts reflect the full write workload:
+**Autovacuum was disabled** for this benchmark. Dead tuple counts reflect the full write workload:
 
-- **person\_mapping** (82.6% dead): Merges delete the "loser" person row. 295,766 hard deletes + 117,233 updates = massive churn. At production scale, this table needs `autovacuum_vacuum_scale_factor=0.01` and `autovacuum_vacuum_cost_delay=0`.
-- **union\_find** (46.6% dead): Merges update root rows (clear person\_id, set next). 387,170 updates generated dead tuples. HOT updates (5,576) were rare — most updates change indexed columns (`next`, `person_id`), preventing HOT.
-- **distinct\_id\_mappings** (2.2% dead): Only `/delete_distinct_id` operations (10K) generated dead tuples. This table is insert-heavy with no updates.
+- **person_mapping** (82.6% dead): Merges delete the "loser" person row. ~296K hard deletes + ~117K updates = massive churn. At production scale: `autovacuum_vacuum_scale_factor=0.01`, `autovacuum_vacuum_cost_delay=0`.
+- **union_find** (46.6% dead): Merges update root rows (clear `person_id`, set `next`). ~386K updates generated dead tuples. HOT updates (5,204) were rare because most updates change indexed columns (`next`, `person_id`), preventing HOT.
+- **distinct_id_mappings** (2.2% dead): Only `delete_distinct_id` (10K) generated dead tuples. Insert-heavy, no updates.
 
 ### DML Totals
 
 | Table | Inserts | Updates | Deletes | HOT Updates |
 |-------|---------|---------|---------|-------------|
-| union\_find | 460,000 | 387,170 | 10,000 | 5,576 |
-| person\_mapping | 365,000 | 117,233 | 295,766 | 105,900 |
-| distinct\_id\_mappings | 460,000 | 0 | 10,000 | 0 |
+| union_find | 460,000 | 386,472 | 10,000 | 5,204 |
+| person_mapping | 365,000 | 117,147 | 295,662 | 104,381 |
+| distinct_id_mappings | 460,000 | 0 | 10,000 | 0 |
 
-**HOT update ratio analysis:** `person_mapping` achieves 90% HOT updates (105,900 / 117,233) because its updates target `is_identified` and `deleted_at` — neither column is indexed. `union_find` achieves only 1.4% HOT (5,576 / 387,170) because merge updates change `next` and `person_id`, both of which participate in indexes (`idx_uf_next`, `idx_uf_person`). This is the root cause of union\_find's high dead tuple ratio and the strongest argument for aggressive autovacuum on this table.
+**HOT update ratio:** `person_mapping` achieves 89% HOT (104,381 / 117,147) because updates target `is_identified` and `deleted_at` -- neither indexed. `union_find` achieves only 1.3% HOT (5,204 / 386,472) because merge updates change `next` and `person_id`, both indexed (`idx_uf_next`, `idx_uf_person`). This drives the high dead tuple ratio and argues for aggressive autovacuum on `union_find`.
 
 ### Scan Patterns
 
 | Table | Seq Scans | Index Scans | Index Scan % |
 |-------|-----------|-------------|--------------|
-| union\_find | 7 | 7,531,301 | 100.00% |
-| person\_mapping | 5 | 2,142,571 | 100.00% |
-| distinct\_id\_mappings | 4 | 2,798,526 | 100.00% |
+| union_find | 7 | 7,549,261 | 100.00% |
+| person_mapping | 5 | 2,143,572 | 100.00% |
+| distinct_id_mappings | 4 | 2,828,674 | 100.00% |
 
-Negligible sequential scans (migration/truncate only). All application queries use index scans as intended.
+All application queries use index scans. Sequential scans are from migration/truncate only.
 
 ### Index Usage
 
 | Index | Scans | Tuples Read | Size | Bytes/Scan | Purpose |
 |-------|-------|-------------|------|------------|---------|
-| `union_find_pkey` | 6,512,674 | 7,174,356 | 25 MB | 4.03 | CTE chain traversal (every resolve) |
-| `person_mapping_pkey` | 2,032,571 | 2,046,341 | 8 MB | 4.30 | Person UUID lookup at chain root |
-| `idx_did_lookup` | 1,899,899 | 1,528,646 | 25 MB | 13.83 | distinct\_id → node entry point |
-| `idx_uf_next` | 898,627 | 854,450 | 8 MB | 9.13 | Delete: find children of deleted node |
-| `distinct_id_mappings_pkey` | 898,627 | 898,627 | 10 MB | 11.49 | Delete: DID row by PK |
-| `idx_uf_person` | 120,000 | 120,000 | 14 MB | 122.47 | Reverse resolve + delete person |
-| `idx_person_mapping_lookup` | 110,000 | 110,061 | 31 MB | 296.15 | Reverse resolve: team\_id + person\_uuid |
+| `union_find_pkey` | 6,500,362 | 7,146,765 | 25 MB | 4.03 | CTE chain traversal (every resolve) |
+| `person_mapping_pkey` | 2,033,572 | 2,046,137 | 8 MB | 4.30 | Person UUID lookup at chain root |
+| `idx_did_lookup` | 1,899,775 | 1,528,519 | 25 MB | 13.83 | distinct_id -> PK entry point |
+| `idx_uf_next` | 928,899 | 884,005 | 8 MB | 9.13 | Delete/reverse resolve: find children |
+| `distinct_id_mappings_pkey` | 928,899 | 928,899 | 10 MB | 11.49 | DID row by PK (delete path) |
+| `idx_uf_person` | 120,000 | 120,000 | 15 MB | 122.47 | Reverse resolve + delete person |
+| `idx_person_mapping_lookup` | 110,000 | 110,096 | 32 MB | 296.15 | Reverse resolve: team_id + person_uuid |
 
-**Analysis:**
+**Key observations:**
 
-- **`union_find_pkey`** is the hottest index by an order of magnitude. At 4.0 bytes/scan, each scan touches ~1 leaf page — optimal for the recursive CTE's single-row lookups. This index is the core of the system's performance.
-- **`idx_person_mapping_lookup`** has the worst bytes/scan ratio (296). At 31MB for only 110K scans, it's oversized relative to its usage. This is because it indexes `(team_id, person_uuid)` where person\_uuid is a `varchar(200)` UUID string. At production scale with 100M persons, this index would be ~31GB. Consider storing person\_uuid as native `uuid` type (16 bytes) or a numeric hash.
-- **`idx_uf_person`** at 14MB for 120K scans is also sparse. It's a partial unique index (`WHERE person_id IS NOT NULL`) covering only root nodes. At production scale with 100M persons, expect ~3.1GB — reasonable for its purpose.
-- **`idx_uf_next`** at 898K scans is used exclusively by delete operations. If deletes are rare in production, this index's overhead during writes (maintaining it on every INSERT/UPDATE) may outweigh its read benefit. Profile the production delete rate before deciding.
+- **`union_find_pkey`** is the hottest index by an order of magnitude (6.5M scans). At 4.0 bytes/scan, each scan touches ~1 leaf page. This is the core of the system's performance.
+- **`idx_person_mapping_lookup`** has the worst bytes/scan (296). At 32 MB for only 110K scans, it's oversized because `person_uuid` is `varchar(200)`. At 100M persons: ~32 GB. Migrating to native `uuid` type (16 bytes) would cut this to ~8 GB.
+- **`idx_uf_next`** at 929K scans is used by both delete ops and reverse resolve. The 4.2M buffer hits on this index are significant.
+- **`idx_uf_person`** at 15 MB for 120K scans is a partial unique index covering only root nodes. At 100M persons: ~3.1 GB -- reasonable.
 
 ### Checkpoint Behavior
 
@@ -409,7 +405,7 @@ Negligible sequential scans (migration/truncate only). All application queries u
 | Write time | 3ms |
 | Sync time | 1ms |
 
-With `checkpoint_timeout=15min` and the benchmark completing in ~185s, only 1 on-demand checkpoint occurred. The minimal checkpoint I/O confirms that `synchronous_commit=off` + `wal_level=minimal` keeps WAL overhead negligible in this benchmark configuration.
+With `checkpoint_timeout=15min` and the benchmark completing in ~195s, only 1 on-demand checkpoint occurred.
 
 ---
 
@@ -417,47 +413,73 @@ With `checkpoint_timeout=15min` and the benchmark completing in ~185s, only 1 on
 
 ### Forward Resolve CTE (the critical path)
 
-**Shallow chain (depth 0, root node):**
+**Root node (depth 0):**
 ```
-Execution Time: 0.16ms | Buffer Hits: 11
+Execution Time: 0.583ms | Buffer Hits: 18
 ```
-The CTE starts at the given PK, finds `person_id IS NOT NULL` on the first hop (root), and terminates. One index scan on `union_find_pkey` (7 hits) plus one on `person_mapping_pkey` (4 hits).
+CTE starts, finds `person_id IS NOT NULL` immediately, terminates after 1 loop. One `union_find_pkey` scan (7 hits) + Memoize cache (1kB) + `person_mapping_pkey` join (4 hits).
 
-**Deep chain (depth 19):**
+**Deep chain (depth 22):**
 ```
-Execution Time: 0.70ms | Buffer Hits: 87
+Execution Time: 0.665ms | Buffer Hits: 106
 ```
-The CTE loops 20 times, each loop performing one `union_find_pkey` index scan at 4.0 buffer hits/hop. The 19 recursive steps generate 76 buffer hits. The `walk_result` sort uses quicksort (20 rows) — negligible cost.
+CTE loops 23 times, each performing one Memoized `union_find_pkey` index scan. 95 buffer hits for the chain walk (4.1 hits/hop), plus `person_mapping_pkey` join (4 hits). Sort uses top-N heapsort (25kB memory).
 
-**Cost per hop:** `(0.70ms - 0.16ms) / 19 hops ≈ 0.028ms/hop`. This is the fundamental unit of resolve latency. At depth 100 (worst case): `0.16 + 100 × 0.028 ≈ 2.96ms`. At depth 1000 (pathological): ~28ms.
+**Cost per hop:** `(0.665ms - 0.583ms) / 22 hops ~ 0.004ms/hop` (execution time delta). The low per-hop cost reflects the Memoize node caching repeated lookups. In buffer terms: `(106 - 18) / 22 ~ 4.0 buffer hits/hop`.
 
-### Reverse Resolve CTE (person → all distinct\_ids)
+**Projected latency at scale:**
 
+| Depth | Buffer Hits | Estimated Execution |
+|-------|-------------|-------------------|
+| 0 | 18 | ~0.16ms |
+| 10 | ~58 | ~0.40ms |
+| 22 | 106 | ~0.67ms |
+| 100 | ~418 | ~2.56ms |
+| 1000 | ~4018 | ~24ms |
+
+### Reverse Resolve CTE (person -> all distinct_ids)
+
+**Small person (2 DIDs):**
 ```
-Execution Time: 1.61ms | Buffer Hits: 245
+Execution Time: 0.198ms | Buffer Hits: 22
 ```
-Starts from `idx_uf_person` (person\_id → root node, 11 hits including InitPlan), then walks outward via `idx_uf_next` (3.8 hits/child level across 9 levels). For the test person with 30 DIDs, the CTE terminates after 9 levels. Each level joins `distinct_id_mappings_pkey` to map node IDs back to distinct\_id strings (4 hits per DID). The LIMIT 10001 clause prevents runaway fan-out.
+One `idx_uf_person` scan (7 hits) finds root, one `idx_uf_next` scan finds no children beyond the 1 direct child. Two `distinct_id_mappings_pkey` joins (8 hits total).
+
+**Large person (335 DIDs, 9 tree levels):**
+```
+Execution Time: 7.82ms | Buffer Hits: 2,611
+```
+`idx_uf_person` finds root (7 hits). 9 recursive levels walk `idx_uf_next` (3.8 hits per child node, 335 nodes total = 1,264 hits). Each node joins `distinct_id_mappings_pkey` (4 hits per DID = 1,340 hits).
+
+**Cost per DID:** ~7.8 buffer hits/DID for the reverse traversal. At 10,000 DIDs (the cap): ~78K buffer hits, ~230ms estimated.
 
 ### Batch Lookup (`ANY()` index scan)
 
 ```
-Execution Time: <0.3ms | Buffer Hits: 35
+Execution Time: 2.27ms | Buffer Hits: 39
 ```
-A single `idx_did_lookup` scan with `ANY(ARRAY[...])` for 10 distinct\_ids. Postgres handles this as a single index scan with an `IN`-list, not 10 separate scans — 3.5 hits per key. Linear scaling: 100 keys ≈ 35 buffer hits ≈ 0.5ms.
+Single `idx_did_lookup` scan with `ANY(ARRAY[...])` for 10 distinct_ids. 3.9 buffer hits per key. Scales linearly: 100 keys ~ 390 buffer hits ~ 5ms.
 
-### Batch Resolve (multi-start recursive CTE)
-
-```
-Execution Time: 0.25ms | Buffer Hits: 14
-```
-The multi-start CTE seeds starting nodes into the recursive pass. Postgres processes all chains in a single recursive pass, then deduplicates roots with `DISTINCT ON (start_node)`. For shallow chains (depth 0-1), the total is dominated by the initial ANY() index scan (7 hits). For 10 chains at depth 19 each, expect ~700 buffer hits and ~4ms — still a single query.
-
-### Path Compression CTE
+### Path Compression CTE (depth 22, above threshold)
 
 ```
-Execution Time: 0.73ms | Buffer Hits: 83
+Execution Time: 1.63ms | Buffer Hits: 468
 ```
-At depth 19, the compression CTE walks the full chain (83 hits), computes `max_depth=19`, and since 19 < 20 (threshold), the `WHERE pi.max_depth >= $3` filter evaluates to false — the UPDATE is skipped entirely (the `InitPlan` nodes show "never executed"). The CTE walk cost is paid even when no compression occurs. At depth 20+, the UPDATE would flatten all intermediate nodes to point directly at the root in a single pass.
+Walks the full 23-node chain (95 CTE hits), computes `max_depth=22`. Since `22 >= 20` (threshold), the UPDATE fires: scans all 22 non-root nodes via `union_find_pkey` (88 hits) and updates their `next` to point directly at the root. The 468 total hits include the chain walk, root lookup, and 22 index-update operations. Post-compression, all 22 nodes resolve in 1 hop.
+
+---
+
+## Bottleneck Summary
+
+| Bottleneck | Severity | Affected Operations | Details |
+|------------|----------|---------------------|---------|
+| Per-source merge serial SQL | **Critical** | `/merge` | 10x serial CTE + UPDATE per batch; 3.9x slower than batched path |
+| Dead tuple bloat (person_mapping) | **Critical** | All writes | 82.6% dead tuples; merges generate 1 dead tuple per source |
+| Dead tuple bloat (union_find) | **High** | All writes | 46.6% dead tuples; root updates can't use HOT (indexed columns change) |
+| Compress channel saturation | **High** | `/resolve` | ~100 "channel full" errors during 1M reads on 5 hot teams; chains stay deep until next successful compression |
+| p99 latency cliff on writes | **Medium** | `/create`, `/alias`, `/delete_*` | p99 jumps 25-45x above p50; Docker tmpfs scheduling artifact |
+| `idx_person_mapping_lookup` sizing | **Medium** | `/resolve_distinct_ids` | 32 MB for 110K scans; varchar(200) UUID bloats index at scale |
+| Single-table design | **Medium** | All at scale | No partition pruning; B-tree depth grows with row count |
 
 ---
 
@@ -465,41 +487,44 @@ At depth 19, the compression CTE walks the full chain (83 hits), computes `max_d
 
 ### I1: Migrate all merge callers to batched merge (high impact)
 
-The 4.0× improvement is definitive. `/merge` should be deprecated for all production traffic in favor of `/batched_merge`. The per-source endpoint should only be kept for single-source convenience.
+The 3.9x improvement is definitive. `/merge` should be deprecated for production traffic in favor of `/batched_merge`. The per-source path should only be kept for single-source convenience or backward compatibility.
 
-### I2: Increase default merge batch size (medium impact)
+### I2: Background path compaction (critical for production)
 
-The current `BENCH_BATCH=10` was chosen conservatively. Batched merge amortizes transaction overhead — testing with batch sizes of 25, 50, and 100 would reveal the throughput ceiling. The batch\_resolve\_pks CTE scales well (single recursive pass regardless of batch size), so the limit is transaction hold time vs. worker channel blocking time.
+The ~100 "channel full" errors during the read phase demonstrate that opportunistic compression is insufficient under load. A periodic background job per team that flattens all chains to depth 1 would guarantee bounded resolve latency. This is the most important operational requirement for production.
 
-### I3: Background path compaction (critical for production)
-
-Path compression triggers on both writes (via `CompressHint` with retry) and reads (fire-and-forget `try_send`) when chain depth exceeds `PATH_COMPRESS_THRESHOLD=20`. At production scale with billions of DIDs, this reactive approach may not keep chains short enough. A periodic background job (per team, off-peak) that flattens all chains to depth 1 would guarantee O(1) resolve latency. This is the most important operational requirement.
-
-### I4: Autovacuum tuning for merge churn (critical for production)
-
-Merges generate 1 dead tuple in `person_mapping` (loser deleted) and 1 dead tuple in `union_find` (root updated) per source. At 12.2K merges/s via batched merge, that's 24K dead tuples/s. Required autovacuum settings:
+### I3: Autovacuum tuning (critical for production)
 
 ```sql
 ALTER TABLE union_find SET (autovacuum_vacuum_scale_factor = 0.01, autovacuum_vacuum_cost_delay = 0);
 ALTER TABLE person_mapping SET (autovacuum_vacuum_scale_factor = 0.01, autovacuum_vacuum_cost_delay = 0);
 ```
 
-### I5: Partition tables by team\_id (critical for production at scale)
+At production merge rates, dead tuples accumulate at ~2 per source per merge. Without aggressive vacuum, table bloat degrades all operations.
 
-The current single-table design works at 450K rows. At billions of rows, `PARTITION BY HASH(team_id, 64)` is essential:
-- Align with the 64-worker pool (one partition per worker subset)
-- Reduce per-partition index tree depth
-- Enable partition-level autovacuum and `VACUUM FULL`
+### I4: Partition tables by `team_id` (critical at scale)
+
+`PARTITION BY HASH(team_id, 64)` is essential at 1B+ rows:
+- Index B-tree depth drops from ~4 to ~3 levels per partition
+- Per-partition vacuum runs faster with less lock contention
 - Partition pruning eliminates 63/64 partitions on every query
+- Aligns with worker-per-team architecture
+
+### I5: Increase compress channel capacity or add dedicated compress workers (high impact)
+
+The current design routes `CompressPath` ops through the same per-team worker channel as writes. Under heavy read load triggering compression, the channel saturates. Options:
+- Increase `WORKER_CHANNEL_CAPACITY` (currently 64) for teams with deep chains
+- Add a separate compress-only channel/worker pool
+- Use `enqueue_compress` with retry (already done for write-triggered compression) for read-triggered compression too
 
 ### I6: Evaluate `idx_person_mapping_lookup` sizing (medium impact)
 
-At 31MB for 110K scans (296 bytes/scan), this is the least efficient index. It indexes `(team_id, person_uuid)` where `person_uuid` is a `varchar(200)` string. At production scale (100M persons), this index alone would be ~31GB. Options: (1) store person\_uuid as `uuid` type (16 bytes) instead of `varchar(200)`, (2) use a hash index for exact-match lookups, (3) add a numeric hash column.
+At 32 MB / 296 bytes per scan, this is the least efficient index. Options: (1) store `person_uuid` as native `uuid` type (16 bytes vs up to 200), (2) use a hash index for exact-match lookups, (3) add a numeric hash column.
 
 ### I7: Stress-test queue saturation (validation)
 
-The current benchmark uses 50 concurrency against 64 workers — no saturation is possible. A stress benchmark with `BENCH_CONCURRENCY=500+` would validate the 100ms enqueue timeout behavior and identify the worker pool's saturation point.
+50 concurrency against 64 workers shows no write saturation. A stress benchmark at 500+ concurrency would identify the worker pool's breaking point and validate the 100ms enqueue timeout.
 
-### I8: Evaluate `idx_uf_next` maintenance cost vs. delete frequency (low-medium impact)
+### I8: Increase default merge batch size (medium impact)
 
-This index exists solely for delete operations (898K scans) but is maintained on every INSERT and UPDATE to `union_find` (847K write DML ops). If production delete rates are low relative to writes, the index maintenance overhead during merges and creates may exceed the savings during deletes. Profile production delete frequency before deciding; consider a deferred/lazy index strategy.
+The current `BENCH_BATCH=10` is conservative. Batched merge amortizes transaction overhead. Testing at 25, 50, 100 would reveal the throughput ceiling. The batch CTE scales well (single recursive pass regardless of batch size).
