@@ -2299,7 +2299,10 @@ async fn alias_returns_compress_hint_above_threshold() {
     let hint = hint.unwrap();
     assert!(hint.depth > 5);
     assert_eq!(hint.distinct_id, "h-other");
-    assert_eq!(resp.person_uuid, root_uuid, "alias should resolve to target's person");
+    assert_eq!(
+        resp.person_uuid, root_uuid,
+        "alias should resolve to target's person"
+    );
 
     // h-other was linked to h10, verify full chain composition
     let expected: Vec<&str> = vec![
@@ -2334,7 +2337,10 @@ async fn alias_no_compress_hint_below_threshold() {
         hint.is_none(),
         "should not return CompressHint for short chains"
     );
-    assert_eq!(resp.person_uuid, root_a.person_uuid, "should resolve to target's person");
+    assert_eq!(
+        resp.person_uuid, root_a.person_uuid,
+        "should resolve to target's person"
+    );
 
     // lo-b was linked to lo-a: chain is lo-b → lo-a (root)
     assert_chain_matches(&pool, t, "lo-b", &["lo-b", "lo-a"], &root_a.person_uuid).await;
@@ -2368,7 +2374,10 @@ async fn merge_returns_compress_hint_above_threshold() {
     let hint = hint.unwrap();
     assert!(hint.depth > 5);
     assert_eq!(hint.distinct_id, "mg-src");
-    assert_eq!(resp.person_uuid, root_uuid, "merge should resolve to target's person");
+    assert_eq!(
+        resp.person_uuid, root_uuid,
+        "merge should resolve to target's person"
+    );
 
     // mg-src was linked to mg10's pk; full chain: mg-src → mg10 → mg9 → ... → mg0
     let expected: Vec<&str> = vec![
@@ -3009,7 +3018,10 @@ async fn batched_merge_returns_compress_hint_above_threshold() {
     let hint = hint.unwrap();
     assert!(hint.depth > 5);
     assert_eq!(hint.distinct_id, "mg-src");
-    assert_eq!(resp.person_uuid, root_uuid, "batched merge should resolve to target's person");
+    assert_eq!(
+        resp.person_uuid, root_uuid,
+        "batched merge should resolve to target's person"
+    );
 
     // mg-src was linked to mg10's pk; full chain: mg-src → mg10 → mg9 → ... → mg0
     let expected: Vec<&str> = vec![
