@@ -14,6 +14,7 @@
 | BENCH_CREATE | 50,000 |
 | BENCH_ALIAS | 100,000 |
 | BENCH_MERGE | 100,000 (10 per batch = 10,000 batches) |
+| BENCH_BATCHED_MERGE | 100,000 (10 per batch = 10,000 batches) |
 | BENCH_CHAIN_DEPTH | 100 |
 | BENCH_READS | 1,000,000 |
 | BENCH_DELETE_DID | 10,000 |
@@ -70,6 +71,10 @@ Mix: 90% Case 1a (new source -> existing target), 5% self-alias, 5% Case 3 (both
 | max | 607.12ms |
 
 Pre-seeding: 100,000 merge distinct_ids in **6.44s** (parallel).
+
+### Phase 3a: Batched Merge (`POST /batched_merge`, 10 sources per batch)
+
+_Pending — re-run benchmarks to populate._
 
 ### Phase 3b: Chain Deepening (DB-direct, untimed)
 
@@ -143,6 +148,7 @@ Pre-seeding: 10,000 persons in **838ms** (parallel).
 | Create | 4,778 | 5.45ms | 193.16ms | 238.12ms |
 | Alias | 3,947 | 6.84ms | 201.57ms | 423.39ms |
 | Merge (batch) | 249 | 195.97ms | 449.94ms | 607.12ms |
+| Batched Merge | _pending_ | _pending_ | _pending_ | _pending_ |
 | Resolve (read) | 13,638 | 1.88ms | 5.73ms | 803.27ms |
 | Delete DID | 2,581 | 8.22ms | 207.78ms | 373.92ms |
 | Delete Person | 3,905 | 4.65ms | 197.41ms | 216.10ms |
@@ -163,9 +169,9 @@ The p50 of ~196ms for a 10-source merge is dominated by DB round-trips and row-l
 
 All write operations show a sharp jump between p95 and p99 (e.g., create p95=15ms vs p99=193ms). This pattern strongly suggests **WAL fsync clustering**: Postgres batches WAL flushes, and unlucky requests land on the synchronous flush boundary. The `commit_delay=10` / `commit_siblings=5` settings in `docker-compose.yml` attempt to mitigate this, but with 50 concurrent connections the effect is limited.
 
-**3. Chain deepening is extremely slow (239s for 96K ops)**
+**3. Chain deepening was extremely slow (239s for 96K ops)**
 
-This is DB-direct (not benchmarked), but it dominates total run time. Each merge calls `handle_merge` sequentially per chain link, with no batching. For deep chains (50-100 hops), each link operation must traverse increasingly deep chains via `resolve_root`.
+This is DB-direct (not benchmarked), but it dominated total run time. Each merge called `handle_merge` sequentially per chain link across all teams. Now parallelized across teams via `JoinSet` (see R2). Re-run benchmarks to measure the improvement.
 
 **4. Read throughput is strong but max latency is high (803ms)**
 
@@ -183,13 +189,17 @@ To stress-test queue saturation, future runs should increase `BENCH_CONCURRENCY`
 
 ## Remediation Proposals
 
-### R1: Reduce merge latency with batched SQL
+### R1: Reduce merge latency with batched SQL ✓ (implemented)
 
 The merge phase is bottlenecked by per-source round-trips within each batch. Instead of N individual `check_did` + `resolve_root` + `link_root_to_target` calls per merge batch, batch the lookups into a single multi-row query and process results in-memory.
 
-### R2: Parallelize chain deepening
+**Status:** Implemented as `POST /batched_merge`. Phase 3a benchmarks this endpoint against the same data shape as Phase 3 for direct comparison. Re-run benchmarks to measure the improvement.
 
-Phase 3b runs 96K merge operations sequentially. Since chains for different teams are independent, use `JoinSet` to deepen chains for multiple teams concurrently (same pattern as `seed_parallel`).
+### R2: Parallelize chain deepening ✓ (implemented)
+
+Phase 3b ran 96K merge operations sequentially. Since chains for different teams are independent, use `JoinSet` to deepen chains for multiple teams concurrently (same pattern as `seed_parallel`).
+
+**Status:** Implemented. Chain deepening now spawns one task per team via `JoinSet`, processing each team's chains concurrently. With 100 teams and a 50-connection DB pool, this should be roughly 50x faster. Re-run benchmarks to measure.
 
 ### R3: Tune WAL flush behavior for lower p99
 

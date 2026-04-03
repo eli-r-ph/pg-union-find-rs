@@ -29,6 +29,7 @@ union_find:           (team_id, current) PK, next (nullable), person_id (nullabl
 | POST | `/identify` | `{ team_id, target, anonymous }` | Link anonymous distinct_id to target (`$identify`) |
 | POST | `/alias` | `{ team_id, target, alias }` | Link alias distinct_id to target (`$create_alias`) |
 | POST | `/merge` | `{ team_id, target, sources }` | Force-merge N sources into target (`$merge_dangerously`) |
+| POST | `/batched_merge` | `{ team_id, target, sources }` | Batched variant of `/merge` — same semantics, fewer DB round-trips |
 | POST | `/resolve` | `{ team_id, distinct_id }` | Resolve distinct_id to person_uuid via chain traversal |
 | POST | `/delete_person` | `{ team_id, person_uuid }` | Soft-delete a person and all associated distinct_ids |
 | POST | `/delete_distinct_id` | `{ team_id, distinct_id }` | Soft-delete a single distinct_id |
@@ -43,6 +44,7 @@ union_find:           (team_id, current) PK, next (nullable), person_id (nullabl
   - Both exist, different persons: merge if the source person is unidentified; reject with 409 if already identified (caller must use `/merge` to force).
   - Neither exists: create a new person with both distinct_ids.
 - **`/merge`**: Ignores `is_identified` -- always merges. For each source: if new, create link to target; if existing with a different person, link source's tree into target's tree.
+- **`/batched_merge`**: Same request/response shape and semantics as `/merge`. Replaces per-source serial SQL with bulk lookups (`ANY()`), a single recursive CTE for all sources, and batch `INSERT`/`UPDATE`/`DELETE` statements. Reduces DB round-trips from O(N) to O(1) for typical batches.
 - **`/resolve`**: Walk union_find chain via recursive CTE to root, join person_mapping to return `person_uuid`. Triggers background path compression when chain depth exceeds threshold.
 - **`/delete_person`**: Sets `deleted_at` on all distinct_ids for the person and removes the person_mapping row.
 - **`/delete_distinct_id`**: Sets `deleted_at` on the distinct_id. If it was the last live distinct_id for its person, also removes the person_mapping row.
@@ -83,10 +85,11 @@ The benchmark harness (`src/bin/bench.rs`) sends parallel HTTP requests to a run
 2. **Create** -- `POST /create` (80% new, 20% existing, shuffled)
 3. **Alias** -- `POST /alias` (90% new-source-to-existing-target, 5% self-alias, 5% both-new, shuffled)
 4. **Merge** -- `POST /merge` in batches of 10 (sources DB-seeded before timed phase)
-5. **Chain deepening** -- DB-direct merges to build realistic chain depths (untimed)
-6. **Resolve** -- `POST /resolve` against DB-seeded IDs only (warm-up primaries + merge IDs)
-7. **Delete distinct_id** -- `POST /delete_distinct_id` (DB-seeded before timed phase)
-8. **Delete person** -- `POST /delete_person` (DB-seeded before timed phase)
+5. **Batched Merge** -- `POST /batched_merge` with same batch size and data shape as Phase 4 (separate seed, for direct comparison)
+6. **Chain deepening** -- DB-direct merges to build realistic chain depths (untimed)
+7. **Resolve** -- `POST /resolve` against DB-seeded IDs only (warm-up primaries + merge IDs)
+8. **Delete distinct_id** -- `POST /delete_distinct_id` (DB-seeded before timed phase)
+9. **Delete person** -- `POST /delete_person` (DB-seeded before timed phase)
 
 ### Running
 
@@ -112,8 +115,9 @@ cargo run --release --bin bench
 | `BENCH_CREATE` | 50,000 | Phase 2 create count |
 | `BENCH_ALIAS` | 100,000 | Phase 3 alias count |
 | `BENCH_MERGE` | 100,000 | Phase 4 merge distinct_id count |
-| `BENCH_BATCH` | 10 | Phase 4 sub-batch size |
-| `BENCH_CHAIN_DEPTH` | 100 | Phase 5 max union_find chain depth |
+| `BENCH_BATCHED_MERGE` | 100,000 | Phase 5 batched merge distinct_id count |
+| `BENCH_BATCH` | 10 | Phase 4/5 sub-batch size |
+| `BENCH_CHAIN_DEPTH` | 100 | Phase 6 max union_find chain depth |
 | `BENCH_READS` | 1,000,000 | Phase 6 read count |
 | `BENCH_DELETE_DID` | 10,000 | Phase 7 delete_distinct_id count |
 | `BENCH_DELETE_PERSON` | 10,000 | Phase 8 delete_person count |

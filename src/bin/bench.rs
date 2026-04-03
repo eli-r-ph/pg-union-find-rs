@@ -8,6 +8,7 @@
 //!   Phase 1b — Create:   benchmark N_CREATE individual POST /create calls (80% new, 20% existing)
 //!   Phase 2  — Alias:    run N_ALIAS alias ops via POST /alias (mixed cases)
 //!   Phase 3  — Merge:    seed N_MERGE distinct_ids, then merge in sub-batches via POST /merge
+//!   Phase 3a — Batched Merge: seed N distinct_ids, merge via POST /batched_merge (same batch size)
 //!   Phase 3b — Deepen:   merge targets into each other for realistic chain depths (DB-direct, untimed)
 //!   Phase 4  — Read:     resolve N_READS random distinct_ids via POST /resolve
 //!   Phase 5  — Delete distinct_id: benchmark N delete_distinct_id calls via POST /delete_distinct_id
@@ -19,7 +20,8 @@
 //!   BENCH_CREATE           (50_000)             — phase 1b create count
 //!   BENCH_ALIAS            (100_000)            — phase 2 alias count
 //!   BENCH_MERGE            (100_000)            — phase 3 merge distinct_id count
-//!   BENCH_BATCH            (10)                 — phase 3 sub-batch size
+//!   BENCH_BATCHED_MERGE    (100_000)            — phase 3a batched merge distinct_id count
+//!   BENCH_BATCH            (10)                 — phase 3/3a sub-batch size
 //!   BENCH_CHAIN_DEPTH      (100)                — phase 3b: max override chain depth
 //!   BENCH_READS            (1_000_000)          — phase 4 read count
 //!   BENCH_DELETE_DID       (10_000)             — phase 5 delete_distinct_id count
@@ -583,6 +585,95 @@ async fn phase_merge(
 }
 
 // ---------------------------------------------------------------------------
+// Phase 3a: batched merge benchmark — parallel HTTP POST /batched_merge
+// ---------------------------------------------------------------------------
+
+fn pregen_batched_merge(
+    n: usize,
+    batch_size: usize,
+    team_ids: &[i64],
+    targets_by_team: &HashMap<i64, Vec<String>>,
+    hot_by_team: &HashMap<i64, Vec<String>>,
+) -> MergePregen {
+    let mut rng = rand::rng();
+
+    let seed_pairs: Vec<(i64, String)> = (0..n)
+        .map(|i| (team_ids[i % team_ids.len()], format!("bmerge-{i}")))
+        .collect();
+
+    let mut merge_by_team: HashMap<i64, Vec<String>> = HashMap::new();
+    let mut all_merge_ids = Vec::with_capacity(n);
+
+    for (team_id, did) in &seed_pairs {
+        merge_by_team.entry(*team_id).or_default().push(did.clone());
+        all_merge_ids.push(ScopedId {
+            team_id: *team_id,
+            distinct_id: did.clone(),
+        });
+    }
+
+    let mut ops = Vec::with_capacity(n / batch_size + 1);
+    for (&team_id, dids) in &merge_by_team {
+        for chunk in dids.chunks(batch_size) {
+            let tgt = pick_target_for_team(&mut rng, team_id, hot_by_team, targets_by_team);
+            ops.push(MergeOp {
+                team_id,
+                target: tgt.to_owned(),
+                sources: chunk.to_vec(),
+            });
+        }
+    }
+
+    MergePregen {
+        seed_pairs,
+        ops,
+        all_merge_ids,
+    }
+}
+
+async fn phase_batched_merge(
+    pool: &PgPool,
+    client: &Client,
+    sem: &Arc<Semaphore>,
+    base_url: &str,
+    pregen: &MergePregen,
+) {
+    let n = pregen.seed_pairs.len();
+    let n_ops = pregen.ops.len();
+    println!("Phase 3a: merging {n} distinct_ids in {n_ops} batches via POST /batched_merge...");
+
+    println!("  seeding {n} batched-merge distinct_ids (parallel, tx batch {SEED_TX_BATCH})...");
+    let t_pre = Instant::now();
+    seed_parallel(pool, &pregen.seed_pairs).await;
+    println!("  seeded in {:.2?}", t_pre.elapsed());
+
+    let url = format!("{base_url}/batched_merge");
+    let requests: Vec<(String, serde_json::Value)> = pregen
+        .ops
+        .iter()
+        .map(|op| {
+            (
+                url.clone(),
+                serde_json::json!({
+                    "team_id": op.team_id,
+                    "target": op.target,
+                    "sources": op.sources,
+                }),
+            )
+        })
+        .collect();
+
+    let wall_start = Instant::now();
+    let (latencies, failures) = run_parallel(client, sem, requests).await;
+    let wall_time = wall_start.elapsed();
+
+    print_stats(
+        "batched_merge (per batch)",
+        &compute_stats(latencies, wall_time, failures),
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Phase 3b: chain deepening — DB-direct, not HTTP-benchmarked.
 // ---------------------------------------------------------------------------
 
@@ -684,14 +775,27 @@ async fn phase_chain_deepen(
     }
 
     let t0 = Instant::now();
-    for (team_id, chains) in &team_plans {
-        for chain in chains {
-            for i in 0..chain.len().saturating_sub(1) {
-                db::handle_merge(pool, *team_id, &chain[i + 1], &[chain[i].clone()], i32::MAX)
+    let mut set = tokio::task::JoinSet::new();
+    for (team_id, chains) in team_plans {
+        let pool = pool.clone();
+        set.spawn(async move {
+            for chain in &chains {
+                for i in 0..chain.len().saturating_sub(1) {
+                    db::handle_merge(
+                        &pool,
+                        team_id,
+                        &chain[i + 1],
+                        &[chain[i].clone()],
+                        i32::MAX,
+                    )
                     .await
                     .expect("chain deepen merge failed");
+                }
             }
-        }
+        });
+    }
+    while let Some(result) = set.join_next().await {
+        result.expect("chain deepen task panicked");
     }
 
     println!("  total chain deepening wall time: {:.2?}\n", t0.elapsed());
@@ -837,6 +941,7 @@ async fn main() {
     let n_create = env_usize("BENCH_CREATE", 50_000);
     let n_alias = env_usize("BENCH_ALIAS", 100_000);
     let n_merge = env_usize("BENCH_MERGE", 100_000);
+    let n_batched_merge = env_usize("BENCH_BATCHED_MERGE", 100_000);
     let batch_size = env_usize("BENCH_BATCH", 10);
     let chain_depth = env_usize("BENCH_CHAIN_DEPTH", 100);
     let n_reads = env_usize("BENCH_READS", 1_000_000);
@@ -855,6 +960,7 @@ async fn main() {
     println!("  BENCH_CREATE         = {n_create}");
     println!("  BENCH_ALIAS          = {n_alias}");
     println!("  BENCH_MERGE          = {n_merge}");
+    println!("  BENCH_BATCHED_MERGE  = {n_batched_merge}");
     println!("  BENCH_BATCH          = {batch_size}");
     println!("  BENCH_CHAIN_DEPTH    = {chain_depth}");
     println!("  BENCH_READS          = {n_reads}");
@@ -905,17 +1011,26 @@ async fn main() {
         &warm.targets_by_team,
         &warm.hot_by_team,
     );
+    let batched_merge_pregen = pregen_batched_merge(
+        n_batched_merge,
+        batch_size,
+        &team_ids,
+        &warm.targets_by_team,
+        &warm.hot_by_team,
+    );
 
     // Build read lookup pool from DB-seeded IDs only — no dependency on HTTP phases.
     // Warm-up primaries test root-node resolution; merge IDs test chain traversal.
     let mut lookup_ids: Vec<ScopedId> = warm.all_targets.clone();
     lookup_ids.extend(merge_pregen.all_merge_ids.iter().cloned());
+    lookup_ids.extend(batched_merge_pregen.all_merge_ids.iter().cloned());
 
     println!(
-        "pregenerated {} create + {} alias + {} merge ops in {:.2?}\n",
+        "pregenerated {} create + {} alias + {} merge + {} batched_merge ops in {:.2?}\n",
         create_ops.len(),
         alias_pregen.ops.len(),
         merge_pregen.ops.len(),
+        batched_merge_pregen.ops.len(),
         t_pregen.elapsed(),
     );
 
@@ -927,6 +1042,9 @@ async fn main() {
 
     // Phase 3: merge benchmark (parallel HTTP, DB-direct seeding)
     phase_merge(&pool, &client, &sem, &base_url, &merge_pregen).await;
+
+    // Phase 3a: batched merge benchmark (parallel HTTP, DB-direct seeding)
+    phase_batched_merge(&pool, &client, &sem, &base_url, &batched_merge_pregen).await;
 
     // Phase 3b: chain deepening (DB-direct, not benchmarked)
     phase_chain_deepen(&pool, chain_depth, &warm.targets_by_team).await;

@@ -33,6 +33,7 @@ cargo run --release --bin bench
 | 1b — Create | POST /create | 80% new distinct_ids, 20% existing |
 | 2 — Alias | POST /alias | Mixed: 85% Case 1a, 5% Case 2a, 5% src=dest, 5% Case 3 |
 | 3 — Merge | POST /merge | Seed + merge in sub-batches |
+| 3a — Batched Merge | POST /batched_merge | Same shape as Phase 3, separate seed, direct comparison |
 | 3b — Deepen | DB-direct | Build realistic chain depths (untimed) |
 | 4 — Read | POST /resolve | Random lookups of non-primary distinct_ids |
 | 5 — Delete distinct_id | POST /delete_distinct_id | Delete pre-seeded distinct_ids |
@@ -55,9 +56,19 @@ exist, same person), 5% target==source (get-or-create shortcut), 5% Case 3
 **Phase 3 (merge)** first seeds N merge distinct_ids via direct DB (untimed),
 then sends parallel `POST /merge` requests in sub-batches of configurable size.
 
+**Phase 3a (batched merge)** seeds a separate pool of N distinct_ids via direct DB
+(untimed), then sends parallel `POST /batched_merge` requests in sub-batches of
+the same configurable size as Phase 3. This phase exists for direct latency
+comparison against Phase 3 — identical data shape, different endpoint. The
+batched path replaces per-source serial SQL with bulk lookups and batch
+`INSERT`/`UPDATE`/`DELETE` statements.
+
 **Phase 3b (chain deepen)** merges targets into each other via direct DB calls
 to build realistic union_find chain depths. This is untimed fixture preparation
-so Phase 4 reads traverse chains of varying depth.
+so Phase 4 reads traverse chains of varying depth. Teams are processed in
+parallel via `JoinSet` (chains within a team are disjoint, so there is no
+contention). Within each chain, links are sequential since each depends on the
+prior merge.
 
 **Phase 4 (read)** sends parallel `POST /resolve` requests for random
 non-primary distinct_ids. Reads bypass the worker channel and go direct to the
@@ -80,7 +91,8 @@ Delete phases run last so they don't interfere with read/write benchmarks.
 | `BENCH_CREATE` | 50,000 | Phase 1b create count |
 | `BENCH_ALIAS` | 100,000 | Phase 2 alias count |
 | `BENCH_MERGE` | 100,000 | Phase 3 merge distinct_id count |
-| `BENCH_BATCH` | 10 | Phase 3 sub-batch size |
+| `BENCH_BATCHED_MERGE` | 100,000 | Phase 3a batched merge distinct_id count |
+| `BENCH_BATCH` | 10 | Phase 3/3a sub-batch size |
 | `BENCH_CHAIN_DEPTH` | 100 | Phase 3b max chain depth |
 | `BENCH_READS` | 1,000,000 | Phase 4 read count |
 | `BENCH_DELETE_DID` | 10,000 | Phase 5 delete_distinct_id count |

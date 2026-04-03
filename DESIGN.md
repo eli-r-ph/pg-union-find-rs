@@ -15,6 +15,7 @@ This document describes the architecture and operation of `pg-union-find-rs`, a 
   - [Create](#create)
   - [Alias / Identify](#alias--identify)
   - [Merge](#merge)
+  - [Batched Merge](#batched-merge)
   - [Delete Person](#delete-person)
   - [Delete Distinct ID](#delete-distinct-id)
 - [Path Compression](#path-compression)
@@ -199,7 +200,7 @@ Client                     Server                          PostgreSQL
 
 ## Write Path: Shared Worker Design
 
-All mutations (`/create`, `/alias`, `/identify`, `/merge`, `/delete_person`, `/delete_distinct_id`) flow through the worker pool.
+All mutations (`/create`, `/alias`, `/identify`, `/merge`, `/batched_merge`, `/delete_person`, `/delete_distinct_id`) flow through the worker pool.
 
 ```
 Client                     Handler                     Worker[i]         PostgreSQL
@@ -434,6 +435,73 @@ Finally: set_identified(target_person_id)
 **All sources are merged within a single transaction.** The target's root is reused; each source's root is demoted to a non-root pointing at the target. The unique `(team_id, person_id)` constraint on `union_find` guarantees no duplicate roots survive the merge.
 
 **DB operations:** 1 transaction, `2 + 2*len(sources)` SQL statements in the typical case (target check_did + per-source check_did + link + set_identified).
+
+---
+
+### Batched Merge
+
+`POST /batched_merge` — Same semantics as `/merge` (identical request/response shape), but replaces the per-source serial SQL with batched queries. This reduces DB round-trips from `2 + 2*N` to roughly 6-8 regardless of source count.
+
+```
+Request: { team_id: 1, target: "user@x", sources: ["anon_1", "anon_2", "anon_3"] }
+```
+
+The observable result is identical to `/merge`. The difference is internal: instead of N individual `check_did` + link operations, the batched path runs bulk SQL.
+
+**Algorithm (all within a single transaction):**
+
+```
+Step 1: check_did(target)                          ← same as /merge
+        NotFound → error, Orphaned → create person, Live → use existing
+
+Step 2: Batch lookup all sources (1 query)
+        SELECT id, distinct_id FROM distinct_id_mappings
+        WHERE team_id = $1 AND distinct_id = ANY($2::text[])
+        → HashMap<distinct_id_string, did_pk>
+        Sources absent from result → NotFound
+
+Step 3: Batch resolve all found PKs (1 recursive CTE)
+        Walk all chains simultaneously using unnest($2::bigint[]) as seed.
+        Each row returns (start_node, root_current, person_id, depth).
+        PKs present in lookup but absent from resolve → Orphaned
+
+Step 4: Classify each source
+        ┌──────────────────────────────────────────────────────────────┐
+        │ NotFound    → batch insert (Step 5)                         │
+        │ Orphaned    → sequential unlink + link (Step 6, rare)       │
+        │ Live, same person as target → skip                          │
+        │ Live, different person → batch link root (Step 7)           │
+        └──────────────────────────────────────────────────────────────┘
+
+Step 5: Batch insert NotFound sources (2 queries)
+        INSERT INTO distinct_id_mappings ... SELECT unnest($2::text[])
+        INSERT INTO union_find ... for each new PK, pointing at target
+
+Step 6: Process orphaned sources sequentially
+        For each orphan: unlink_did + link_did (reuses existing helpers)
+        Orphans are rare — only after delete_person — so sequential is fine.
+
+Step 7: Batch link Live-different roots (2 queries, deduped by root)
+        UPDATE union_find SET person_id = NULL, next = target_pk
+        WHERE current = ANY(unique_root_currents)
+
+        DELETE FROM person_mapping
+        WHERE person_id = ANY(old_person_ids)
+
+Step 8: set_identified + commit                    ← same as /merge
+```
+
+**Deduplication:** Sources are deduped before processing. Multiple sources sharing the same root (e.g., `b`, `c`, `d` all under person B) produce a single root link operation — root B is linked to target once, person B is deleted once. The target appearing in the source list resolves to "same person" and is skipped.
+
+**SQL statement count comparison:**
+
+| Scenario (S sources)       | `/merge` | `/batched_merge`      |
+| -------------------------- | -------- | --------------------- |
+| All Live, different person | 2 + 4S   | ~8                    |
+| All NotFound               | 2 + 3S   | ~6                    |
+| Mixed                      | 2 + 2-4S | ~8 + orphan_count * 3 |
+
+**Correctness invariant:** Within a valid union-find tree, source chains never share intermediate nodes — they can only share roots. Deduplicating by `root_current` before the batch link step handles this correctly, producing identical observable results to the serial `/merge` path.
 
 ---
 
