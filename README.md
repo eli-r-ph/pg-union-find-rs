@@ -31,6 +31,7 @@ union_find:           (team_id, current) PK, next (nullable), person_id (nullabl
 | POST | `/merge` | `{ team_id, target, sources }` | Force-merge N sources into target (`$merge_dangerously`) |
 | POST | `/batched_merge` | `{ team_id, target, sources }` | Batched variant of `/merge` — same semantics, fewer DB round-trips |
 | POST | `/resolve` | `{ team_id, distinct_id }` | Resolve distinct_id to person_uuid via chain traversal |
+| POST | `/resolve_distinct_ids` | `{ team_id, person_uuid }` | Return all distinct_ids belonging to a person (capped at 10,000) |
 | POST | `/delete_person` | `{ team_id, person_uuid }` | Soft-delete a person and all associated distinct_ids |
 | POST | `/delete_distinct_id` | `{ team_id, distinct_id }` | Soft-delete a single distinct_id |
 
@@ -46,6 +47,7 @@ union_find:           (team_id, current) PK, next (nullable), person_id (nullabl
 - **`/merge`**: Ignores `is_identified` -- always merges. For each source: if new, create link to target; if existing with a different person, link source's tree into target's tree.
 - **`/batched_merge`**: Same request/response shape and semantics as `/merge`. Replaces per-source serial SQL with bulk lookups (`ANY()`), a single recursive CTE for all sources, and batch `INSERT`/`UPDATE`/`DELETE` statements. Reduces DB round-trips from O(N) to O(1) for typical batches.
 - **`/resolve`**: Walk union_find chain via recursive CTE to root, join person_mapping to return `person_uuid`. Triggers background path compression when chain depth exceeds threshold.
+- **`/resolve_distinct_ids`**: Reverse traversal — given a `person_uuid`, find the root node in `union_find`, then walk backward via a recursive CTE to collect all nodes whose chains lead to that root. Returns up to 10,000 distinct_id strings with an `is_truncated` flag. Like `/resolve`, bypasses the worker pool and reads directly from the connection pool. Returns 404 if the person is not found or was soft-deleted.
 - **`/delete_person`**: Sets `deleted_at` on all distinct_ids for the person and removes the person_mapping row.
 - **`/delete_distinct_id`**: Sets `deleted_at` on the distinct_id. If it was the last live distinct_id for its person, also removes the person_mapping row.
 
@@ -88,8 +90,9 @@ The benchmark harness (`src/bin/bench.rs`) sends parallel HTTP requests to a run
 5. **Batched Merge** -- `POST /batched_merge` with same batch size and data shape as Phase 4 (separate seed, for direct comparison)
 6. **Chain deepening** -- DB-direct merges to build realistic chain depths (untimed)
 7. **Resolve** -- `POST /resolve` against DB-seeded IDs only (warm-up primaries + merge IDs)
-8. **Delete distinct_id** -- `POST /delete_distinct_id` (DB-seeded before timed phase)
-9. **Delete person** -- `POST /delete_person` (DB-seeded before timed phase)
+8. **Resolve Distinct IDs** -- `POST /resolve_distinct_ids` against live persons from prior phases (no extra seeding; 80/20 hot-set bias)
+9. **Delete distinct_id** -- `POST /delete_distinct_id` (DB-seeded before timed phase)
+10. **Delete person** -- `POST /delete_person` (DB-seeded before timed phase)
 
 ### Running
 
@@ -118,9 +121,10 @@ cargo run --release --bin bench
 | `BENCH_BATCHED_MERGE` | 100,000 | Phase 5 batched merge distinct_id count |
 | `BENCH_BATCH` | 10 | Phase 4/5 sub-batch size |
 | `BENCH_CHAIN_DEPTH` | 100 | Phase 6 max union_find chain depth |
-| `BENCH_READS` | 1,000,000 | Phase 6 read count |
-| `BENCH_DELETE_DID` | 10,000 | Phase 7 delete_distinct_id count |
-| `BENCH_DELETE_PERSON` | 10,000 | Phase 8 delete_person count |
+| `BENCH_READS` | 1,000,000 | Phase 7 read count |
+| `BENCH_RESOLVE_DIDS` | 100,000 | Phase 8 resolve_distinct_ids count |
+| `BENCH_DELETE_DID` | 10,000 | Phase 9 delete_distinct_id count |
+| `BENCH_DELETE_PERSON` | 10,000 | Phase 10 delete_person count |
 | `BENCH_DB_POOL` | 50 | Max DB connections (seeding) |
 | `BENCH_CONCURRENCY` | 50 | Max parallel HTTP requests |
 | `BENCH_BASE_URL` | http://127.0.0.1:3000 | Server base URL |

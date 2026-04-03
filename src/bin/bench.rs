@@ -11,6 +11,7 @@
 //!   Phase 3a — Batched Merge: seed N distinct_ids, merge via POST /batched_merge (same batch size)
 //!   Phase 3b — Deepen:   merge targets into each other for realistic chain depths (DB-direct, untimed)
 //!   Phase 4  — Read:     resolve N_READS random distinct_ids via POST /resolve
+//!   Phase 4a — Resolve distinct IDs: resolve N person_uuids via POST /resolve_distinct_ids
 //!   Phase 5  — Delete distinct_id: benchmark N delete_distinct_id calls via POST /delete_distinct_id
 //!   Phase 6  — Delete person: benchmark N delete_person calls via POST /delete_person
 //!
@@ -24,6 +25,7 @@
 //!   BENCH_BATCH            (10)                 — phase 3/3a sub-batch size
 //!   BENCH_CHAIN_DEPTH      (100)                — phase 3b: max override chain depth
 //!   BENCH_READS            (1_000_000)          — phase 4 read count
+//!   BENCH_RESOLVE_DIDS     (100_000)            — phase 4a resolve_distinct_ids count
 //!   BENCH_DELETE_DID       (10_000)             — phase 5 delete_distinct_id count
 //!   BENCH_DELETE_PERSON    (10_000)             — phase 6 delete_person count
 //!   BENCH_DB_POOL          (50)                 — max DB connections for seeding pool
@@ -781,15 +783,9 @@ async fn phase_chain_deepen(
         set.spawn(async move {
             for chain in &chains {
                 for i in 0..chain.len().saturating_sub(1) {
-                    db::handle_merge(
-                        &pool,
-                        team_id,
-                        &chain[i + 1],
-                        &[chain[i].clone()],
-                        i32::MAX,
-                    )
-                    .await
-                    .expect("chain deepen merge failed");
+                    db::handle_merge(&pool, team_id, &chain[i + 1], &[chain[i].clone()], i32::MAX)
+                        .await
+                        .expect("chain deepen merge failed");
                 }
             }
         });
@@ -835,6 +831,89 @@ async fn phase_read(
 
     print_stats(
         "resolve (read)",
+        &compute_stats(latencies, wall_time, failures),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4a: resolve_distinct_ids benchmark — parallel HTTP POST /resolve_distinct_ids
+// Reuses persons created by prior phases; no additional seeding required.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct PersonTarget {
+    team_id: i64,
+    person_uuid: String,
+}
+
+async fn collect_person_targets(pool: &PgPool) -> Vec<PersonTarget> {
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT team_id, person_uuid FROM person_mapping WHERE deleted_at IS NULL",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("failed to query person_mapping for benchmark targets");
+    rows.into_iter()
+        .map(|(team_id, person_uuid)| PersonTarget {
+            team_id,
+            person_uuid,
+        })
+        .collect()
+}
+
+async fn phase_resolve_distinct_ids(
+    pool: &PgPool,
+    client: &Client,
+    sem: &Arc<Semaphore>,
+    base_url: &str,
+    n: usize,
+) {
+    println!("Phase 4a: collecting person_uuid targets from DB...");
+    let t_collect = Instant::now();
+    let person_targets = collect_person_targets(pool).await;
+    println!(
+        "  found {} live persons in {:.2?}",
+        person_targets.len(),
+        t_collect.elapsed()
+    );
+
+    if person_targets.is_empty() {
+        println!("  no persons to resolve — skipping phase 4a\n");
+        return;
+    }
+
+    let hot_count = std::cmp::max(1, person_targets.len() / 5);
+    let mut rng = rand::rng();
+    let hot_set: Vec<PersonTarget> = (0..hot_count)
+        .map(|_| person_targets[rng.random_range(0..person_targets.len())].clone())
+        .collect();
+
+    println!("Phase 4a: resolving {n} person_uuids via POST /resolve_distinct_ids...");
+
+    let url = format!("{base_url}/resolve_distinct_ids");
+    let requests: Vec<(String, serde_json::Value)> = (0..n)
+        .map(|_| {
+            let pt = if rng.random_bool(0.8) {
+                &hot_set[rng.random_range(0..hot_set.len())]
+            } else {
+                &person_targets[rng.random_range(0..person_targets.len())]
+            };
+            (
+                url.clone(),
+                serde_json::json!({
+                    "team_id": pt.team_id,
+                    "person_uuid": pt.person_uuid,
+                }),
+            )
+        })
+        .collect();
+
+    let wall_start = Instant::now();
+    let (latencies, failures) = run_parallel(client, sem, requests).await;
+    let wall_time = wall_start.elapsed();
+
+    print_stats(
+        "resolve_distinct_ids",
         &compute_stats(latencies, wall_time, failures),
     );
 }
@@ -945,6 +1024,7 @@ async fn main() {
     let batch_size = env_usize("BENCH_BATCH", 10);
     let chain_depth = env_usize("BENCH_CHAIN_DEPTH", 100);
     let n_reads = env_usize("BENCH_READS", 1_000_000);
+    let n_resolve_dids = env_usize("BENCH_RESOLVE_DIDS", 100_000);
     let n_delete_did = env_usize("BENCH_DELETE_DID", 10_000);
     let n_delete_person = env_usize("BENCH_DELETE_PERSON", 10_000);
     let n_teams = env_usize("BENCH_TEAMS", std::cmp::max(1, n_warm / 1000));
@@ -964,6 +1044,7 @@ async fn main() {
     println!("  BENCH_BATCH          = {batch_size}");
     println!("  BENCH_CHAIN_DEPTH    = {chain_depth}");
     println!("  BENCH_READS          = {n_reads}");
+    println!("  BENCH_RESOLVE_DIDS   = {n_resolve_dids}");
     println!("  BENCH_DELETE_DID     = {n_delete_did}");
     println!("  BENCH_DELETE_PERSON  = {n_delete_person}");
     println!("  BENCH_DB_POOL        = {db_pool_size}");
@@ -1051,6 +1132,9 @@ async fn main() {
 
     // Phase 4: read benchmark (parallel HTTP)
     phase_read(&client, &sem, &base_url, &lookup_ids, n_reads).await;
+
+    // Phase 4a: resolve_distinct_ids benchmark (parallel HTTP, reuses existing data)
+    phase_resolve_distinct_ids(&pool, &client, &sem, &base_url, n_resolve_dids).await;
 
     // Phase 5: delete_distinct_id benchmark (parallel HTTP)
     phase_delete_distinct_id(&pool, &client, &sem, &base_url, n_delete_did, &team_ids).await;

@@ -4,7 +4,9 @@ use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 
 use pg_union_find_rs::db::{self, ResolvedPerson};
-use pg_union_find_rs::models::{AliasResponse, DbResult, MergeResponse};
+use pg_union_find_rs::models::{
+    AliasResponse, DbResult, MergeResponse, ResolveDistinctIdsResponse,
+};
 
 static TEAM_COUNTER: AtomicI64 = AtomicI64::new(0);
 
@@ -516,6 +518,14 @@ pub async fn resolve(
     db::resolve(pool, team_id, distinct_id)
         .await
         .map(|opt| opt.map(|(p, _)| p))
+}
+
+pub async fn resolve_distinct_ids(
+    pool: &PgPool,
+    team_id: i64,
+    person_uuid: &str,
+) -> DbResult<ResolveDistinctIdsResponse> {
+    db::resolve_distinct_ids(pool, team_id, person_uuid).await
 }
 
 /// Walk the chain and return its depth (number of hops from start to root).

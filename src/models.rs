@@ -85,6 +85,19 @@ pub struct DeleteDistinctIdResponse {
     pub person_deleted: bool,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ResolveDistinctIdsRequest {
+    pub team_id: i64,
+    pub person_uuid: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ResolveDistinctIdsResponse {
+    pub person_uuid: String,
+    pub distinct_ids: Vec<String>,
+    pub is_truncated: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Internal error type
 // ---------------------------------------------------------------------------

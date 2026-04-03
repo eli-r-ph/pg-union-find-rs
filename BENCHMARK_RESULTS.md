@@ -17,6 +17,7 @@
 | BENCH_BATCHED_MERGE | 100,000 (10 per batch = 10,000 batches) |
 | BENCH_CHAIN_DEPTH | 100 |
 | BENCH_READS | 1,000,000 |
+| BENCH_RESOLVE_DIDS | 100,000 |
 | BENCH_DELETE_DID | 10,000 |
 | BENCH_DELETE_PERSON | 10,000 |
 | BENCH_DB_POOL | 50 |
@@ -107,6 +108,12 @@ Chain depth distribution:
 
 Lookup pool: 200,000 IDs (100K warm-up primaries + 100K merge IDs), all DB-seeded.
 
+### Phase 4a: Resolve Distinct IDs (`POST /resolve_distinct_ids`)
+
+_Pending — re-run benchmarks to populate._
+
+Reuses all live persons from prior phases (no additional seeding). Collects `(team_id, person_uuid)` pairs from `person_mapping` at benchmark time, then sends 100K concurrent resolve requests with 80/20 hot-set bias. Persons have varying fan-out (1 DID for warm-up singletons, many DIDs for merge/alias targets, deep chains from deepening phase), exercising the reverse recursive CTE across realistic data shapes.
+
 ### Phase 5: Delete Distinct ID (`POST /delete_distinct_id`)
 
 | Metric | Value |
@@ -150,6 +157,7 @@ Pre-seeding: 10,000 persons in **838ms** (parallel).
 | Merge (batch) | 249 | 195.97ms | 449.94ms | 607.12ms |
 | Batched Merge | _pending_ | _pending_ | _pending_ | _pending_ |
 | Resolve (read) | 13,638 | 1.88ms | 5.73ms | 803.27ms |
+| Resolve Distinct IDs | _pending_ | _pending_ | _pending_ | _pending_ |
 | Delete DID | 2,581 | 8.22ms | 207.78ms | 373.92ms |
 | Delete Person | 3,905 | 4.65ms | 197.41ms | 216.10ms |
 

@@ -10,6 +10,7 @@ This document describes the architecture and operation of `pg-union-find-rs`, a 
 - [Data Model](#data-model)
 - [Union-Find Representation](#union-find-representation)
 - [Read Path: Resolve](#read-path-resolve)
+- [Read Path: Resolve Distinct IDs](#read-path-resolve-distinct-ids)
 - [Write Path: Shared Worker Design](#write-path-shared-worker-design)
 - [Operations](#operations)
   - [Create](#create)
@@ -65,9 +66,9 @@ This document describes the architecture and operation of `pg-union-find-rs`, a 
 **Key design properties:**
 
 - **Writes are serialized per shard.** Each worker task owns a bounded `mpsc` channel and processes operations strictly in FIFO order. `team_id % N` determines the shard, so writes for the same team are always serialized. Different teams on the same shard also serialize, which is an acceptable trade-off for simplicity.
-- **Reads bypass the worker pool.** `/resolve` acquires a connection directly from the Postgres pool and runs a read-only recursive CTE. This allows reads to scale independently and never block behind queued writes.
+- **Reads bypass the worker pool.** `/resolve` and `/resolve_distinct_ids` acquire a connection directly from the Postgres pool and run read-only recursive CTEs. This allows reads to scale independently and never block behind queued writes.
 - **Backpressure via bounded channels.** Each worker channel has a bounded capacity (default 1024). Enqueue attempts timeout after 100ms, returning HTTP 503 rather than allowing unbounded memory growth.
-- **DB connection budget.** `max_connections = WORKER_POOL_SIZE + 1`. Each worker holds at most one connection; the +1 covers direct-pool reads.
+- **DB connection budget.** `max_connections = WORKER_POOL_SIZE + 1`. Each worker holds at most one connection; the +1 covers direct-pool reads (`/resolve`, `/resolve_distinct_ids`).
 
 ---
 
@@ -159,7 +160,7 @@ The CTE terminates when it hits a row where `person_id IS NOT NULL` (the JOIN co
 
 ## Read Path: Resolve
 
-`POST /resolve` is the only read operation. It bypasses the worker pool entirely.
+`POST /resolve` is the primary read operation. It bypasses the worker pool entirely.
 
 ```
 Client                     Server                          PostgreSQL
@@ -195,6 +196,80 @@ Client                     Server                          PostgreSQL
 **Performance:** Two SQL statements per resolve (lookup + CTE). The CTE walks integer-indexed rows; typical chains are shallow (depth 1-3 after compression). If the chain is deeper than `PATH_COMPRESS_THRESHOLD`, a background compression task is enqueued via `try_send` (non-blocking, dropped if the channel is full).
 
 **Correctness:** Resolves see a consistent snapshot of the chain. Concurrent writes may extend or compress the chain, but the CTE always walks to a valid root or returns nothing. Soft-deleted persons are filtered out by `deleted_at IS NULL` on the `person_mapping` join.
+
+---
+
+## Read Path: Resolve Distinct IDs
+
+`POST /resolve_distinct_ids` is the reverse of `/resolve`: given a `person_uuid`, it returns all distinct_ids belonging to that person. Like `/resolve`, it bypasses the worker pool and reads directly from the connection pool.
+
+```
+Client                     Server                          PostgreSQL
+  │                          │                                │
+  │  POST /resolve_distinct  │                                │
+  │  _ids                    │                                │
+  │  {team_id, person_uuid}  │                                │
+  │─────────────────────────►│                                │
+  │                          │   pool.acquire()               │
+  │                          │───────────────────────────────►│
+  │                          │                                │
+  │                          │   SELECT person_id FROM        │
+  │                          │     person_mapping             │
+  │                          │   WHERE team_id=$1             │
+  │                          │     AND person_uuid=$2         │
+  │                          │     AND deleted_at IS NULL     │
+  │                          │───────────────────────────────►│
+  │                          │◄───────────────────────────────│ person_id
+  │                          │                                │
+  │                          │   Reverse recursive CTE:       │
+  │                          │   find root by person_id,      │
+  │                          │   walk backward through all    │
+  │                          │   nodes whose next points to   │
+  │                          │   collected nodes, join        │
+  │                          │   distinct_id_mappings         │
+  │                          │   LIMIT 10001                  │
+  │                          │───────────────────────────────►│
+  │                          │◄───────────────────────────────│ [distinct_ids]
+  │                          │                                │
+  │  200 {person_uuid,       │                                │
+  │       distinct_ids,      │                                │
+  │       is_truncated}      │                                │
+  │◄─────────────────────────│                                │
+```
+
+**SQL strategy — reverse recursive CTE:**
+
+```sql
+WITH RECURSIVE tree(node) AS (
+    -- Base: find the root node for this person
+    SELECT uf.current
+    FROM union_find uf
+    WHERE uf.team_id = $1 AND uf.person_id = $2 AND uf.deleted_at IS NULL
+
+    UNION ALL
+
+    -- Recurse: find all nodes whose next points to an already-collected node
+    SELECT uf.current
+    FROM tree t
+    JOIN union_find uf ON uf.team_id = $1 AND uf.next = t.node
+    WHERE uf.person_id IS NULL
+)
+SELECT d.distinct_id
+FROM tree t
+JOIN distinct_id_mappings d ON d.id = t.node AND d.team_id = $1
+LIMIT 10001
+```
+
+The CTE starts at the root (identified by `person_id`), then recursively expands to every node in the tree by following `next` pointers in reverse. The `LIMIT 10001` allows detection of truncation: if more than 10,000 rows are returned, the response sets `is_truncated: true` and returns exactly 10,000.
+
+**Performance:** Two SQL statements per call (person_mapping lookup + reverse CTE). The CTE traverses the full tree for the person. For typical workloads (tens to hundreds of distinct_ids per person) this is fast. The 10,000 cap prevents pathological cases from producing unbounded result sets.
+
+**Correctness under concurrent writes:** The reverse CTE executes as a single SQL statement and sees a consistent MVCC snapshot. A concurrent merge, alias, or delete cannot produce a partial or inconsistent tree view within the CTE. The only subtle case is between the `person_mapping` lookup (query 1) and the CTE (query 2): a concurrent `delete_person` could soft-delete the person between the two queries, causing the CTE to return zero rows instead of a 404. This is a benign inconsistency — the caller sees an empty result for a person that was deleted mid-flight.
+
+**Error handling:**
+- Person not found or soft-deleted → 404 (`DbError::NotFound`)
+- Wrong team for UUID → 404 (scoped by `team_id`)
+- DB connection/query failure → 500 (`DbError::Internal`)
 
 ---
 

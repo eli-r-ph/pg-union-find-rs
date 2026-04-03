@@ -94,6 +94,10 @@ async fn main() {
         .route("/delete_person", post(handlers::delete_person))
         .route("/delete_distinct_id", post(handlers::delete_distinct_id))
         .route("/resolve", post(handlers::resolve))
+        .route(
+            "/resolve_distinct_ids",
+            post(handlers::resolve_distinct_ids),
+        )
         .with_state(state)
         .layer(CatchPanicLayer::custom(
             |_: Box<dyn std::any::Any + Send>| {

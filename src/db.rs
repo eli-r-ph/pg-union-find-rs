@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::models::{
     AliasResponse, CompressHint, CreateResponse, DbError, DbOp, DbResult, DeleteDistinctIdResponse,
-    DeletePersonResponse, MergeResponse,
+    DeletePersonResponse, MergeResponse, ResolveDistinctIdsResponse,
 };
 
 // ---------------------------------------------------------------------------
@@ -502,12 +502,14 @@ async fn batch_resolve_pks(
 
     Ok(rows
         .into_iter()
-        .map(|(start_node, root_current, person_id, depth)| BatchResolveRow {
-            start_node,
-            root_current,
-            person_id,
-            depth,
-        })
+        .map(
+            |(start_node, root_current, person_id, depth)| BatchResolveRow {
+                start_node,
+                root_current,
+                person_id,
+                depth,
+            },
+        )
         .collect())
 }
 
@@ -782,6 +784,66 @@ pub async fn resolve(
 ) -> DbResult<Option<(ResolvedPerson, i32)>> {
     let mut conn = pool.acquire().await?;
     resolve_tx(&mut conn, team_id, distinct_id).await
+}
+
+const RESOLVE_DISTINCT_IDS_LIMIT: usize = 10_000;
+
+/// Resolve all distinct_ids belonging to a person, capped at 10,000.
+pub async fn resolve_distinct_ids(
+    pool: &PgPool,
+    team_id: i64,
+    person_uuid: &str,
+) -> DbResult<ResolveDistinctIdsResponse> {
+    let mut conn = pool.acquire().await?;
+
+    let person_id: i64 = sqlx::query_scalar(
+        "SELECT person_id FROM person_mapping \
+         WHERE team_id = $1 AND person_uuid = $2 AND deleted_at IS NULL",
+    )
+    .bind(team_id)
+    .bind(person_uuid)
+    .fetch_optional(&mut *conn)
+    .await?
+    .ok_or_else(|| DbError::NotFound(format!("person '{person_uuid}' not found")))?;
+
+    let rows: Vec<(String,)> = sqlx::query_as(
+        r#"
+        WITH RECURSIVE tree(node) AS (
+            SELECT uf.current
+            FROM union_find uf
+            WHERE uf.team_id = $1 AND uf.person_id = $2 AND uf.deleted_at IS NULL
+
+            UNION ALL
+
+            SELECT uf.current
+            FROM tree t
+            JOIN union_find uf ON uf.team_id = $1 AND uf.next = t.node
+            WHERE uf.person_id IS NULL
+        )
+        SELECT d.distinct_id
+        FROM tree t
+        JOIN distinct_id_mappings d ON d.id = t.node AND d.team_id = $1
+        LIMIT $3
+        "#,
+    )
+    .bind(team_id)
+    .bind(person_id)
+    .bind((RESOLVE_DISTINCT_IDS_LIMIT + 1) as i64)
+    .fetch_all(&mut *conn)
+    .await?;
+
+    let is_truncated = rows.len() > RESOLVE_DISTINCT_IDS_LIMIT;
+    let distinct_ids: Vec<String> = rows
+        .into_iter()
+        .take(RESOLVE_DISTINCT_IDS_LIMIT)
+        .map(|(did,)| did)
+        .collect();
+
+    Ok(ResolveDistinctIdsResponse {
+        person_uuid: person_uuid.to_string(),
+        distinct_ids,
+        is_truncated,
+    })
 }
 
 /// /create — get-or-create a person for a single distinct_id.

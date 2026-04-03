@@ -9,7 +9,8 @@ use sqlx::PgPool;
 use crate::db;
 use crate::models::{
     AliasRequest, CompressHint, CreateRequest, DbError, DbOp, DeleteDistinctIdRequest,
-    DeletePersonRequest, IdentifyRequest, MergeRequest, ResolveRequest, ResolveResponse,
+    DeletePersonRequest, IdentifyRequest, MergeRequest, ResolveDistinctIdsRequest, ResolveRequest,
+    ResolveResponse,
 };
 
 const ENQUEUE_TIMEOUT: Duration = Duration::from_millis(100);
@@ -385,6 +386,20 @@ pub async fn resolve(
             "distinct_id '{}' not found",
             req.distinct_id
         ))),
+        Err(e) => db_error_response(e),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// POST /resolve_distinct_ids — read-only lookup, bypasses worker channels
+// ---------------------------------------------------------------------------
+
+pub async fn resolve_distinct_ids(
+    State(state): State<AppState>,
+    Json(req): Json<ResolveDistinctIdsRequest>,
+) -> impl IntoResponse {
+    match db::resolve_distinct_ids(&state.pool, req.team_id, &req.person_uuid).await {
+        Ok(resp) => (StatusCode::OK, Json(serde_json::json!(resp))).into_response(),
         Err(e) => db_error_response(e),
     }
 }

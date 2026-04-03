@@ -2539,7 +2539,9 @@ async fn batched_merge_same_person() {
     assert_chain_matches(&pool, t, "b", &["b", "a"], &r_a.person_uuid).await;
 
     let before_uf = count_union_find(&pool, t).await;
-    let resp = handle_batched_merge(&pool, t, "a", &["b".into()]).await.unwrap();
+    let resp = handle_batched_merge(&pool, t, "a", &["b".into()])
+        .await
+        .unwrap();
     assert!(resp.is_identified);
     assert_eq!(resp.person_uuid, r_a.person_uuid);
 
@@ -2564,7 +2566,9 @@ async fn batched_merge_different_person() {
 
     let old_root_pid = collect_chain(&pool, t, "b").await[0].person_id.unwrap();
 
-    let resp = handle_batched_merge(&pool, t, "a", &["b".into()]).await.unwrap();
+    let resp = handle_batched_merge(&pool, t, "a", &["b".into()])
+        .await
+        .unwrap();
     assert_eq!(resp.person_uuid, person_a.person_uuid);
     assert!(resp.is_identified);
 
@@ -2673,7 +2677,9 @@ async fn batched_merge_target_in_sources() {
     let t = next_team_id();
 
     let tgt = db::handle_create(&pool, t, "a").await.unwrap();
-    let resp = handle_batched_merge(&pool, t, "a", &["a".into()]).await.unwrap();
+    let resp = handle_batched_merge(&pool, t, "a", &["a".into()])
+        .await
+        .unwrap();
     assert_eq!(resp.person_uuid, tgt.person_uuid);
 
     assert_eq!(count_person_mappings(&pool, t).await, 1);
@@ -2694,12 +2700,16 @@ async fn batched_merge_chain_all_ids_follow() {
     db::handle_create(&pool, t, "b").await.unwrap();
     let person_c = db::handle_create(&pool, t, "c").await.unwrap();
 
-    handle_batched_merge(&pool, t, "a", &["b".into()]).await.unwrap();
+    handle_batched_merge(&pool, t, "a", &["b".into()])
+        .await
+        .unwrap();
 
     assert_chain_is_root(&pool, t, "a", &person_a.person_uuid).await;
     assert_chain_matches(&pool, t, "b", &["b", "a"], &person_a.person_uuid).await;
 
-    handle_batched_merge(&pool, t, "c", &["a".into()]).await.unwrap();
+    handle_batched_merge(&pool, t, "c", &["a".into()])
+        .await
+        .unwrap();
 
     assert_chain_is_root(&pool, t, "c", &person_c.person_uuid).await;
     assert_chain_matches(&pool, t, "a", &["a", "c"], &person_c.person_uuid).await;
@@ -2732,7 +2742,9 @@ async fn batched_merge_chain_deep_transitive() {
     assert_chain_matches(&pool, t, "b", &["b", "a"], &person_a.person_uuid).await;
     assert_chain_matches(&pool, t, "c", &["c", "a"], &person_a.person_uuid).await;
 
-    handle_batched_merge(&pool, t, "d", &["a".into()]).await.unwrap();
+    handle_batched_merge(&pool, t, "d", &["a".into()])
+        .await
+        .unwrap();
 
     assert_chain_is_root(&pool, t, "d", &person_d.person_uuid).await;
     assert_chain_matches(&pool, t, "a", &["a", "d"], &person_d.person_uuid).await;
@@ -2755,7 +2767,9 @@ async fn batched_merge_sets_identified() {
     let pid_x = chain_x[0].person_id.unwrap();
     assert!(!is_person_identified(&pool, pid_x).await);
 
-    let resp = handle_batched_merge(&pool, t, "x", &["y".into()]).await.unwrap();
+    let resp = handle_batched_merge(&pool, t, "x", &["y".into()])
+        .await
+        .unwrap();
     assert!(resp.is_identified);
 
     assert_chain_is_root(&pool, t, "x", &r_x.person_uuid).await;
@@ -2796,7 +2810,9 @@ async fn batched_merge_link_structure() {
     assert_chain_is_root(&pool, t, "a", &r_a.person_uuid).await;
     assert_chain_is_root(&pool, t, "b", &r_b.person_uuid).await;
 
-    handle_batched_merge(&pool, t, "a", &["b".into()]).await.unwrap();
+    handle_batched_merge(&pool, t, "a", &["b".into()])
+        .await
+        .unwrap();
 
     assert_chain_is_root(&pool, t, "a", &r_a.person_uuid).await;
     assert_chain_matches(&pool, t, "b", &["b", "a"], &r_a.person_uuid).await;
@@ -2856,7 +2872,9 @@ async fn batched_merge_already_identified_target() {
 
     db::handle_create(&pool, t, "y").await.unwrap();
 
-    let resp = handle_batched_merge(&pool, t, "x", &["y".into()]).await.unwrap();
+    let resp = handle_batched_merge(&pool, t, "x", &["y".into()])
+        .await
+        .unwrap();
     assert_eq!(resp.person_uuid, resp_x.person_uuid);
     assert!(resp.is_identified);
 
@@ -2879,7 +2897,9 @@ async fn batched_merge_with_deleted_target() {
         .await
         .unwrap();
 
-    let resp = handle_batched_merge(&pool, t, "a", &["b".into()]).await.unwrap();
+    let resp = handle_batched_merge(&pool, t, "a", &["b".into()])
+        .await
+        .unwrap();
     assert_ne!(resp.person_uuid, pa.person_uuid);
     assert!(resp.is_identified);
 
@@ -2901,7 +2921,9 @@ async fn batched_merge_with_deleted_source() {
         .await
         .unwrap();
 
-    let resp = handle_batched_merge(&pool, t, "a", &["b".into()]).await.unwrap();
+    let resp = handle_batched_merge(&pool, t, "a", &["b".into()])
+        .await
+        .unwrap();
     assert_eq!(resp.person_uuid, pa.person_uuid);
     assert!(resp.is_identified);
 
@@ -3049,7 +3071,9 @@ async fn batched_merge_matches_merge_output() {
 
     let t2 = next_team_id();
     setup(t2).await;
-    let resp2 = handle_batched_merge(&pool, t2, "tgt", &sources).await.unwrap();
+    let resp2 = handle_batched_merge(&pool, t2, "tgt", &sources)
+        .await
+        .unwrap();
 
     assert!(resp1.is_identified);
     assert!(resp2.is_identified);
@@ -3085,4 +3109,244 @@ async fn batched_merge_matches_merge_output() {
 
     assert_all_invariants(&pool, t1).await;
     assert_all_invariants(&pool, t2).await;
+}
+
+// ===========================================================================
+// /resolve_distinct_ids
+// ===========================================================================
+
+#[tokio::test]
+async fn resolve_distinct_ids_single() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let created = db::handle_create(&pool, t, "user-1").await.unwrap();
+
+    let resp = resolve_distinct_ids(&pool, t, &created.person_uuid)
+        .await
+        .unwrap();
+    assert_eq!(resp.person_uuid, created.person_uuid);
+    assert_eq!(resp.distinct_ids, vec!["user-1"]);
+    assert!(!resp.is_truncated);
+
+    assert_all_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn resolve_distinct_ids_after_alias() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let created = db::handle_create(&pool, t, "a").await.unwrap();
+    handle_alias(&pool, t, "a", "b").await.unwrap();
+    handle_alias(&pool, t, "a", "c").await.unwrap();
+
+    let resp = resolve_distinct_ids(&pool, t, &created.person_uuid)
+        .await
+        .unwrap();
+    assert_eq!(resp.person_uuid, created.person_uuid);
+    assert!(!resp.is_truncated);
+
+    let mut dids = resp.distinct_ids.clone();
+    dids.sort();
+    assert_eq!(dids, vec!["a", "b", "c"]);
+
+    assert_all_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn resolve_distinct_ids_after_merge() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let person_a = db::handle_create(&pool, t, "a").await.unwrap();
+    db::handle_create(&pool, t, "b").await.unwrap();
+    db::handle_create(&pool, t, "c").await.unwrap();
+
+    handle_merge(&pool, t, "a", &["b".into(), "c".into()])
+        .await
+        .unwrap();
+
+    let resp = resolve_distinct_ids(&pool, t, &person_a.person_uuid)
+        .await
+        .unwrap();
+    assert_eq!(resp.person_uuid, person_a.person_uuid);
+    assert!(!resp.is_truncated);
+
+    let mut dids = resp.distinct_ids.clone();
+    dids.sort();
+    assert_eq!(dids, vec!["a", "b", "c"]);
+
+    assert_all_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn resolve_distinct_ids_fan_out() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let root = db::handle_create(&pool, t, "root").await.unwrap();
+    for i in 0..20 {
+        let did = format!("leaf-{i}");
+        handle_alias(&pool, t, "root", &did).await.unwrap();
+    }
+
+    let resp = resolve_distinct_ids(&pool, t, &root.person_uuid)
+        .await
+        .unwrap();
+    assert_eq!(resp.person_uuid, root.person_uuid);
+    assert!(!resp.is_truncated);
+    assert_eq!(resp.distinct_ids.len(), 21);
+
+    assert!(resp.distinct_ids.contains(&"root".to_string()));
+    for i in 0..20 {
+        assert!(resp.distinct_ids.contains(&format!("leaf-{i}")));
+    }
+
+    assert_all_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn resolve_distinct_ids_not_found() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let result = resolve_distinct_ids(&pool, t, "nonexistent-uuid").await;
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        DbError::NotFound(_) => {}
+        other => panic!("expected NotFound, got: {other}"),
+    }
+}
+
+#[tokio::test]
+async fn resolve_distinct_ids_deleted_person() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let created = db::handle_create(&pool, t, "a").await.unwrap();
+    handle_alias(&pool, t, "a", "b").await.unwrap();
+
+    db::handle_delete_person(&pool, t, &created.person_uuid)
+        .await
+        .unwrap();
+
+    let result = resolve_distinct_ids(&pool, t, &created.person_uuid).await;
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        DbError::NotFound(_) => {}
+        other => panic!("expected NotFound for deleted person, got: {other}"),
+    }
+
+    assert_structural_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn resolve_distinct_ids_team_isolation() {
+    let pool = test_pool().await;
+    let t1 = next_team_id();
+    let t2 = next_team_id();
+
+    let p1 = db::handle_create(&pool, t1, "shared").await.unwrap();
+    let p2 = db::handle_create(&pool, t2, "shared").await.unwrap();
+
+    handle_alias(&pool, t1, "shared", "extra-1").await.unwrap();
+
+    let resp1 = resolve_distinct_ids(&pool, t1, &p1.person_uuid)
+        .await
+        .unwrap();
+    let resp2 = resolve_distinct_ids(&pool, t2, &p2.person_uuid)
+        .await
+        .unwrap();
+
+    let mut dids1 = resp1.distinct_ids.clone();
+    dids1.sort();
+    assert_eq!(dids1, vec!["extra-1", "shared"]);
+    assert_eq!(resp2.distinct_ids, vec!["shared"]);
+
+    let cross = resolve_distinct_ids(&pool, t2, &p1.person_uuid).await;
+    assert!(
+        cross.is_err(),
+        "person_uuid from t1 should not resolve in t2"
+    );
+
+    assert_all_invariants(&pool, t1).await;
+    assert_all_invariants(&pool, t2).await;
+}
+
+#[tokio::test]
+async fn resolve_distinct_ids_truncation() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let root = db::handle_create(&pool, t, "root").await.unwrap();
+
+    let batch_size = 500;
+    let total_leaves = 10_001;
+    for batch_start in (0..total_leaves).step_by(batch_size) {
+        let batch_end = std::cmp::min(batch_start + batch_size, total_leaves);
+        let sources: Vec<String> = (batch_start..batch_end)
+            .map(|i| format!("did-{i}"))
+            .collect();
+        handle_merge(&pool, t, "root", &sources).await.unwrap();
+    }
+
+    let resp = resolve_distinct_ids(&pool, t, &root.person_uuid)
+        .await
+        .unwrap();
+    assert!(
+        resp.is_truncated,
+        "should be truncated with >10000 distinct_ids"
+    );
+    assert_eq!(resp.distinct_ids.len(), 10_000);
+}
+
+#[tokio::test]
+async fn resolve_distinct_ids_deep_chain() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let root = db::handle_create(&pool, t, "n0").await.unwrap();
+    for i in 1..=50 {
+        let prev = format!("n{}", i - 1);
+        let curr = format!("n{i}");
+        handle_alias(&pool, t, &prev, &curr).await.unwrap();
+    }
+
+    let resp = resolve_distinct_ids(&pool, t, &root.person_uuid)
+        .await
+        .unwrap();
+    assert_eq!(resp.person_uuid, root.person_uuid);
+    assert!(!resp.is_truncated);
+    assert_eq!(resp.distinct_ids.len(), 51);
+
+    for i in 0..=50 {
+        assert!(resp.distinct_ids.contains(&format!("n{i}")));
+    }
+
+    assert_all_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn resolve_distinct_ids_after_delete_did() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let created = db::handle_create(&pool, t, "a").await.unwrap();
+    handle_alias(&pool, t, "a", "b").await.unwrap();
+    handle_alias(&pool, t, "a", "c").await.unwrap();
+
+    db::handle_delete_distinct_id(&pool, t, "b").await.unwrap();
+
+    let resp = resolve_distinct_ids(&pool, t, &created.person_uuid)
+        .await
+        .unwrap();
+    assert!(!resp.is_truncated);
+
+    let mut dids = resp.distinct_ids.clone();
+    dids.sort();
+    assert_eq!(dids, vec!["a", "c"]);
+    assert!(!resp.distinct_ids.contains(&"b".to_string()));
+
+    assert_all_invariants(&pool, t).await;
 }
