@@ -46,8 +46,5 @@ services:
       - full_page_writes=off
       - -c
       - checkpoint_timeout=15min
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-
-volumes:
-  pgdata:
+    tmpfs:
+      - /var/lib/postgresql/data:size=2G
