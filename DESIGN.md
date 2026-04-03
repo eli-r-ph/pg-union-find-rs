@@ -526,7 +526,7 @@ Steps:
 3. `DELETE FROM person_mapping WHERE person_id = 9`
 4. `UPDATE person_mapping SET is_identified = true WHERE person_id = 7`
 
-Path compression is triggered lazily at read time (see [Path Compression](#path-compression)).
+If the combined chain depth exceeds `PATH_COMPRESS_THRESHOLD`, background compression is enqueued (see [Path Compression](#path-compression)).
 
 **Constraint:** if the source person is already `is_identified = true`, the merge is refused with HTTP 409. The caller must use `/merge` to force-merge identified persons.
 
@@ -857,9 +857,8 @@ Every non-root node on the path is updated to point directly at the root.
 
 **When compression is triggered:**
 
-Compression is triggered lazily by **reads** (`/resolve`): if the resolved chain depth exceeds `PATH_COMPRESS_THRESHOLD` (default 20), a `try_send` fires a `CompressPath` operation into the worker channel. This is fire-and-forget — if the channel is full, the attempt is silently dropped and retried on the next access.
-
-Write operations (`/alias`, `/identify`, `/merge`, `/batched_merge`) do **not** enqueue compression. This avoids write-amplification and worker channel contention during heavy mutation workloads. Any chains that grow deep will be compressed organically when they are next read.
+1. **After writes** (`/alias`, `/identify`, `/merge`, `/batched_merge`): the operation returns a `CompressHint` when the combined chain depth exceeds `PATH_COMPRESS_THRESHOLD` (default 20). The handler enqueues a `CompressPath` operation to the worker channel in a background task (up to 3 retry attempts with backoff). Each write produces at most one hint — for merges with multiple sources, only the single deepest source chain is targeted.
+2. **After reads** (`/resolve`): if the resolved chain depth exceeds the threshold, a `try_send` fires compression into the worker channel. This is fire-and-forget — if the channel is full, the attempt is silently dropped.
 
 **SQL implementation** (single statement within a transaction):
 
@@ -889,7 +888,7 @@ WHERE pi.max_depth >= $3
 
 The entire walk + update runs as one SQL statement in one transaction. If compression races with a concurrent write, it sees a consistent MVCC snapshot and either compresses correctly or becomes a no-op.
 
-**Compression is best-effort.** If the worker channel is full, compression is skipped and retried on the next access. Chains are always correct regardless of depth — compression is purely a performance optimization.
+**Compression is best-effort.** On the write path, the handler retries enqueue up to 3 times with backoff; on the read path, a single `try_send` is attempted and silently dropped if the channel is full. In either case, chains are always correct regardless of depth — compression is purely a performance optimization.
 
 ---
 

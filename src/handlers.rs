@@ -8,8 +8,9 @@ use sqlx::PgPool;
 
 use crate::db;
 use crate::models::{
-    AliasRequest, CreateRequest, DbError, DbOp, DeleteDistinctIdRequest, DeletePersonRequest,
-    IdentifyRequest, MergeRequest, ResolveDistinctIdsRequest, ResolveRequest, ResolveResponse,
+    AliasRequest, CompressHint, CreateRequest, DbError, DbOp, DeleteDistinctIdRequest,
+    DeletePersonRequest, IdentifyRequest, MergeRequest, ResolveDistinctIdsRequest, ResolveRequest,
+    ResolveResponse,
 };
 
 const ENQUEUE_TIMEOUT: Duration = Duration::from_millis(100);
@@ -42,6 +43,45 @@ async fn enqueue_op(sender: &mpsc::Sender<DbOp>, op: DbOp) -> Result<(), axum::r
         )
             .into_response()),
     }
+}
+
+fn enqueue_compress(state: &AppState, team_id: i64, hint: CompressHint) {
+    let sender = state.sender_for(team_id).clone();
+    tokio::spawn(async move {
+        for attempt in 0u64..3 {
+            let (reply_tx, _reply_rx) = oneshot::channel();
+            let op = DbOp::CompressPath {
+                team_id,
+                distinct_id: hint.distinct_id.clone(),
+                depth: hint.depth,
+                reply: reply_tx,
+            };
+            match tokio::time::timeout(ENQUEUE_TIMEOUT, sender.send(op)).await {
+                Ok(Ok(())) => return,
+                Ok(Err(_)) => {
+                    tracing::error!(
+                        team_id,
+                        distinct_id = %hint.distinct_id,
+                        depth = hint.depth,
+                        "compress enqueue failed: worker closed"
+                    );
+                    return;
+                }
+                Err(_) => {
+                    if attempt < 2 {
+                        tokio::time::sleep(Duration::from_millis(50 * (attempt + 1))).await;
+                    } else {
+                        tracing::error!(
+                            team_id,
+                            distinct_id = %hint.distinct_id,
+                            depth = hint.depth,
+                            "compress enqueue failed after 3 attempts"
+                        );
+                    }
+                }
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -99,7 +139,12 @@ pub async fn identify(
     }
 
     match reply_rx.await {
-        Ok(Ok(resp)) => (StatusCode::OK, Json(serde_json::json!(resp))).into_response(),
+        Ok(Ok((resp, hint))) => {
+            if let Some(hint) = hint {
+                enqueue_compress(&state, team_id, hint);
+            }
+            (StatusCode::OK, Json(serde_json::json!(resp))).into_response()
+        }
         Ok(Err(e)) => db_error_response(e),
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -132,7 +177,12 @@ pub async fn alias(
     }
 
     match reply_rx.await {
-        Ok(Ok(resp)) => (StatusCode::OK, Json(serde_json::json!(resp))).into_response(),
+        Ok(Ok((resp, hint))) => {
+            if let Some(hint) = hint {
+                enqueue_compress(&state, team_id, hint);
+            }
+            (StatusCode::OK, Json(serde_json::json!(resp))).into_response()
+        }
         Ok(Err(e)) => db_error_response(e),
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -165,7 +215,12 @@ pub async fn merge(
     }
 
     match reply_rx.await {
-        Ok(Ok(resp)) => (StatusCode::OK, Json(serde_json::json!(resp))).into_response(),
+        Ok(Ok((resp, hint))) => {
+            if let Some(hint) = hint {
+                enqueue_compress(&state, team_id, hint);
+            }
+            (StatusCode::OK, Json(serde_json::json!(resp))).into_response()
+        }
         Ok(Err(e)) => db_error_response(e),
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -198,7 +253,12 @@ pub async fn batched_merge(
     }
 
     match reply_rx.await {
-        Ok(Ok(resp)) => (StatusCode::OK, Json(serde_json::json!(resp))).into_response(),
+        Ok(Ok((resp, hint))) => {
+            if let Some(hint) = hint {
+                enqueue_compress(&state, team_id, hint);
+            }
+            (StatusCode::OK, Json(serde_json::json!(resp))).into_response()
+        }
         Ok(Err(e)) => db_error_response(e),
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,

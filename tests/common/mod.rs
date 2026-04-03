@@ -483,7 +483,9 @@ pub async fn handle_alias(
     target: &str,
     source: &str,
 ) -> DbResult<AliasResponse> {
-    db::handle_alias(pool, team_id, target, source).await
+    db::handle_alias(pool, team_id, target, source, i32::MAX)
+        .await
+        .map(|(r, _)| r)
 }
 
 pub async fn handle_merge(
@@ -492,7 +494,9 @@ pub async fn handle_merge(
     target: &str,
     sources: &[String],
 ) -> DbResult<MergeResponse> {
-    db::handle_merge(pool, team_id, target, sources).await
+    db::handle_merge(pool, team_id, target, sources, i32::MAX)
+        .await
+        .map(|(r, _)| r)
 }
 
 pub async fn handle_batched_merge(
@@ -501,7 +505,9 @@ pub async fn handle_batched_merge(
     target: &str,
     sources: &[String],
 ) -> DbResult<MergeResponse> {
-    db::handle_batched_merge(pool, team_id, target, sources).await
+    db::handle_batched_merge(pool, team_id, target, sources, i32::MAX)
+        .await
+        .map(|(r, _)| r)
 }
 
 pub async fn resolve(

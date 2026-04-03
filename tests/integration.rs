@@ -2274,11 +2274,119 @@ async fn compress_nonexistent_did_is_noop() {
     );
 }
 
-// Tests for CompressHint return from mutations were removed: mutations no
-// longer return compression hints (read-side lazy compression only).
-// Removed: alias_returns_compress_hint_above_threshold,
-//          alias_no_compress_hint_below_threshold,
-//          merge_returns_compress_hint_above_threshold.
+#[tokio::test]
+async fn alias_returns_compress_hint_above_threshold() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let root = db::handle_create(&pool, t, "h0").await.unwrap();
+    let root_uuid = root.person_uuid;
+    for i in 1..=10 {
+        let prev = format!("h{}", i - 1);
+        let curr = format!("h{i}");
+        handle_alias(&pool, t, &prev, &curr).await.unwrap();
+    }
+
+    db::handle_create(&pool, t, "h-other").await.unwrap();
+
+    let (resp, hint) = db::handle_alias(&pool, t, "h10", "h-other", 5)
+        .await
+        .unwrap();
+    assert!(
+        hint.is_some(),
+        "should return CompressHint when combined depth > threshold"
+    );
+    let hint = hint.unwrap();
+    assert!(hint.depth > 5);
+    assert_eq!(hint.distinct_id, "h-other");
+    assert_eq!(resp.person_uuid, root_uuid, "alias should resolve to target's person");
+
+    // h-other was linked to h10, verify full chain composition
+    let expected: Vec<&str> = vec![
+        "h-other", "h10", "h9", "h8", "h7", "h6", "h5", "h4", "h3", "h2", "h1", "h0",
+    ];
+    assert_chain_matches(&pool, t, "h-other", &expected, &root_uuid).await;
+
+    // h10 still resolves through the original chain
+    let h10_expected: Vec<&str> = vec![
+        "h10", "h9", "h8", "h7", "h6", "h5", "h4", "h3", "h2", "h1", "h0",
+    ];
+    assert_chain_matches(&pool, t, "h10", &h10_expected, &root_uuid).await;
+
+    // root is still root
+    assert_chain_is_root(&pool, t, "h0", &root_uuid).await;
+
+    assert_all_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn alias_no_compress_hint_below_threshold() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let root_a = db::handle_create(&pool, t, "lo-a").await.unwrap();
+    db::handle_create(&pool, t, "lo-b").await.unwrap();
+
+    let (resp, hint) = db::handle_alias(&pool, t, "lo-a", "lo-b", 20)
+        .await
+        .unwrap();
+    assert!(
+        hint.is_none(),
+        "should not return CompressHint for short chains"
+    );
+    assert_eq!(resp.person_uuid, root_a.person_uuid, "should resolve to target's person");
+
+    // lo-b was linked to lo-a: chain is lo-b → lo-a (root)
+    assert_chain_matches(&pool, t, "lo-b", &["lo-b", "lo-a"], &root_a.person_uuid).await;
+    assert_chain_is_root(&pool, t, "lo-a", &root_a.person_uuid).await;
+
+    assert_all_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn merge_returns_compress_hint_above_threshold() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let root = db::handle_create(&pool, t, "mg0").await.unwrap();
+    let root_uuid = root.person_uuid;
+    for i in 1..=10 {
+        let prev = format!("mg{}", i - 1);
+        let curr = format!("mg{i}");
+        handle_alias(&pool, t, &prev, &curr).await.unwrap();
+    }
+
+    db::handle_create(&pool, t, "mg-src").await.unwrap();
+
+    let (resp, hint) = db::handle_merge(&pool, t, "mg10", &["mg-src".into()], 5)
+        .await
+        .unwrap();
+    assert!(
+        hint.is_some(),
+        "merge should return CompressHint when combined depth > threshold"
+    );
+    let hint = hint.unwrap();
+    assert!(hint.depth > 5);
+    assert_eq!(hint.distinct_id, "mg-src");
+    assert_eq!(resp.person_uuid, root_uuid, "merge should resolve to target's person");
+
+    // mg-src was linked to mg10's pk; full chain: mg-src → mg10 → mg9 → ... → mg0
+    let expected: Vec<&str> = vec![
+        "mg-src", "mg10", "mg9", "mg8", "mg7", "mg6", "mg5", "mg4", "mg3", "mg2", "mg1", "mg0",
+    ];
+    assert_chain_matches(&pool, t, "mg-src", &expected, &root_uuid).await;
+
+    // mg10 still resolves through the original chain
+    let mg10_expected: Vec<&str> = vec![
+        "mg10", "mg9", "mg8", "mg7", "mg6", "mg5", "mg4", "mg3", "mg2", "mg1", "mg0",
+    ];
+    assert_chain_matches(&pool, t, "mg10", &mg10_expected, &root_uuid).await;
+
+    // root is still root
+    assert_chain_is_root(&pool, t, "mg0", &root_uuid).await;
+
+    assert_all_invariants(&pool, t).await;
+}
 
 #[tokio::test]
 async fn compress_mid_chain_only_flattens_below() {
@@ -2876,9 +2984,50 @@ async fn batched_merge_with_deleted_source() {
     assert_structural_invariants(&pool, t).await;
 }
 
-// Test for CompressHint return from batched_merge was removed: mutations no
-// longer return compression hints (read-side lazy compression only).
-// Removed: batched_merge_returns_compress_hint_above_threshold.
+#[tokio::test]
+async fn batched_merge_returns_compress_hint_above_threshold() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let root = db::handle_create(&pool, t, "mg0").await.unwrap();
+    let root_uuid = root.person_uuid;
+    for i in 1..=10 {
+        let prev = format!("mg{}", i - 1);
+        let curr = format!("mg{i}");
+        handle_alias(&pool, t, &prev, &curr).await.unwrap();
+    }
+
+    db::handle_create(&pool, t, "mg-src").await.unwrap();
+
+    let (resp, hint) = db::handle_batched_merge(&pool, t, "mg10", &["mg-src".into()], 5)
+        .await
+        .unwrap();
+    assert!(
+        hint.is_some(),
+        "batched_merge should return CompressHint when combined depth > threshold"
+    );
+    let hint = hint.unwrap();
+    assert!(hint.depth > 5);
+    assert_eq!(hint.distinct_id, "mg-src");
+    assert_eq!(resp.person_uuid, root_uuid, "batched merge should resolve to target's person");
+
+    // mg-src was linked to mg10's pk; full chain: mg-src → mg10 → mg9 → ... → mg0
+    let expected: Vec<&str> = vec![
+        "mg-src", "mg10", "mg9", "mg8", "mg7", "mg6", "mg5", "mg4", "mg3", "mg2", "mg1", "mg0",
+    ];
+    assert_chain_matches(&pool, t, "mg-src", &expected, &root_uuid).await;
+
+    // mg10 still resolves through the original chain
+    let mg10_expected: Vec<&str> = vec![
+        "mg10", "mg9", "mg8", "mg7", "mg6", "mg5", "mg4", "mg3", "mg2", "mg1", "mg0",
+    ];
+    assert_chain_matches(&pool, t, "mg10", &mg10_expected, &root_uuid).await;
+
+    // root is still root
+    assert_chain_is_root(&pool, t, "mg0", &root_uuid).await;
+
+    assert_all_invariants(&pool, t).await;
+}
 
 // ===========================================================================
 // Batched merge — new tests specific to batched behavior

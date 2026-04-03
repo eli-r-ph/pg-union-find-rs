@@ -6,7 +6,7 @@ A Postgres-backed union-find service for person/distinct_id resolution, modeled 
 
 - **Three tables:** `person_mapping`, `distinct_id_mappings`, `union_find` -- the union_find table forms a linked chain of distinct_id PKs traversed by a recursive CTE. Root rows carry the `person_id`.
 - **Worker pool:** HTTP handlers partition operations by `team_id` into N bounded channels, serializing same-team writes while different teams run in parallel. Write enqueue uses a 100ms timeout, returning 503 if the queue is full.
-- **Path compression:** After resolve operations that traverse chains deeper than `PATH_COMPRESS_THRESHOLD`, a background task compresses the chain to reduce future traversal cost.
+- **Path compression:** Write operations (`/alias`, `/identify`, `/merge`, `/batched_merge`) return a `CompressHint` when the combined chain depth exceeds `PATH_COMPRESS_THRESHOLD`; the handler enqueues compression with retry. Read operations (`/resolve`) use fire-and-forget `try_send`. Both paths trigger a background task that flattens the chain to reduce future traversal cost.
 
 ### Schema
 

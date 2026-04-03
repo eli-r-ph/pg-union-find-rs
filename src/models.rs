@@ -128,6 +128,16 @@ impl From<sqlx::Error> for DbError {
 }
 
 // ---------------------------------------------------------------------------
+// Compression hint — returned by mutations to signal a chain needs compression.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct CompressHint {
+    pub distinct_id: String,
+    pub depth: i32,
+}
+
+// ---------------------------------------------------------------------------
 // Channel protocol — the single-threaded worker processes these sequentially.
 // ---------------------------------------------------------------------------
 
@@ -143,19 +153,19 @@ pub enum DbOp {
         team_id: i64,
         target: String,
         source: String,
-        reply: oneshot::Sender<DbResult<AliasResponse>>,
+        reply: oneshot::Sender<DbResult<(AliasResponse, Option<CompressHint>)>>,
     },
     Merge {
         team_id: i64,
         target: String,
         sources: Vec<String>,
-        reply: oneshot::Sender<DbResult<MergeResponse>>,
+        reply: oneshot::Sender<DbResult<(MergeResponse, Option<CompressHint>)>>,
     },
     BatchedMerge {
         team_id: i64,
         target: String,
         sources: Vec<String>,
-        reply: oneshot::Sender<DbResult<MergeResponse>>,
+        reply: oneshot::Sender<DbResult<(MergeResponse, Option<CompressHint>)>>,
     },
     DeletePerson {
         team_id: i64,

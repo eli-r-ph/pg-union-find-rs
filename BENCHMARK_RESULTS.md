@@ -32,7 +32,7 @@ This service implements a union-find data structure backed by Postgres for manag
 | Per-source merge serial SQL | **Critical** | `/merge` | 10× serial CTE + UPDATE cycles per batch; 4.0× slower than batched path |
 | Dead tuple bloat (person\_mapping) | **Critical** | All writes | 82.6% dead tuples after benchmark; merges generate 1 dead tuple per source |
 | Dead tuple bloat (union\_find) | **High** | All writes | 46.6% dead tuples; root updates on merge can't use HOT (indexed columns change) |
-| Chain depth growth | **High** | `/resolve` | Path compression triggers lazily at depth ≥20; unbounded depth between compressions adds ~0.028ms/hop |
+| Chain depth growth | **High** | `/resolve` | Path compression triggers at depth ≥20 on both writes and reads; unbounded depth between compressions adds ~0.028ms/hop |
 | p99 latency cliff on writes | **Medium** | `/create`, `/alias`, `/delete_*` | p99 jumps 10-40× above p50 (e.g. create: 4ms → 162ms); Docker Desktop tmpfs I/O scheduling artifact |
 | `idx_person_mapping_lookup` sizing | **Medium** | `/resolve_distinct_ids` | 31 MB for 110K scans (296 bytes/scan); varchar(200) UUID bloats index at scale |
 | Single-table design | **Medium** | All at scale | No partition pruning; B-tree depth grows with row count; vacuum contention |
@@ -56,7 +56,7 @@ The design is **viable for production at scale** with the right operational conf
 
 This fits on a single vertically scaled instance with 1TB storage. With 64 hash partitions on `team_id`, each partition holds ~6.4GB — small enough for per-partition `VACUUM FULL` during off-peak windows.
 
-**Chain depth is the critical scaling risk.** The benchmark's average chain depth of 2.76 (p50=2, p95=11, p99=16, max=20 post-compression) is manageable. But with billions of DIDs and continuous merges, chains could grow past the compression threshold between resolve-triggered compressions. Each additional hop adds ~0.028ms of CTE execution time. At depth 100 that's ~2.96ms per resolve — still fast but 1.7x the current p50. A background compaction job (periodic per-team full-tree flattening) is essential to guarantee O(1) resolve latency regardless of merge history.
+**Chain depth is the critical scaling risk.** The benchmark's average chain depth of 2.76 (p50=2, p95=11, p99=16, max=20 post-compression) is manageable. But with billions of DIDs and continuous merges, chains could grow past the compression threshold between compressions. Path compression is triggered on both writes (via `CompressHint` when combined chain depth exceeds the threshold) and reads (fire-and-forget `try_send` on `/resolve`). Each additional hop adds ~0.028ms of CTE execution time. At depth 100 that's ~2.96ms per resolve — still fast but 1.7x the current p50. A background compaction job (periodic per-team full-tree flattening) is essential to guarantee O(1) resolve latency regardless of merge history.
 
 **WAL and checkpoint pressure.** The benchmark generated 490MB of WAL across 6.2M WAL records with `synchronous_commit=off`. In production with full durability enabled, WAL write latency adds ~0.5-2ms per commit depending on storage. With NVMe SSDs and `wal_compression=lz4`, a production instance could sustain the write throughput without WAL being the bottleneck. Group commit (`commit_delay=200us`, `commit_siblings=5`) amortizes fsync across concurrent transactions.
 
@@ -201,7 +201,7 @@ Sampled chain depth statistics (10 teams, 44,039 nodes post-benchmark):
 | p99 | 16 |
 | Max | 20 |
 
-The max of 20 (rather than 100, the configured maximum) confirms that path compression triggered by `/resolve` (threshold=20) is successfully flattening deep chains during the read phase.
+The max of 20 (rather than 100, the configured maximum) confirms that path compression (threshold=20), triggered on both writes and reads, is successfully flattening deep chains.
 
 ---
 
@@ -473,7 +473,7 @@ The current `BENCH_BATCH=10` was chosen conservatively. Batched merge amortizes 
 
 ### I3: Background path compaction (critical for production)
 
-Path compression triggers lazily on reads when depth exceeds `PATH_COMPRESS_THRESHOLD=20`. At production scale with billions of DIDs, a periodic background job (per team, off-peak) that flattens all chains to depth 1 would guarantee O(1) resolve latency. This is the most important operational requirement.
+Path compression triggers on both writes (via `CompressHint` with retry) and reads (fire-and-forget `try_send`) when chain depth exceeds `PATH_COMPRESS_THRESHOLD=20`. At production scale with billions of DIDs, this reactive approach may not keep chains short enough. A periodic background job (per team, off-peak) that flattens all chains to depth 1 would guarantee O(1) resolve latency. This is the most important operational requirement.
 
 ### I4: Autovacuum tuning for merge churn (critical for production)
 

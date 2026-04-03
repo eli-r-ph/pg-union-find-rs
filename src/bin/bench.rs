@@ -783,7 +783,7 @@ async fn phase_chain_deepen(
         set.spawn(async move {
             for chain in &chains {
                 for i in 0..chain.len().saturating_sub(1) {
-                    db::handle_merge(&pool, team_id, &chain[i + 1], &[chain[i].clone()])
+                    db::handle_merge(&pool, team_id, &chain[i + 1], &[chain[i].clone()], i32::MAX)
                         .await
                         .expect("chain deepen merge failed");
                 }
