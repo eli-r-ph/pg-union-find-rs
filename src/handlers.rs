@@ -49,12 +49,11 @@ fn enqueue_compress(state: &AppState, team_id: i64, hint: CompressHint) {
     let sender = state.sender_for(team_id).clone();
     tokio::spawn(async move {
         for attempt in 0u64..3 {
-            let (reply_tx, _reply_rx) = oneshot::channel();
             let op = DbOp::CompressPath {
                 team_id,
                 distinct_id: hint.distinct_id.clone(),
                 depth: hint.depth,
-                reply: reply_tx,
+                reply: None,
             };
             match tokio::time::timeout(ENQUEUE_TIMEOUT, sender.send(op)).await {
                 Ok(Ok(())) => return,
@@ -354,14 +353,13 @@ pub async fn resolve(
     match db::resolve(&state.pool, req.team_id, &req.distinct_id).await {
         Ok(Some((person, depth))) => {
             if depth > state.compress_threshold {
-                let (reply_tx, _) = oneshot::channel();
                 if state
                     .sender_for(req.team_id)
                     .try_send(DbOp::CompressPath {
                         team_id: req.team_id,
                         distinct_id: req.distinct_id.clone(),
                         depth,
-                        reply: reply_tx,
+                        reply: None,
                     })
                     .is_err()
                 {

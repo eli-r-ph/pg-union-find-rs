@@ -202,7 +202,9 @@ pub async fn worker_loop(pool: PgPool, mut rx: mpsc::Receiver<DbOp>, compress_th
                 if let Err(ref e) = result {
                     tracing::error!(team_id, %distinct_id, depth, %e, "path compression failed");
                 }
-                let _ = reply.send(result);
+                if let Some(reply) = reply {
+                    let _ = reply.send(result);
+                }
             }
         }
     }
@@ -1011,6 +1013,11 @@ pub async fn handle_merge(
         validate_distinct_id(src)?;
     }
 
+    let unique_sources: Vec<&String> = {
+        let mut seen = std::collections::HashSet::new();
+        sources.iter().filter(|s| seen.insert(s.as_str())).collect()
+    };
+
     let mut tx = pool.begin().await?;
 
     let (target_pk, target_person_id, target_person_uuid, target_depth) =
@@ -1041,7 +1048,7 @@ pub async fn handle_merge(
     let mut max_combined_depth = 0i32;
     let mut deepest_source: Option<String> = None;
 
-    for src in sources {
+    for src in unique_sources {
         match check_did(&mut tx, team_id, src).await? {
             DidState::NotFound => {
                 insert_did_and_link(&mut tx, team_id, src, target_pk).await?;
@@ -1393,14 +1400,14 @@ pub async fn handle_delete_distinct_id(
         .await?;
 
         if !still_referenced {
-            sqlx::query(
+            let result = sqlx::query(
                 "UPDATE person_mapping SET deleted_at = now() \
                  WHERE person_id = $1 AND deleted_at IS NULL",
             )
             .bind(pid)
             .execute(&mut *tx)
             .await?;
-            person_deleted = true;
+            person_deleted = result.rows_affected() > 0;
         }
     }
 

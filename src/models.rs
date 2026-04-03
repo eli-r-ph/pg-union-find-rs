@@ -181,6 +181,6 @@ pub enum DbOp {
         team_id: i64,
         distinct_id: String,
         depth: i32,
-        reply: oneshot::Sender<DbResult<()>>,
+        reply: Option<oneshot::Sender<DbResult<()>>>,
     },
 }

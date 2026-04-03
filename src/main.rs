@@ -36,7 +36,8 @@ async fn main() {
     let pool_size = env_usize("WORKER_POOL_SIZE", 64);
     let channel_capacity = env_usize("WORKER_CHANNEL_CAPACITY", 64);
     let compress_threshold = env_usize("PATH_COMPRESS_THRESHOLD", 20) as i32;
-    let max_conns = (pool_size + 1) as u32;
+    let read_pool_size = env_usize("READ_POOL_SIZE", 4);
+    let max_conns = (pool_size + read_pool_size) as u32;
 
     if pool_size == 0 {
         tracing::error!("WORKER_POOL_SIZE must be >= 1");
@@ -74,6 +75,7 @@ async fn main() {
         pool_size,
         channel_capacity,
         compress_threshold,
+        read_pool_size,
         max_conns,
         "spawned workers"
     );

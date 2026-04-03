@@ -3709,3 +3709,289 @@ async fn resolve_distinct_ids_after_delete_did() {
 
     assert_all_invariants(&pool, t).await;
 }
+
+// ===========================================================================
+// 3a. delete_person then delete_distinct_id on same chain
+// ===========================================================================
+
+#[tokio::test]
+async fn delete_person_then_delete_distinct_id() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let created = db::handle_create(&pool, t, "a").await.unwrap();
+    handle_alias(&pool, t, "a", "b").await.unwrap();
+
+    assert_chain_is_root(&pool, t, "a", &created.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &created.person_uuid).await;
+
+    let chain = collect_chain(&pool, t, "a").await;
+    let pid = chain[0].person_id.unwrap();
+
+    db::handle_delete_person(&pool, t, &created.person_uuid)
+        .await
+        .unwrap();
+
+    assert!(is_person_deleted(&pool, pid).await);
+
+    let resp = db::handle_delete_distinct_id(&pool, t, "a").await.unwrap();
+    assert_eq!(resp.distinct_id, "a");
+    assert!(
+        !resp.person_deleted,
+        "person was already soft-deleted, person_deleted should be false"
+    );
+
+    let resolved = resolve(&pool, t, "b").await.unwrap();
+    assert!(
+        resolved.is_none(),
+        "b should still be orphaned after deleting root 'a'"
+    );
+
+    let new = db::handle_create(&pool, t, "b").await.unwrap();
+    assert_ne!(new.person_uuid, created.person_uuid);
+
+    let resolved = resolve(&pool, t, "b").await.unwrap();
+    assert!(resolved.is_some());
+    assert_eq!(resolved.unwrap().person_uuid, new.person_uuid);
+
+    assert_structural_invariants(&pool, t).await;
+}
+
+// ===========================================================================
+// 3c. Concurrency / worker serialization tests
+// ===========================================================================
+
+#[tokio::test]
+async fn worker_routing_by_team_id() {
+    use pg_union_find_rs::handlers::AppState;
+    use pg_union_find_rs::models::DbOp;
+    use std::sync::Arc;
+    use tokio::sync::{mpsc, oneshot};
+
+    let pool = test_pool().await;
+    let num_workers = 4usize;
+    let channel_capacity = 64;
+    let compress_threshold = i32::MAX;
+
+    let mut senders = Vec::with_capacity(num_workers);
+    for _ in 0..num_workers {
+        let (tx, rx) = mpsc::channel(channel_capacity);
+        let worker_pool = pool.clone();
+        tokio::spawn(async move {
+            db::worker_loop(worker_pool, rx, compress_threshold).await;
+        });
+        senders.push(tx);
+    }
+
+    let state = AppState {
+        workers: Arc::from(senders.into_boxed_slice()),
+        pool: pool.clone(),
+        compress_threshold,
+    };
+
+    let mut handles = Vec::new();
+    for team_id in 0i64..8 {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let did = format!("routing-{team_id}");
+        let op = DbOp::Create {
+            team_id,
+            distinct_id: did,
+            reply: reply_tx,
+        };
+        let sender = state.workers[(team_id as u64 as usize) % num_workers].clone();
+        sender.send(op).await.unwrap();
+        handles.push((team_id, reply_rx));
+    }
+
+    for (team_id, reply_rx) in handles {
+        let result = reply_rx.await.unwrap();
+        assert!(
+            result.is_ok(),
+            "team_id {team_id} create should succeed: {:?}",
+            result
+        );
+    }
+
+    for team_id in 0i64..8 {
+        let did = format!("routing-{team_id}");
+        let resolved = resolve(&pool, team_id, &did).await.unwrap();
+        assert!(resolved.is_some(), "routing-{team_id} should be resolvable");
+    }
+}
+
+#[tokio::test]
+async fn worker_serialization_prevents_races() {
+    use pg_union_find_rs::handlers::AppState;
+    use pg_union_find_rs::models::DbOp;
+    use std::sync::Arc;
+    use tokio::sync::{mpsc, oneshot};
+
+    let pool = test_pool().await;
+    let t = next_team_id();
+    let num_workers = 2usize;
+    let channel_capacity = 128;
+    let compress_threshold = i32::MAX;
+
+    let mut senders = Vec::with_capacity(num_workers);
+    for _ in 0..num_workers {
+        let (tx, rx) = mpsc::channel(channel_capacity);
+        let worker_pool = pool.clone();
+        tokio::spawn(async move {
+            db::worker_loop(worker_pool, rx, compress_threshold).await;
+        });
+        senders.push(tx);
+    }
+
+    let state = AppState {
+        workers: Arc::from(senders.into_boxed_slice()),
+        pool: pool.clone(),
+        compress_threshold,
+    };
+
+    db::handle_create(&pool, t, "root").await.unwrap();
+
+    let sender = state.workers[(t as u64 as usize) % num_workers].clone();
+    let mut handles = Vec::new();
+    for i in 0..50 {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let source = format!("src-{i}");
+        let op = DbOp::Alias {
+            team_id: t,
+            target: "root".into(),
+            source,
+            reply: reply_tx,
+        };
+        sender.send(op).await.unwrap();
+        handles.push(reply_rx);
+    }
+
+    for rx in handles {
+        let result = rx.await.unwrap();
+        assert!(result.is_ok(), "alias should succeed: {:?}", result);
+    }
+
+    for i in 0..50 {
+        let did = format!("src-{i}");
+        let resolved = resolve(&pool, t, &did).await.unwrap();
+        assert!(resolved.is_some(), "{did} should be resolvable");
+    }
+
+    assert_all_invariants(&pool, t).await;
+}
+
+#[tokio::test]
+async fn worker_backpressure_returns_full() {
+    use pg_union_find_rs::models::DbOp;
+    use tokio::sync::{mpsc, oneshot};
+
+    let pool = test_pool().await;
+    let t = next_team_id();
+    let channel_capacity = 1;
+    let compress_threshold = i32::MAX;
+
+    let (tx, rx) = mpsc::channel(channel_capacity);
+    let worker_pool = pool.clone();
+    tokio::spawn(async move {
+        db::worker_loop(worker_pool, rx, compress_threshold).await;
+    });
+
+    let (block_tx, block_rx) = oneshot::channel();
+    let blocking_op = DbOp::Create {
+        team_id: t,
+        distinct_id: "blocker".into(),
+        reply: block_tx,
+    };
+    tx.send(blocking_op).await.unwrap();
+    let _ = block_rx.await;
+
+    let mut overflows = 0;
+    for i in 0..10 {
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        let op = DbOp::Create {
+            team_id: t,
+            distinct_id: format!("overflow-{i}"),
+            reply: reply_tx,
+        };
+        if tx.try_send(op).is_err() {
+            overflows += 1;
+        }
+    }
+
+    assert!(
+        overflows > 0,
+        "expected some ops to be rejected due to backpressure, but all were accepted"
+    );
+}
+
+// ===========================================================================
+// 3e. batched_merge with orphaned target AND orphaned sources
+// ===========================================================================
+
+#[tokio::test]
+async fn batched_merge_orphaned_target_and_sources() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let pa = db::handle_create(&pool, t, "a").await.unwrap();
+    let pb = db::handle_create(&pool, t, "b").await.unwrap();
+    let pc = db::handle_create(&pool, t, "c").await.unwrap();
+
+    db::handle_delete_person(&pool, t, &pa.person_uuid)
+        .await
+        .unwrap();
+    db::handle_delete_person(&pool, t, &pb.person_uuid)
+        .await
+        .unwrap();
+    db::handle_delete_person(&pool, t, &pc.person_uuid)
+        .await
+        .unwrap();
+
+    for did in &["a", "b", "c"] {
+        let resolved = resolve(&pool, t, did).await.unwrap();
+        assert!(resolved.is_none(), "{did} should be orphaned after delete");
+    }
+
+    let resp = handle_batched_merge(&pool, t, "a", &["b".into(), "c".into()])
+        .await
+        .unwrap();
+    assert_ne!(resp.person_uuid, pa.person_uuid);
+    assert_ne!(resp.person_uuid, pb.person_uuid);
+    assert_ne!(resp.person_uuid, pc.person_uuid);
+    assert!(resp.is_identified);
+
+    assert_chain_is_root(&pool, t, "a", &resp.person_uuid).await;
+    assert_chain_matches(&pool, t, "b", &["b", "a"], &resp.person_uuid).await;
+    assert_chain_matches(&pool, t, "c", &["c", "a"], &resp.person_uuid).await;
+
+    assert_structural_invariants(&pool, t).await;
+}
+
+// ===========================================================================
+// 3f. alias(x, x) where x is orphaned
+// ===========================================================================
+
+#[tokio::test]
+async fn alias_target_eq_source_orphaned() {
+    let pool = test_pool().await;
+    let t = next_team_id();
+
+    let old = db::handle_create(&pool, t, "x").await.unwrap();
+    db::handle_delete_person(&pool, t, &old.person_uuid)
+        .await
+        .unwrap();
+
+    let resolved = resolve(&pool, t, "x").await.unwrap();
+    assert!(resolved.is_none(), "x should be orphaned after delete");
+
+    let resp = handle_alias(&pool, t, "x", "x").await.unwrap();
+    assert_ne!(resp.person_uuid, old.person_uuid);
+    assert!(resp.is_identified);
+
+    assert_chain_is_root(&pool, t, "x", &resp.person_uuid).await;
+
+    let chain = collect_chain(&pool, t, "x").await;
+    assert_eq!(chain.len(), 1);
+    assert!(is_person_identified(&pool, chain[0].person_id.unwrap()).await);
+
+    assert_structural_invariants(&pool, t).await;
+}

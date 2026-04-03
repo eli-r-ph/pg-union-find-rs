@@ -67,6 +67,7 @@ Server configuration via env vars:
 | `WORKER_POOL_SIZE` | 64 | Number of per-team worker channels |
 | `WORKER_CHANNEL_CAPACITY` | 64 | Bounded channel capacity per worker |
 | `PATH_COMPRESS_THRESHOLD` | 20 | Chain depth that triggers background compression |
+| `READ_POOL_SIZE` | 4 | Extra DB connections reserved for read-only endpoints (`/resolve`, `/resolve_distinct_ids`) |
 
 ## Scripts
 
