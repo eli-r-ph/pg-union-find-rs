@@ -11,6 +11,11 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+# Cursor's sandbox sets CARGO_TARGET_DIR to a temp cache, which causes cargo
+# to write binaries there while this script runs them from ./target/release/.
+# Unsetting it ensures cargo writes to the default ./target/ directory.
+unset CARGO_TARGET_DIR
+
 export DATABASE_URL="${DATABASE_URL:-postgres://postgres:postgres@localhost:54320/union_find}"
 PG_HOST=localhost
 PG_PORT=54320
