@@ -12,7 +12,7 @@ A Postgres-backed union-find service for person/distinct_id resolution, modeled 
 
 ```
 person_mapping:       person_id (PK bigserial), team_id, person_uuid
-distinct_id_mappings: id (PK bigserial), team_id, distinct_id, is_identified, deleted_at
+distinct_id_mappings: id (PK bigserial), team_id, distinct_id
 union_find:           (team_id, current) PK, next (nullable), person_id (nullable)
 ```
 
@@ -32,8 +32,8 @@ union_find:           (team_id, current) PK, next (nullable), person_id (nullabl
 | POST | `/batched_merge` | `{ team_id, target, sources }` | Batched variant of `/merge` — same semantics, fewer DB round-trips |
 | POST | `/resolve` | `{ team_id, distinct_id }` | Resolve distinct_id to person_uuid via chain traversal |
 | POST | `/resolve_distinct_ids` | `{ team_id, person_uuid }` | Return all distinct_ids belonging to a person (capped at 10,000) |
-| POST | `/delete_person` | `{ team_id, person_uuid }` | Soft-delete a person and all associated distinct_ids |
-| POST | `/delete_distinct_id` | `{ team_id, distinct_id }` | Soft-delete a single distinct_id |
+| POST | `/delete_person` | `{ team_id, person_uuid }` | Soft-delete a person (distinct_ids become orphans, lazily cleaned up) |
+| POST | `/delete_distinct_id` | `{ team_id, distinct_id }` | Hard-delete a single distinct_id from the graph |
 
 ### Operation details
 
@@ -48,8 +48,8 @@ union_find:           (team_id, current) PK, next (nullable), person_id (nullabl
 - **`/batched_merge`**: Same request/response shape and semantics as `/merge`. Replaces per-source serial SQL with bulk lookups (`ANY()`), a single recursive CTE for all sources, and batch `INSERT`/`UPDATE`/`DELETE` statements. Reduces DB round-trips from O(N) to O(1) for typical batches.
 - **`/resolve`**: Walk union_find chain via recursive CTE to root, join person_mapping to return `person_uuid`. Triggers background path compression when chain depth exceeds threshold.
 - **`/resolve_distinct_ids`**: Reverse traversal — given a `person_uuid`, find the root node in `union_find`, then walk backward via a recursive CTE to collect all nodes whose chains lead to that root. Returns up to 10,000 distinct_id strings with an `is_truncated` flag. Like `/resolve`, bypasses the worker pool and reads directly from the connection pool. Returns 404 if the person is not found or was soft-deleted.
-- **`/delete_person`**: Sets `deleted_at` on all distinct_ids for the person and removes the person_mapping row.
-- **`/delete_distinct_id`**: Sets `deleted_at` on the distinct_id. If it was the last live distinct_id for its person, also removes the person_mapping row.
+- **`/delete_person`**: Sets `deleted_at` on the `person_mapping` row and the `union_find` root row. Distinct_ids are not eagerly cleaned up — they become orphans and are lazily detached by future write operations (see DESIGN.md).
+- **`/delete_distinct_id`**: Hard-deletes the `union_find` and `distinct_id_mappings` rows for the distinct_id (unlinks from chain first). If the deleted node was the last root for its person, the `person_mapping` row is soft-deleted as a side effect.
 
 ## Running
 

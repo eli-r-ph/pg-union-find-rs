@@ -31,11 +31,12 @@ cargo run --release --bin bench
 |-------|--------|-------------|
 | 1 — Warm-up | DB-direct | Batch-seed N persons across N teams (untimed) |
 | 1b — Create | POST /create | 80% new distinct_ids, 20% existing |
-| 2 — Alias | POST /alias | Mixed: 85% Case 1a, 5% Case 2a, 5% src=dest, 5% Case 3 |
+| 2 — Alias | POST /alias | Mixed: 90% Case 1a (target exists, source new), 5% src=dest, 5% Case 3 (neither exists) |
 | 3 — Merge | POST /merge | Seed + merge in sub-batches |
 | 3a — Batched Merge | POST /batched_merge | Same shape as Phase 3, separate seed, direct comparison |
 | 3b — Deepen | DB-direct | Build realistic chain depths (untimed) |
 | 4 — Read | POST /resolve | Random lookups of non-primary distinct_ids |
+| 4a — Resolve distinct IDs | POST /resolve_distinct_ids | Resolve person_uuids to their distinct_ids (80/20 hot-set bias) |
 | 5 — Delete distinct_id | POST /delete_distinct_id | Delete pre-seeded distinct_ids |
 | 6 — Delete person | POST /delete_person | Delete pre-seeded persons |
 
@@ -49,9 +50,8 @@ distinct_ids (write path: 3 table inserts in one transaction), 20% target
 existing distinct_ids (read path: simple SELECT).
 
 **Phase 2 (alias)** sends parallel `POST /alias` requests with a mixed case
-distribution: 85% Case 1a (target exists, source is new), 5% Case 2a (both
-exist, same person), 5% target==source (get-or-create shortcut), 5% Case 3
-(neither exists, create both).
+distribution: 90% Case 1a (target exists, source is new), 5% target==source
+(get-or-create shortcut), 5% Case 3 (neither exists, create both).
 
 **Phase 3 (merge)** first seeds N merge distinct_ids via direct DB (untimed),
 then sends parallel `POST /merge` requests in sub-batches of configurable size.
@@ -74,6 +74,11 @@ prior merge.
 non-primary distinct_ids. Reads bypass the worker channel and go direct to the
 DB pool.
 
+**Phase 4a (resolve_distinct_ids)** sends parallel `POST /resolve_distinct_ids`
+requests. Reuses persons created by prior phases — no additional seeding
+required. Targets are selected with 80/20 hot-set bias. Like `/resolve`, this
+bypasses the worker pool and reads directly from the connection pool.
+
 **Phase 5 (delete_distinct_id)** seeds N distinct_ids via direct DB (untimed),
 then sends parallel `POST /delete_distinct_id` requests.
 
@@ -95,6 +100,7 @@ Delete phases run last so they don't interfere with read/write benchmarks.
 | `BENCH_BATCH` | 10 | Phase 3/3a sub-batch size |
 | `BENCH_CHAIN_DEPTH` | 100 | Phase 3b max chain depth |
 | `BENCH_READS` | 1,000,000 | Phase 4 read count |
+| `BENCH_RESOLVE_DIDS` | 100,000 | Phase 4a resolve_distinct_ids count |
 | `BENCH_DELETE_DID` | 10,000 | Phase 5 delete_distinct_id count |
 | `BENCH_DELETE_PERSON` | 10,000 | Phase 6 delete_person count |
 | `BENCH_DB_POOL` | 50 | Max DB connections (seeding only) |

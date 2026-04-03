@@ -143,7 +143,7 @@ The CTE runs as a single SQL statement — Postgres handles the iteration intern
 - **Writes are serialized per shard.** Each worker task owns a bounded `mpsc` channel and processes operations strictly in FIFO order. `team_id % N` determines the shard, so writes for the same team are always serialized. Different teams on the same shard also serialize — an acceptable trade-off for simplicity.
 - **Reads bypass the worker pool.** `/resolve` and `/resolve_distinct_ids` acquire a connection directly from the Postgres pool and run read-only recursive CTEs. Reads scale independently and never block behind queued writes.
 - **Backpressure via bounded channels.** Each worker channel has a bounded capacity (default 64). Enqueue attempts timeout after 100ms, returning HTTP 503 rather than allowing unbounded memory growth.
-- **DB connection budget.** `max_connections = WORKER_POOL_SIZE + 1`. Each worker holds at most one connection; the +1 covers direct-pool reads.
+- **DB connection budget.** `max_connections = WORKER_POOL_SIZE + READ_POOL_SIZE`. Each worker holds at most one connection; the extra connections (default 4) cover direct-pool reads.
 
 ---
 
