@@ -36,6 +36,10 @@ services:
       - max_connections=200
       - -c
       - max_wal_size=1GB
+      # -- durability off: tmpfs + fsync=off + synchronous_commit=off means PG
+      #    never issues storage syscalls. Safe for benchmarking, not production.
+      - -c
+      - fsync=off
       - -c
       - synchronous_commit=off
       - -c
@@ -46,5 +50,9 @@ services:
       - full_page_writes=off
       - -c
       - checkpoint_timeout=15min
+      # -- disable autovacuum during benchmarks to eliminate lock interference.
+      #    The bench binary truncates all tables on start so bloat is bounded.
+      - -c
+      - autovacuum=off
     tmpfs:
       - /var/lib/postgresql/data:size=2G
