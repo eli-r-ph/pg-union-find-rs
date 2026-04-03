@@ -333,13 +333,13 @@ async fn unlink_did(conn: &mut PgConnection, team_id: i64, did_pk: i64) -> DbRes
 }
 
 /// Walk the union_find chain from a distinct_id PK to the root, returning
-/// the root's person_id, the corresponding person_uuid, and the chain depth.
+/// the root's person info, the root node's `current` PK, and the chain depth.
 async fn resolve_by_pk(
     conn: &mut PgConnection,
     team_id: i64,
     did_pk: i64,
-) -> DbResult<Option<(ResolvedPerson, i32)>> {
-    let row = sqlx::query_as::<_, (String, i64, bool, i32)>(
+) -> DbResult<Option<(ResolvedPerson, i64, i32)>> {
+    let row = sqlx::query_as::<_, (String, i64, bool, i64, i32)>(
         r#"
         WITH RECURSIVE walk(node, depth) AS (
             SELECT $2::bigint, 0
@@ -355,7 +355,7 @@ async fn resolve_by_pk(
         walk_result AS (
             SELECT node, depth FROM walk ORDER BY depth DESC LIMIT 1
         )
-        SELECT pm.person_uuid, uf.person_id, pm.is_identified, wr.depth
+        SELECT pm.person_uuid, uf.person_id, pm.is_identified, wr.node, wr.depth
         FROM walk_result wr
         JOIN union_find uf ON uf.team_id = $1 AND uf.current = wr.node
         JOIN person_mapping pm ON pm.person_id = uf.person_id
@@ -368,54 +368,19 @@ async fn resolve_by_pk(
     .fetch_optional(&mut *conn)
     .await?;
 
-    Ok(row.map(|(person_uuid, person_id, is_identified, depth)| {
-        (
-            ResolvedPerson {
-                person_uuid,
-                person_id,
-                is_identified,
-            },
-            depth,
-        )
-    }))
-}
-
-/// Walk the union_find chain from a distinct_id PK to the root, returning
-/// the root's (current, person_id, depth).
-async fn resolve_root(
-    conn: &mut PgConnection,
-    team_id: i64,
-    did_pk: i64,
-) -> DbResult<Option<(i64, i64, i32)>> {
-    let row = sqlx::query_as::<_, (i64, i64, i32)>(
-        r#"
-        WITH RECURSIVE walk(node, depth) AS (
-            SELECT $2::bigint, 0
-
-            UNION ALL
-
-            SELECT uf.next, w.depth + 1
-            FROM walk w
-            JOIN union_find uf
-              ON uf.team_id = $1 AND uf.current = w.node AND uf.person_id IS NULL
-            WHERE w.depth < 1000
-        ),
-        walk_result AS (
-            SELECT node, depth FROM walk ORDER BY depth DESC LIMIT 1
-        )
-        SELECT uf.current, uf.person_id, wr.depth
-        FROM walk_result wr
-        JOIN union_find uf ON uf.team_id = $1 AND uf.current = wr.node
-        WHERE uf.person_id IS NOT NULL
-          AND uf.deleted_at IS NULL
-        "#,
-    )
-    .bind(team_id)
-    .bind(did_pk)
-    .fetch_optional(&mut *conn)
-    .await?;
-
-    Ok(row)
+    Ok(row.map(
+        |(person_uuid, person_id, is_identified, root_current, depth)| {
+            (
+                ResolvedPerson {
+                    person_uuid,
+                    person_id,
+                    is_identified,
+                },
+                root_current,
+                depth,
+            )
+        },
+    ))
 }
 
 /// Batch-lookup multiple distinct_id strings, returning a map from
@@ -518,7 +483,9 @@ pub async fn resolve_tx(
         Some(pk) => pk,
         None => return Ok(None),
     };
-    resolve_by_pk(&mut *conn, team_id, did_pk).await
+    Ok(resolve_by_pk(&mut *conn, team_id, did_pk)
+        .await?
+        .map(|(person, _root_current, depth)| (person, depth)))
 }
 
 // ---------------------------------------------------------------------------
@@ -530,7 +497,8 @@ pub async fn resolve_tx(
 enum DidState {
     NotFound,
     Orphaned(i64),
-    Live(i64, ResolvedPerson, i32),
+    /// (did_pk, person, root_current, depth)
+    Live(i64, ResolvedPerson, i64, i32),
 }
 
 /// Check whether a distinct_id is missing, orphaned (exists but its person is
@@ -542,7 +510,9 @@ async fn check_did(conn: &mut PgConnection, team_id: i64, distinct_id: &str) -> 
         None => return Ok(DidState::NotFound),
     };
     match resolve_by_pk(&mut *conn, team_id, did_pk).await? {
-        Some((person, depth)) => Ok(DidState::Live(did_pk, person, depth)),
+        Some((person, root_current, depth)) => {
+            Ok(DidState::Live(did_pk, person, root_current, depth))
+        }
         None => {
             unlink_did(&mut *conn, team_id, did_pk).await?;
             Ok(DidState::Orphaned(did_pk))
@@ -662,7 +632,7 @@ pub async fn identify_tx(
     distinct_id: &str,
 ) -> DbResult<ResolvedPerson> {
     match check_did(&mut *conn, team_id, distinct_id).await? {
-        DidState::Live(_pk, resolved, _depth) => Ok(resolved),
+        DidState::Live(_pk, resolved, _root, _depth) => Ok(resolved),
 
         DidState::NotFound => {
             let person_uuid = Uuid::new_v4().to_string();
@@ -920,7 +890,10 @@ pub async fn handle_alias(
     let source_state = check_did(&mut tx, team_id, source).await?;
 
     let person_uuid = match (target_state, source_state) {
-        (DidState::Live(tpk, t_resolved, _t_depth), DidState::Live(spk, s_resolved, _s_depth)) => {
+        (
+            DidState::Live(tpk, t_resolved, _t_root, _t_depth),
+            DidState::Live(_spk, s_resolved, s_root, _s_depth),
+        ) => {
             if t_resolved.person_id == s_resolved.person_id {
                 set_identified(&mut tx, t_resolved.person_id).await?;
                 t_resolved.person_uuid
@@ -931,11 +904,7 @@ pub async fn handle_alias(
                     ));
                 }
 
-                let source_root = resolve_root(&mut tx, team_id, spk)
-                    .await?
-                    .ok_or_else(|| DbError::Internal("source chain has no root".into()))?;
-
-                link_root_to_target(&mut tx, team_id, source_root.0, source_root.1, tpk).await?;
+                link_root_to_target(&mut tx, team_id, s_root, s_resolved.person_id, tpk).await?;
 
                 set_identified(&mut tx, t_resolved.person_id).await?;
 
@@ -943,13 +912,13 @@ pub async fn handle_alias(
             }
         }
 
-        (DidState::Live(tpk, t_resolved, _t_depth), source_state) => {
+        (DidState::Live(tpk, t_resolved, _t_root, _t_depth), source_state) => {
             attach_did(&mut tx, team_id, source, source_state, tpk).await?;
             set_identified(&mut tx, t_resolved.person_id).await?;
             t_resolved.person_uuid
         }
 
-        (target_state, DidState::Live(spk, s_resolved, _s_depth)) => {
+        (target_state, DidState::Live(spk, s_resolved, _s_root, _s_depth)) => {
             attach_did(&mut tx, team_id, target, target_state, spk).await?;
             set_identified(&mut tx, s_resolved.person_id).await?;
             s_resolved.person_uuid
@@ -1021,7 +990,9 @@ pub async fn handle_merge(
                 root_did(&mut tx, team_id, pk, person_id).await?;
                 (pk, person_id, person_uuid)
             }
-            DidState::Live(pk, resolved, _depth) => (pk, resolved.person_id, resolved.person_uuid),
+            DidState::Live(pk, resolved, _root, _depth) => {
+                (pk, resolved.person_id, resolved.person_uuid)
+            }
         };
 
     for src in sources {
@@ -1032,19 +1003,10 @@ pub async fn handle_merge(
             DidState::Orphaned(pk) => {
                 link_did(&mut tx, team_id, pk, target_pk).await?;
             }
-            DidState::Live(spk, _, _s_depth) => {
-                let root = resolve_root(&mut tx, team_id, spk).await?;
-                match root {
-                    Some((_, root_person, _)) if root_person == target_person_id => {}
-                    Some((root_current, old_person, _)) => {
-                        link_root_to_target(&mut tx, team_id, root_current, old_person, target_pk)
-                            .await?;
-                    }
-                    None => {
-                        return Err(DbError::Internal(format!(
-                            "source '{src}' exists but chain has no root"
-                        )));
-                    }
+            DidState::Live(_spk, s_resolved, s_root, _s_depth) => {
+                if s_resolved.person_id != target_person_id {
+                    link_root_to_target(&mut tx, team_id, s_root, s_resolved.person_id, target_pk)
+                        .await?;
                 }
             }
         }
@@ -1105,7 +1067,9 @@ pub async fn handle_batched_merge(
                 root_did(&mut tx, team_id, pk, person_id).await?;
                 (pk, person_id, person_uuid)
             }
-            DidState::Live(pk, resolved, _depth) => (pk, resolved.person_id, resolved.person_uuid),
+            DidState::Live(pk, resolved, _root, _depth) => {
+                (pk, resolved.person_id, resolved.person_uuid)
+            }
         };
 
     if sources.is_empty() {
