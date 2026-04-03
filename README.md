@@ -64,8 +64,8 @@ Server configuration via env vars:
 | Env Var | Default | Description |
 |---------|---------|-------------|
 | `DATABASE_URL` | `postgres://postgres:postgres@localhost:54320/union_find` | Postgres connection string |
-| `WORKER_POOL_SIZE` | 100 | Number of per-team worker channels |
-| `WORKER_CHANNEL_CAPACITY` | 1024 | Bounded channel capacity per worker |
+| `WORKER_POOL_SIZE` | 64 | Number of per-team worker channels |
+| `WORKER_CHANNEL_CAPACITY` | 64 | Bounded channel capacity per worker |
 | `PATH_COMPRESS_THRESHOLD` | 20 | Chain depth that triggers background compression |
 
 ## Scripts

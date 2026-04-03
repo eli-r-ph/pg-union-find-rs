@@ -31,11 +31,21 @@ services:
       - -c
       - commit_delay=200
       - -c
-      - commit_siblings=20
+      - commit_siblings=5
       - -c
       - max_connections=200
       - -c
       - max_wal_size=1GB
+      - -c
+      - synchronous_commit=off
+      - -c
+      - wal_level=minimal
+      - -c
+      - max_wal_senders=0
+      - -c
+      - full_page_writes=off
+      - -c
+      - checkpoint_timeout=15min
     volumes:
       - pgdata:/var/lib/postgresql/data
 

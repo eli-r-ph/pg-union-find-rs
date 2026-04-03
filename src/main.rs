@@ -33,8 +33,8 @@ async fn main() {
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:54320/union_find".into());
 
-    let pool_size = env_usize("WORKER_POOL_SIZE", 100);
-    let channel_capacity = env_usize("WORKER_CHANNEL_CAPACITY", 1024);
+    let pool_size = env_usize("WORKER_POOL_SIZE", 64);
+    let channel_capacity = env_usize("WORKER_CHANNEL_CAPACITY", 64);
     let compress_threshold = env_usize("PATH_COMPRESS_THRESHOLD", 20) as i32;
     let max_conns = (pool_size + 1) as u32;
 

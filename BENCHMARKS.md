@@ -130,15 +130,15 @@ All write endpoints use `tokio::time::timeout(100ms)` when enqueueing to the
 per-team worker channel. If the channel is full and the timeout expires, the
 server returns 503 `"queue full"`. The benchmark tracks these as failures.
 
-With the default configuration (100 workers, 1024 channel capacity each), queue
+With the default configuration (64 workers, 64 channel capacity each), queue
 saturation is expected to be negligible under normal concurrency (50 parallel
 requests). High failure rates would indicate the worker pool or channel capacity
 needs scaling.
 
 ## Docker Postgres tuning
 
-The `docker-compose.yml` configures production-grade Postgres settings for
-realistic benchmark results:
+The `docker-compose.yml` configures Postgres settings tuned for local
+benchmarking on Docker Desktop (macOS):
 
 | Setting | Value | Purpose |
 |---------|-------|---------|
@@ -149,10 +149,15 @@ realistic benchmark results:
 | `wal_buffers` | 16 MB | WAL write buffering |
 | `max_wal_size` | 1 GB | Checkpoint spacing |
 | `wal_compression` | lz4 | WAL size reduction |
-| `commit_delay` | 10 us | Group commit window |
+| `synchronous_commit` | off | Async WAL flush (client doesn't wait for disk ack) |
+| `wal_level` | minimal | Reduced WAL generation (no replication) |
+| `max_wal_senders` | 0 | Required for `wal_level=minimal` |
+| `full_page_writes` | off | Skip full-page images after checkpoint |
+| `commit_delay` | 200 us | Group commit window |
 | `commit_siblings` | 5 | Group commit threshold |
+| `checkpoint_timeout` | 15 min | Fewer checkpoints during benchmark runs |
+| `checkpoint_completion_target` | 0.9 | Spread checkpoint I/O |
 | `random_page_cost` | 1.1 | SSD-tuned planner |
 | `effective_io_concurrency` | 200 | Parallel I/O hints |
-| `checkpoint_completion_target` | 0.9 | Spread checkpoint I/O |
 | `max_connections` | 200 | Connection limit |
 | `shm_size` | 512 MB | Container shared memory |
