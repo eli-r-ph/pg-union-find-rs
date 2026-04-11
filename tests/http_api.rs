@@ -2,8 +2,8 @@ mod common;
 
 use std::sync::Arc;
 
-use axum::routing::{get, post};
 use axum::Router;
+use axum::routing::{get, post};
 use axum_test::TestServer;
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -44,15 +44,15 @@ async fn test_server() -> TestServer {
             post(handlers::resolve_distinct_ids),
         )
         .with_state(state);
-    TestServer::builder()
-        .expect_success_by_default()
-        .build(app)
+    TestServer::builder().expect_success_by_default().build(app)
 }
 
 fn assert_error_body(body: &serde_json::Value) {
-    let err = body.get("error").expect("response should have 'error' field");
+    let err = body
+        .get("error")
+        .expect("response should have 'error' field");
     assert!(
-        err.as_str().map_or(false, |s| !s.is_empty()),
+        err.as_str().is_some_and(|s| !s.is_empty()),
         "error field should be a non-empty string, got: {err}"
     );
 }
