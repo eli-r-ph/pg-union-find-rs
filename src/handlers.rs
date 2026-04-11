@@ -352,8 +352,8 @@ pub async fn resolve(
 ) -> impl IntoResponse {
     match db::resolve(&state.pool, req.team_id, &req.distinct_id).await {
         Ok(Some((person, depth))) => {
-            if depth > state.compress_threshold {
-                if state
+            if depth > state.compress_threshold
+                && state
                     .sender_for(req.team_id)
                     .try_send(DbOp::CompressPath {
                         team_id: req.team_id,
@@ -362,14 +362,13 @@ pub async fn resolve(
                         reply: None,
                     })
                     .is_err()
-                {
-                    tracing::error!(
-                        team_id = req.team_id,
-                        distinct_id = %req.distinct_id,
-                        depth,
-                        "compress enqueue failed: channel full"
-                    );
-                }
+            {
+                tracing::error!(
+                    team_id = req.team_id,
+                    distinct_id = %req.distinct_id,
+                    depth,
+                    "compress enqueue failed: channel full"
+                );
             }
             (
                 StatusCode::OK,
@@ -396,7 +395,7 @@ pub async fn resolve_distinct_ids(
     State(state): State<AppState>,
     Json(req): Json<ResolveDistinctIdsRequest>,
 ) -> impl IntoResponse {
-    match db::resolve_distinct_ids(&state.pool, req.team_id, &req.person_uuid).await {
+    match db::resolve_distinct_ids(&state.pool, req.team_id, req.person_uuid).await {
         Ok(resp) => (StatusCode::OK, Json(serde_json::json!(resp))).into_response(),
         Err(e) => db_error_response(e),
     }

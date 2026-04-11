@@ -78,7 +78,7 @@ fn validate_distinct_id(id: &str) -> DbResult<()> {
 // ---------------------------------------------------------------------------
 
 pub struct ResolvedPerson {
-    pub person_uuid: String,
+    pub person_uuid: Uuid,
     pub person_id: i64,
     pub is_identified: bool,
 }
@@ -182,7 +182,7 @@ pub async fn worker_loop(pool: PgPool, mut rx: mpsc::Receiver<DbOp>, compress_th
                 person_uuid,
                 reply,
             } => {
-                let _ = reply.send(handle_delete_person(&pool, team_id, &person_uuid).await);
+                let _ = reply.send(handle_delete_person(&pool, team_id, person_uuid).await);
             }
             DbOp::DeleteDistinctId {
                 team_id,
@@ -347,7 +347,7 @@ async fn resolve_by_pk(
     team_id: i64,
     did_pk: i64,
 ) -> DbResult<Option<(ResolvedPerson, i64, i32)>> {
-    let row = sqlx::query_as::<_, (String, i64, bool, i64, i32)>(
+    let row = sqlx::query_as::<_, (Uuid, i64, bool, i64, i32)>(
         r#"
         WITH RECURSIVE walk(node, depth) AS (
             SELECT $2::bigint, 0
@@ -643,14 +643,14 @@ pub async fn identify_tx(
         DidState::Live(_pk, resolved, _root, _depth) => Ok(resolved),
 
         DidState::NotFound => {
-            let person_uuid = Uuid::new_v4().to_string();
+            let person_uuid = Uuid::new_v4();
 
             let person_id: i64 = sqlx::query_scalar(
                 "INSERT INTO person_mapping (team_id, person_uuid) \
                  VALUES ($1, $2) RETURNING person_id",
             )
             .bind(team_id)
-            .bind(&person_uuid)
+            .bind(person_uuid)
             .fetch_one(&mut *conn)
             .await?;
 
@@ -681,14 +681,14 @@ pub async fn identify_tx(
         }
 
         DidState::Orphaned(did_pk) => {
-            let person_uuid = Uuid::new_v4().to_string();
+            let person_uuid = Uuid::new_v4();
 
             let person_id: i64 = sqlx::query_scalar(
                 "INSERT INTO person_mapping (team_id, person_uuid) \
                  VALUES ($1, $2) RETURNING person_id",
             )
             .bind(team_id)
-            .bind(&person_uuid)
+            .bind(person_uuid)
             .fetch_one(&mut *conn)
             .await?;
 
@@ -765,7 +765,7 @@ const RESOLVE_DISTINCT_IDS_LIMIT: usize = 10_000;
 pub async fn resolve_distinct_ids(
     pool: &PgPool,
     team_id: i64,
-    person_uuid: &str,
+    person_uuid: Uuid,
 ) -> DbResult<ResolveDistinctIdsResponse> {
     let mut conn = pool.acquire().await?;
 
@@ -813,7 +813,7 @@ pub async fn resolve_distinct_ids(
         .collect();
 
     Ok(ResolveDistinctIdsResponse {
-        person_uuid: person_uuid.to_string(),
+        person_uuid,
         distinct_ids,
         is_truncated,
     })
@@ -965,14 +965,14 @@ pub async fn handle_alias(
         }
 
         (target_state, source_state) => {
-            let person_uuid = Uuid::new_v4().to_string();
+            let person_uuid = Uuid::new_v4();
 
             let person_id: i64 = sqlx::query_scalar(
                 "INSERT INTO person_mapping (team_id, person_uuid, is_identified) \
                  VALUES ($1, $2, true) RETURNING person_id",
             )
             .bind(team_id)
-            .bind(&person_uuid)
+            .bind(person_uuid)
             .fetch_one(&mut *tx)
             .await?;
 
@@ -1028,13 +1028,13 @@ pub async fn handle_merge(
                 )));
             }
             DidState::Orphaned(pk) => {
-                let person_uuid = Uuid::new_v4().to_string();
+                let person_uuid = Uuid::new_v4();
                 let person_id: i64 = sqlx::query_scalar(
                     "INSERT INTO person_mapping (team_id, person_uuid) \
                      VALUES ($1, $2) RETURNING person_id",
                 )
                 .bind(team_id)
-                .bind(&person_uuid)
+                .bind(person_uuid)
                 .fetch_one(&mut *tx)
                 .await?;
                 root_did(&mut tx, team_id, pk, person_id).await?;
@@ -1136,13 +1136,13 @@ pub async fn handle_batched_merge(
                 )));
             }
             DidState::Orphaned(pk) => {
-                let person_uuid = Uuid::new_v4().to_string();
+                let person_uuid = Uuid::new_v4();
                 let person_id: i64 = sqlx::query_scalar(
                     "INSERT INTO person_mapping (team_id, person_uuid) \
                      VALUES ($1, $2) RETURNING person_id",
                 )
                 .bind(team_id)
-                .bind(&person_uuid)
+                .bind(person_uuid)
                 .fetch_one(&mut *tx)
                 .await?;
                 root_did(&mut tx, team_id, pk, person_id).await?;
@@ -1316,7 +1316,7 @@ pub async fn handle_batched_merge(
 pub async fn handle_delete_person(
     pool: &PgPool,
     team_id: i64,
-    person_uuid: &str,
+    person_uuid: Uuid,
 ) -> DbResult<DeletePersonResponse> {
     let mut tx = pool.begin().await?;
 
@@ -1346,9 +1346,7 @@ pub async fn handle_delete_person(
 
     tx.commit().await?;
 
-    Ok(DeletePersonResponse {
-        person_uuid: person_uuid.to_string(),
-    })
+    Ok(DeletePersonResponse { person_uuid })
 }
 
 /// /delete_distinct_id — unlink a distinct_id from its chain, then hard-delete

@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
+use uuid::Uuid;
 
 use pg_union_find_rs::db::{self, ResolvedPerson};
 use pg_union_find_rs::models::{
@@ -198,7 +199,7 @@ pub async fn assert_chain_matches(
     team_id: i64,
     start_did: &str,
     expected_dids: &[&str],
-    expected_person_uuid: &str,
+    expected_person_uuid: Uuid,
 ) {
     let chain = collect_chain(pool, team_id, start_did).await;
     assert_eq!(
@@ -252,7 +253,7 @@ pub async fn assert_chain_matches(
     }
 
     let root = chain.last().unwrap();
-    let person_uuid: String = sqlx::query_scalar(
+    let person_uuid: Uuid = sqlx::query_scalar(
         "SELECT person_uuid FROM person_mapping \
          WHERE person_id = $1 AND deleted_at IS NULL",
     )
@@ -271,7 +272,7 @@ pub async fn assert_chain_is_root(
     pool: &PgPool,
     team_id: i64,
     did: &str,
-    expected_person_uuid: &str,
+    expected_person_uuid: Uuid,
 ) {
     assert_chain_matches(pool, team_id, did, &[did], expected_person_uuid).await;
 }
@@ -523,7 +524,7 @@ pub async fn resolve(
 pub async fn resolve_distinct_ids(
     pool: &PgPool,
     team_id: i64,
-    person_uuid: &str,
+    person_uuid: Uuid,
 ) -> DbResult<ResolveDistinctIdsResponse> {
     db::resolve_distinct_ids(pool, team_id, person_uuid).await
 }

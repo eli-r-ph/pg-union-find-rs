@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
+use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
 // Request / response types
@@ -13,7 +14,7 @@ pub struct CreateRequest {
 
 #[derive(Debug, Serialize)]
 pub struct CreateResponse {
-    pub person_uuid: String,
+    pub person_uuid: Uuid,
     pub is_identified: bool,
 }
 
@@ -33,7 +34,7 @@ pub struct AliasRequest {
 
 #[derive(Debug, Serialize)]
 pub struct AliasResponse {
-    pub person_uuid: String,
+    pub person_uuid: Uuid,
     pub is_identified: bool,
 }
 
@@ -46,7 +47,7 @@ pub struct MergeRequest {
 
 #[derive(Debug, Serialize)]
 pub struct MergeResponse {
-    pub person_uuid: String,
+    pub person_uuid: Uuid,
     pub is_identified: bool,
 }
 
@@ -58,19 +59,19 @@ pub struct ResolveRequest {
 
 #[derive(Debug, Serialize)]
 pub struct ResolveResponse {
-    pub person_uuid: String,
+    pub person_uuid: Uuid,
     pub is_identified: bool,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct DeletePersonRequest {
     pub team_id: i64,
-    pub person_uuid: String,
+    pub person_uuid: Uuid,
 }
 
 #[derive(Debug, Serialize)]
 pub struct DeletePersonResponse {
-    pub person_uuid: String,
+    pub person_uuid: Uuid,
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,12 +89,12 @@ pub struct DeleteDistinctIdResponse {
 #[derive(Debug, Deserialize)]
 pub struct ResolveDistinctIdsRequest {
     pub team_id: i64,
-    pub person_uuid: String,
+    pub person_uuid: Uuid,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ResolveDistinctIdsResponse {
-    pub person_uuid: String,
+    pub person_uuid: Uuid,
     pub distinct_ids: Vec<String>,
     pub is_truncated: bool,
 }
@@ -169,7 +170,7 @@ pub enum DbOp {
     },
     DeletePerson {
         team_id: i64,
-        person_uuid: String,
+        person_uuid: Uuid,
         reply: oneshot::Sender<DbResult<DeletePersonResponse>>,
     },
     DeleteDistinctId {

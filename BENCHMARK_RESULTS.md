@@ -52,7 +52,7 @@ Fits on a single vertically scaled instance with 1TB NVMe storage. With 64 hash 
 
 **2. Dead tuple bloat.** After the benchmark, `person_mapping` has 82.6% dead tuples and `union_find` has 46.6%. Merges generate 1 dead tuple per source in both tables. At 768K merges/s aggregate, that's ~1.5M dead tuples/s. Required: aggressive per-table autovacuum (`autovacuum_vacuum_scale_factor=0.01`, `autovacuum_vacuum_cost_delay=0`) and monitoring of `n_dead_tup`.
 
-**3. `idx_person_mapping_lookup` sizing.** At 32 MB for 110K scans (296 bytes/scan), this index stores `(team_id, person_uuid)` where `person_uuid` is `varchar(200)`. At 100M persons, this index alone would be ~32 GB. Migrating `person_uuid` to native `uuid` type (16 bytes) would cut it to ~8 GB.
+**3. `idx_person_mapping_lookup` sizing.** At 32 MB for 110K scans (296 bytes/scan) in this benchmark run, this index stores `(team_id, person_uuid)`. The `person_uuid` column has been migrated from `varchar(200)` to native `UUID` (16 bytes), which should reduce this index to ~8 GB at 100M persons (down from ~32 GB with the old varchar type).
 
 **4. Partitioning.** The current single-table design works at 450K rows but is untenable at 1B+. `PARTITION BY HASH(team_id, 64)` is essential: index B-tree depth drops a level, per-partition vacuum runs faster, and partition pruning eliminates 63/64 partitions on every query (all queries already filter on `team_id`).
 
@@ -391,7 +391,7 @@ All application queries use index scans. Sequential scans are from migration/tru
 **Key observations:**
 
 - **`union_find_pkey`** is the hottest index by an order of magnitude (6.5M scans). At 4.0 bytes/scan, each scan touches ~1 leaf page. This is the core of the system's performance.
-- **`idx_person_mapping_lookup`** has the worst bytes/scan (296). At 32 MB for only 110K scans, it's oversized because `person_uuid` is `varchar(200)`. At 100M persons: ~32 GB. Migrating to native `uuid` type (16 bytes) would cut this to ~8 GB.
+- **`idx_person_mapping_lookup`** had the worst bytes/scan (296) in this benchmark run. At 32 MB for only 110K scans, it was oversized because `person_uuid` was `varchar(200)`. The column has since been migrated to native `UUID` (16 bytes), which should cut this index to ~8 GB at 100M persons.
 - **`idx_uf_next`** at 929K scans is used by both delete ops and reverse resolve. The 4.2M buffer hits on this index are significant.
 - **`idx_uf_person`** at 15 MB for 120K scans is a partial unique index covering only root nodes. At 100M persons: ~3.1 GB -- reasonable.
 
@@ -478,7 +478,7 @@ Walks the full 23-node chain (95 CTE hits), computes `max_depth=22`. Since `22 >
 | Dead tuple bloat (union_find) | **High** | All writes | 46.6% dead tuples; root updates can't use HOT (indexed columns change) |
 | Compress channel saturation | **High** | `/resolve` | ~100 "channel full" errors during 1M reads on 5 hot teams; chains stay deep until next successful compression |
 | p99 latency cliff on writes | **Medium** | `/create`, `/alias`, `/delete_*` | p99 jumps 25-45x above p50; Docker tmpfs scheduling artifact |
-| `idx_person_mapping_lookup` sizing | **Medium** | `/resolve_distinct_ids` | 32 MB for 110K scans; varchar(200) UUID bloats index at scale |
+| `idx_person_mapping_lookup` sizing | **Addressed** | `/resolve_distinct_ids` | 32 MB for 110K scans in benchmark; migrated from varchar(200) to native UUID (16 bytes) |
 | Single-table design | **Medium** | All at scale | No partition pruning; B-tree depth grows with row count |
 
 ---
@@ -517,9 +517,9 @@ The current design routes `CompressPath` ops through the same per-team worker ch
 - Add a separate compress-only channel/worker pool
 - Use `enqueue_compress` with retry (already done for write-triggered compression) for read-triggered compression too
 
-### I6: Evaluate `idx_person_mapping_lookup` sizing (medium impact)
+### I6: ~~Evaluate `idx_person_mapping_lookup` sizing~~ (done)
 
-At 32 MB / 296 bytes per scan, this is the least efficient index. Options: (1) store `person_uuid` as native `uuid` type (16 bytes vs up to 200), (2) use a hash index for exact-match lookups, (3) add a numeric hash column.
+**Implemented:** `person_uuid` migrated from `varchar(200)` to native `UUID` (16 bytes) in migration 006. Remaining options if further reduction is needed: (1) use a hash index for exact-match lookups, (2) add a numeric hash column.
 
 ### I7: Stress-test queue saturation (validation)
 

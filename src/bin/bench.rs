@@ -46,6 +46,8 @@ use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use tokio::sync::Semaphore;
 
+use uuid::Uuid;
+
 use pg_union_find_rs::db;
 
 // ---------------------------------------------------------------------------
@@ -245,7 +247,7 @@ async fn seed_parallel(pool: &PgPool, pairs: &[(i64, String)]) {
 }
 
 /// Like seed_parallel but returns (team_id, person_uuid) for each seeded row.
-async fn seed_parallel_with_uuids(pool: &PgPool, pairs: &[(i64, String)]) -> Vec<(i64, String)> {
+async fn seed_parallel_with_uuids(pool: &PgPool, pairs: &[(i64, String)]) -> Vec<(i64, Uuid)> {
     let mut set = tokio::task::JoinSet::new();
     for chunk in pairs.chunks(SEED_TX_BATCH) {
         let pool = pool.clone();
@@ -843,11 +845,11 @@ async fn phase_read(
 #[derive(Clone)]
 struct PersonTarget {
     team_id: i64,
-    person_uuid: String,
+    person_uuid: Uuid,
 }
 
 async fn collect_person_targets(pool: &PgPool) -> Vec<PersonTarget> {
-    let rows: Vec<(i64, String)> =
+    let rows: Vec<(i64, Uuid)> =
         sqlx::query_as("SELECT team_id, person_uuid FROM person_mapping WHERE deleted_at IS NULL")
             .fetch_all(pool)
             .await

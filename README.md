@@ -11,7 +11,7 @@ A Postgres-backed union-find service for person/distinct_id resolution, modeled 
 ### Schema
 
 ```
-person_mapping:       person_id (PK bigserial), team_id, person_uuid
+person_mapping:       person_id (PK bigserial), team_id, person_uuid (uuid)
 distinct_id_mappings: id (PK bigserial), team_id, distinct_id
 union_find:           (team_id, current) PK, next (nullable), person_id (nullable)
 ```

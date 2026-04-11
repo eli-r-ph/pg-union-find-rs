@@ -157,7 +157,7 @@ Three tables form the storage layer:
 ├──────────────────────────────┤     ├────────────────────────────────┤
 │ person_id    BIGSERIAL  PK    │     │ id            BIGSERIAL  PK    │
 │ team_id      BIGINT           │     │ team_id       BIGINT           │
-│ person_uuid  VARCHAR(200)     │     │ distinct_id   VARCHAR(200)     │
+│ person_uuid  UUID             │     │ distinct_id   VARCHAR(200)     │
 │ is_identified BOOLEAN         │     └────────────────────────────────┘
 │ deleted_at   TIMESTAMPTZ      │          UNIQUE (team_id, distinct_id)
 └──────────────────────────────┘
