@@ -172,6 +172,7 @@ Three tables form the storage layer:
 │ person_id   BIGINT  NULLABLE   ── references person_mapping       │
 │ deleted_at  TIMESTAMPTZ                                           │
 └───────────────────────────────────────────────────────────────────┘
+  PK     (team_id, current)
   UNIQUE (team_id, person_id) WHERE person_id IS NOT NULL
   INDEX  (team_id, next)      WHERE next IS NOT NULL
 ```
