@@ -73,10 +73,18 @@ fn validate_distinct_id(id: &str) -> DbResult<()> {
     Ok(())
 }
 
+/// Maximum hops any chain walk will follow. Path compression keeps real
+/// chains far shorter than this. A walk that hits the cap (or otherwise fails
+/// to end at a root) is reported as an Internal error, never as "not found":
+/// treating a live-but-too-deep node as missing would let write paths
+/// re-assign it to the wrong person.
+const MAX_WALK_DEPTH: i32 = 1000;
+
 // ---------------------------------------------------------------------------
 // Resolved person — returned by the recursive CTE
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 pub struct ResolvedPerson {
     pub person_uuid: Uuid,
     pub person_id: i64,
@@ -110,8 +118,9 @@ pub async fn handle_compress_path(
             SELECT uf.next, w.depth + 1
             FROM walk w
             JOIN union_find uf
-              ON uf.team_id = $1 AND uf.current = w.node AND uf.person_id IS NULL
-            WHERE w.depth < 1000
+              ON uf.team_id = $1 AND uf.current = w.node
+             AND uf.person_id IS NULL AND uf.next IS NOT NULL
+            WHERE w.depth < $4
         ),
         path_info AS (
             SELECT
@@ -130,6 +139,7 @@ pub async fn handle_compress_path(
     .bind(team_id)
     .bind(did_pk)
     .bind(threshold)
+    .bind(MAX_WALK_DEPTH)
     .execute(&mut *tx)
     .await?;
 
@@ -233,121 +243,143 @@ async fn lookup_did(
 /// Splice a node out of its union_find chain, then clear it to orphan state.
 ///
 /// Non-root nodes (person_id IS NULL): all parents inherit the node's `next`,
-/// splicing past it. Safe because person_id is NULL — no duplication.
+/// splicing past it. Parents are non-roots themselves, so no person_id moves.
 ///
 /// Root nodes (person_id IS NOT NULL): exactly one parent is promoted to root
-/// (inherits next/person_id/deleted_at) and all other parents are redirected
-/// to the promoted parent. This preserves the invariant that each person_id
-/// appears at most once in union_find.
+/// (inherits person_id/deleted_at) and all other parents are redirected to it.
+/// The old root is cleared BEFORE the parent is promoted: Postgres checks the
+/// partial unique index on (team_id, person_id) per row as a statement runs,
+/// so combining clear+promote in one UPDATE transiently duplicates person_id
+/// and aborts whenever the promoted row happens to be scanned first.
 async fn unlink_did(conn: &mut PgConnection, team_id: i64, did_pk: i64) -> DbResult<()> {
-    let is_root: bool = sqlx::query_scalar(
-        "SELECT COALESCE(person_id IS NOT NULL, false) \
+    // deleted_at round-trips as text (no datetime crate needed); only its
+    // NULL-ness matters downstream, but the original timestamp is preserved.
+    let node: Option<(Option<i64>, Option<i64>, Option<String>)> = sqlx::query_as(
+        "SELECT next, person_id, deleted_at::text \
          FROM union_find WHERE team_id = $1 AND current = $2",
     )
     .bind(team_id)
     .bind(did_pk)
     .fetch_optional(&mut *conn)
-    .await?
-    .unwrap_or(false);
+    .await?;
 
-    if !is_root {
-        // Non-root: bulk-splice all parents through this node.
-        // Parents inherit (next, person_id, deleted_at) from the unlinked node.
-        // Safe because person_id is NULL here — no duplication possible.
-        sqlx::query(
-            "UPDATE union_find AS parent \
-             SET next = target.next, \
-                 person_id = target.person_id, \
-                 deleted_at = target.deleted_at \
-             FROM (SELECT next, person_id, deleted_at \
-                   FROM union_find WHERE team_id = $1 AND current = $2) AS target \
-             WHERE parent.team_id = $1 AND parent.next = $2",
-        )
-        .bind(team_id)
-        .bind(did_pk)
-        .execute(&mut *conn)
-        .await?;
+    let Some((next, person_id, deleted_at)) = node else {
+        return Err(DbError::Internal(format!(
+            "unlink_did: no union_find row for pk {did_pk}"
+        )));
+    };
 
-        // Clear the unlinked node to orphan state.
-        sqlx::query(
-            "UPDATE union_find \
-             SET next = NULL, person_id = NULL, deleted_at = NULL \
-             WHERE team_id = $1 AND current = $2",
-        )
-        .bind(team_id)
-        .bind(did_pk)
-        .execute(&mut *conn)
-        .await?;
-    } else {
-        // Root: promote exactly one parent to root, redirect all others to it.
-        let promoted_pk: Option<i64> = sqlx::query_scalar(
-            "SELECT current FROM union_find \
-             WHERE team_id = $1 AND next = $2 \
-             LIMIT 1",
-        )
-        .bind(team_id)
-        .bind(did_pk)
-        .fetch_optional(&mut *conn)
-        .await?;
-
-        if let Some(promoted_pk) = promoted_pk {
-            // Single UPDATE clears old root and promotes parent in one pass.
-            // A single UPDATE defers unique constraint checks until all row
-            // modifications are applied, preventing transient person_id duplicates.
-            // The read-only CTE captures the old root's values from the snapshot.
-            sqlx::query(
-                "WITH old AS ( \
-                     SELECT person_id, deleted_at \
-                     FROM union_find WHERE team_id = $1 AND current = $2 \
-                 ) \
-                 UPDATE union_find AS uf \
-                 SET next = NULL, \
-                     person_id = CASE WHEN uf.current = $2 THEN NULL ELSE old.person_id END, \
-                     deleted_at = CASE WHEN uf.current = $2 THEN NULL ELSE old.deleted_at END \
-                 FROM old \
-                 WHERE uf.team_id = $1 AND uf.current IN ($2, $3)",
+    match person_id {
+        None => {
+            // Non-root: splice all parents past this node.
+            let Some(next) = next else {
+                return Err(DbError::Internal(format!(
+                    "unlink_did: non-root pk {did_pk} has NULL next"
+                )));
+            };
+            sqlx::query("UPDATE union_find SET next = $3 WHERE team_id = $1 AND next = $2")
+                .bind(team_id)
+                .bind(did_pk)
+                .bind(next)
+                .execute(&mut *conn)
+                .await?;
+        }
+        Some(person_id) => {
+            // Root: promote exactly one parent, redirect all others to it.
+            let promoted_pk: Option<i64> = sqlx::query_scalar(
+                "SELECT current FROM union_find \
+                 WHERE team_id = $1 AND next = $2 \
+                 LIMIT 1",
             )
             .bind(team_id)
             .bind(did_pk)
-            .bind(promoted_pk)
-            .execute(&mut *conn)
+            .fetch_optional(&mut *conn)
             .await?;
 
-            // Redirect all other parents to the promoted node.
-            sqlx::query(
-                "UPDATE union_find SET next = $3 \
-                 WHERE team_id = $1 AND next = $2 AND current != $3",
-            )
-            .bind(team_id)
-            .bind(did_pk)
-            .bind(promoted_pk)
-            .execute(&mut *conn)
-            .await?;
-        } else {
-            // No parents: clear old root (person_id is lost).
-            sqlx::query(
-                "UPDATE union_find \
-                 SET next = NULL, person_id = NULL, deleted_at = NULL \
-                 WHERE team_id = $1 AND current = $2",
-            )
-            .bind(team_id)
-            .bind(did_pk)
-            .execute(&mut *conn)
-            .await?;
+            if let Some(promoted_pk) = promoted_pk {
+                // 1. Clear the old root first so the unique person_id index
+                //    never sees two holders, even mid-statement.
+                sqlx::query(
+                    "UPDATE union_find \
+                     SET next = NULL, person_id = NULL, deleted_at = NULL \
+                     WHERE team_id = $1 AND current = $2",
+                )
+                .bind(team_id)
+                .bind(did_pk)
+                .execute(&mut *conn)
+                .await?;
+
+                // 2. Promote the chosen parent, inheriting the old root's
+                //    person and deletion mark.
+                sqlx::query(
+                    "UPDATE union_find \
+                     SET next = NULL, person_id = $3, deleted_at = $4::timestamptz \
+                     WHERE team_id = $1 AND current = $2",
+                )
+                .bind(team_id)
+                .bind(promoted_pk)
+                .bind(person_id)
+                .bind(&deleted_at)
+                .execute(&mut *conn)
+                .await?;
+
+                // 3. Redirect all other parents to the promoted node.
+                sqlx::query(
+                    "UPDATE union_find SET next = $3 \
+                     WHERE team_id = $1 AND next = $2 AND current != $3",
+                )
+                .bind(team_id)
+                .bind(did_pk)
+                .bind(promoted_pk)
+                .execute(&mut *conn)
+                .await?;
+
+                return Ok(()); // old root already cleared in step 1
+            }
+            // No parents: fall through and clear (person_id is lost).
         }
     }
+
+    // Clear the unlinked node to orphan state.
+    sqlx::query(
+        "UPDATE union_find \
+         SET next = NULL, person_id = NULL, deleted_at = NULL \
+         WHERE team_id = $1 AND current = $2",
+    )
+    .bind(team_id)
+    .bind(did_pk)
+    .execute(&mut *conn)
+    .await?;
 
     Ok(())
 }
 
 /// Walk the union_find chain from a distinct_id PK to the root, returning
 /// the root's person info, the root node's `current` PK, and the chain depth.
+///
+/// Returns Ok(None) only for the one legitimate miss: the walk reached a root
+/// whose person is soft-deleted (the node is an orphan). Every other failure
+/// mode — depth cap exceeded, dangling `next`, missing union_find row, root
+/// referencing a missing person — is data corruption or an over-deep chain
+/// and surfaces as an Internal error so callers never mis-classify a live
+/// distinct_id.
 async fn resolve_by_pk(
     conn: &mut PgConnection,
     team_id: i64,
     did_pk: i64,
 ) -> DbResult<Option<(ResolvedPerson, i64, i32)>> {
-    let row = sqlx::query_as::<_, (Uuid, i64, bool, i64, i32)>(
+    let row = sqlx::query_as::<
+        _,
+        (
+            i64,
+            i32,
+            bool,
+            Option<i64>,
+            Option<Uuid>,
+            Option<bool>,
+            Option<bool>,
+        ),
+    >(
         r#"
         WITH RECURSIVE walk(node, depth) AS (
             SELECT $2::bigint, 0
@@ -357,38 +389,77 @@ async fn resolve_by_pk(
             SELECT uf.next, w.depth + 1
             FROM walk w
             JOIN union_find uf
-              ON uf.team_id = $1 AND uf.current = w.node AND uf.person_id IS NULL
-            WHERE w.depth < 1000
+              ON uf.team_id = $1 AND uf.current = w.node
+             AND uf.person_id IS NULL AND uf.next IS NOT NULL
+            WHERE w.depth < $3
         ),
         walk_result AS (
             SELECT node, depth FROM walk ORDER BY depth DESC LIMIT 1
         )
-        SELECT pm.person_uuid, uf.person_id, pm.is_identified, wr.node, wr.depth
+        SELECT wr.node, wr.depth, (uf.current IS NOT NULL),
+               uf.person_id, pm.person_uuid, pm.is_identified,
+               (pm.deleted_at IS NOT NULL)
         FROM walk_result wr
-        JOIN union_find uf ON uf.team_id = $1 AND uf.current = wr.node
-        JOIN person_mapping pm ON pm.person_id = uf.person_id
-        WHERE uf.person_id IS NOT NULL
-          AND pm.deleted_at IS NULL
+        LEFT JOIN union_find uf ON uf.team_id = $1 AND uf.current = wr.node
+        LEFT JOIN person_mapping pm ON pm.person_id = uf.person_id
         "#,
     )
     .bind(team_id)
     .bind(did_pk)
+    .bind(MAX_WALK_DEPTH)
     .fetch_optional(&mut *conn)
     .await?;
 
-    Ok(row.map(
-        |(person_uuid, person_id, is_identified, root_current, depth)| {
-            (
-                ResolvedPerson {
-                    person_uuid,
-                    person_id,
-                    is_identified,
-                },
-                root_current,
-                depth,
+    // The seed row always yields one walk row, so this is defensive only.
+    let Some((
+        root_current,
+        depth,
+        uf_exists,
+        person_id,
+        person_uuid,
+        is_identified,
+        person_deleted,
+    )) = row
+    else {
+        return Err(DbError::Internal(format!(
+            "resolve walk from pk {did_pk} returned no rows"
+        )));
+    };
+
+    if !uf_exists {
+        return Err(DbError::Internal(format!(
+            "distinct_id pk {root_current} has no union_find row (walk from pk {did_pk})"
+        )));
+    }
+    let Some(person_id) = person_id else {
+        return Err(DbError::Internal(if depth >= MAX_WALK_DEPTH {
+            format!(
+                "chain from pk {did_pk} exceeds MAX_WALK_DEPTH ({MAX_WALK_DEPTH}) without reaching a root"
             )
+        } else {
+            format!("chain from pk {did_pk} stops at non-root pk {root_current} (depth {depth})")
+        }));
+    };
+    let (Some(person_uuid), Some(is_identified), Some(person_deleted)) =
+        (person_uuid, is_identified, person_deleted)
+    else {
+        return Err(DbError::Internal(format!(
+            "union_find root pk {root_current} references missing person {person_id}"
+        )));
+    };
+
+    if person_deleted {
+        return Ok(None);
+    }
+    Ok(Some((
+        ResolvedPerson {
+            person_uuid,
+            person_id,
+            is_identified,
         },
-    ))
+        root_current,
+        depth,
+    )))
 }
 
 /// Batch-lookup multiple distinct_id strings, returning a map from
@@ -427,8 +498,10 @@ struct BatchResolveRow {
 /// recursive CTE. Each returned row carries the `start_node` so the
 /// caller can map results back to individual sources.
 ///
-/// PKs whose chain leads to a soft-deleted person (or has no root)
-/// are absent from the result — the caller should treat them as orphaned.
+/// PKs whose chain leads to a soft-deleted person are absent from the
+/// result — the caller should treat them as orphaned. Walks that fail to
+/// reach a root at all (depth cap, dangling pointers, missing rows) are
+/// errors, mirroring resolve_by_pk.
 async fn batch_resolve_pks(
     conn: &mut PgConnection,
     team_id: i64,
@@ -437,7 +510,7 @@ async fn batch_resolve_pks(
     if pks.is_empty() {
         return Ok(Vec::new());
     }
-    let rows = sqlx::query_as::<_, (i64, i64, i64, i32)>(
+    let rows = sqlx::query_as::<_, (i64, i64, i32, bool, Option<i64>, Option<bool>)>(
         r#"
         WITH RECURSIVE walk(start_node, node, depth) AS (
             SELECT v, v, 0 FROM unnest($2::bigint[]) AS v
@@ -447,38 +520,62 @@ async fn batch_resolve_pks(
             SELECT w.start_node, uf.next, w.depth + 1
             FROM walk w
             JOIN union_find uf
-              ON uf.team_id = $1 AND uf.current = w.node AND uf.person_id IS NULL
-            WHERE w.depth < 1000
+              ON uf.team_id = $1 AND uf.current = w.node
+             AND uf.person_id IS NULL AND uf.next IS NOT NULL
+            WHERE w.depth < $3
         ),
         roots AS (
             SELECT DISTINCT ON (start_node) start_node, node AS root_current, depth
             FROM walk
             ORDER BY start_node, depth DESC
         )
-        SELECT r.start_node, r.root_current, uf.person_id, r.depth
+        SELECT r.start_node, r.root_current, r.depth,
+               (uf.current IS NOT NULL), uf.person_id, (pm.deleted_at IS NOT NULL)
         FROM roots r
-        JOIN union_find uf ON uf.team_id = $1 AND uf.current = r.root_current
-        JOIN person_mapping pm ON pm.person_id = uf.person_id
-        WHERE uf.person_id IS NOT NULL
-          AND pm.deleted_at IS NULL
+        LEFT JOIN union_find uf ON uf.team_id = $1 AND uf.current = r.root_current
+        LEFT JOIN person_mapping pm ON pm.person_id = uf.person_id
         "#,
     )
     .bind(team_id)
     .bind(pks)
+    .bind(MAX_WALK_DEPTH)
     .fetch_all(&mut *conn)
     .await?;
 
-    Ok(rows
-        .into_iter()
-        .map(
-            |(start_node, root_current, person_id, depth)| BatchResolveRow {
-                start_node,
-                root_current,
-                person_id,
-                depth,
-            },
-        )
-        .collect())
+    let mut out = Vec::with_capacity(rows.len());
+    for (start_node, root_current, depth, uf_exists, person_id, person_deleted) in rows {
+        if !uf_exists {
+            return Err(DbError::Internal(format!(
+                "distinct_id pk {root_current} has no union_find row (walk from pk {start_node})"
+            )));
+        }
+        let Some(person_id) = person_id else {
+            return Err(DbError::Internal(if depth >= MAX_WALK_DEPTH {
+                format!(
+                    "chain from pk {start_node} exceeds MAX_WALK_DEPTH ({MAX_WALK_DEPTH}) without reaching a root"
+                )
+            } else {
+                format!(
+                    "chain from pk {start_node} stops at non-root pk {root_current} (depth {depth})"
+                )
+            }));
+        };
+        let Some(person_deleted) = person_deleted else {
+            return Err(DbError::Internal(format!(
+                "union_find root pk {root_current} references missing person {person_id}"
+            )));
+        };
+        if person_deleted {
+            continue; // orphan — absent from result by contract
+        }
+        out.push(BatchResolveRow {
+            start_node,
+            root_current,
+            person_id,
+            depth,
+        });
+    }
+    Ok(out)
 }
 
 /// Resolve a distinct_id string all the way to a ResolvedPerson and chain depth.
@@ -535,7 +632,7 @@ async fn link_did(
     did_pk: i64,
     next_pk: i64,
 ) -> DbResult<()> {
-    sqlx::query(
+    let result = sqlx::query(
         "UPDATE union_find SET next = $3, person_id = NULL, deleted_at = NULL \
          WHERE team_id = $1 AND current = $2",
     )
@@ -544,6 +641,11 @@ async fn link_did(
     .bind(next_pk)
     .execute(&mut *conn)
     .await?;
+    if result.rows_affected() == 0 {
+        return Err(DbError::Internal(format!(
+            "link_did: no union_find row for pk {did_pk}"
+        )));
+    }
     Ok(())
 }
 
@@ -554,7 +656,7 @@ async fn root_did(
     did_pk: i64,
     person_id: i64,
 ) -> DbResult<()> {
-    sqlx::query(
+    let result = sqlx::query(
         "UPDATE union_find SET next = NULL, person_id = $3, deleted_at = NULL \
          WHERE team_id = $1 AND current = $2",
     )
@@ -563,6 +665,11 @@ async fn root_did(
     .bind(person_id)
     .execute(&mut *conn)
     .await?;
+    if result.rows_affected() == 0 {
+        return Err(DbError::Internal(format!(
+            "root_did: no union_find row for pk {did_pk}"
+        )));
+    }
     Ok(())
 }
 
@@ -727,7 +834,7 @@ async fn link_root_to_target(
     old_person: i64,
     target_pk: i64,
 ) -> DbResult<()> {
-    sqlx::query(
+    let result = sqlx::query(
         "UPDATE union_find SET person_id = NULL, next = $3 \
          WHERE team_id = $1 AND current = $2",
     )
@@ -736,6 +843,11 @@ async fn link_root_to_target(
     .bind(target_pk)
     .execute(&mut *conn)
     .await?;
+    if result.rows_affected() == 0 {
+        return Err(DbError::Internal(format!(
+            "link_root_to_target: no union_find row for root pk {source_root_current}"
+        )));
+    }
 
     sqlx::query("DELETE FROM person_mapping WHERE person_id = $1")
         .bind(old_person)
@@ -755,6 +867,7 @@ pub async fn resolve(
     team_id: i64,
     distinct_id: &str,
 ) -> DbResult<Option<(ResolvedPerson, i32)>> {
+    validate_distinct_id(distinct_id)?;
     let mut conn = pool.acquire().await?;
     resolve_tx(&mut conn, team_id, distinct_id).await
 }
@@ -1239,17 +1352,15 @@ pub async fn handle_batched_merge(
 
         let new_pks: Vec<i64> = new_rows.into_iter().map(|(id,)| id).collect();
 
-        for &new_pk in &new_pks {
-            sqlx::query(
-                "INSERT INTO union_find (team_id, current, next, person_id) \
-                 VALUES ($1, $2, $3, NULL)",
-            )
-            .bind(team_id)
-            .bind(new_pk)
-            .bind(target_pk)
-            .execute(&mut *tx)
-            .await?;
-        }
+        sqlx::query(
+            "INSERT INTO union_find (team_id, current, next, person_id) \
+             SELECT $1, unnest($2::bigint[]), $3, NULL",
+        )
+        .bind(team_id)
+        .bind(&new_pks)
+        .bind(target_pk)
+        .execute(&mut *tx)
+        .await?;
     }
 
     // --- Step 6: orphaned sources (sequential — rare case) ------------------
@@ -1357,6 +1468,7 @@ pub async fn handle_delete_distinct_id(
     team_id: i64,
     distinct_id: &str,
 ) -> DbResult<DeleteDistinctIdResponse> {
+    validate_distinct_id(distinct_id)?;
     let mut tx = pool.begin().await?;
 
     let did_pk = lookup_did(&mut tx, team_id, distinct_id)

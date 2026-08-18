@@ -536,3 +536,57 @@ pub async fn chain_depth(pool: &PgPool, team_id: i64, distinct_id: &str) -> i32 
     let chain = collect_chain(pool, team_id, distinct_id).await;
     (chain.len() as i32).saturating_sub(1)
 }
+
+/// Build a chain of `depth + 1` nodes directly in SQL (bypassing the API, so
+/// arbitrarily deep chains are cheap to construct):
+///   deep-0 -> deep-1 -> ... -> deep-{depth} (root, live person)
+/// The leaf "deep-0" sits `depth` hops from the root.
+/// Returns (leaf_did, root_did, person_uuid).
+pub async fn build_deep_chain(pool: &PgPool, team_id: i64, depth: usize) -> (String, String, Uuid) {
+    let person_uuid = Uuid::new_v4();
+    let person_id: i64 = sqlx::query_scalar(
+        "INSERT INTO person_mapping (team_id, person_uuid) VALUES ($1, $2) RETURNING person_id",
+    )
+    .bind(team_id)
+    .bind(person_uuid)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+
+    let mut rows: Vec<(i64, String)> = sqlx::query_as(
+        "INSERT INTO distinct_id_mappings (team_id, distinct_id) \
+         SELECT $1, 'deep-' || i.n FROM generate_series(0, $2::bigint) AS i(n) \
+         RETURNING id, distinct_id",
+    )
+    .bind(team_id)
+    .bind(depth as i64)
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    rows.sort_by_key(|(_, did)| did.strip_prefix("deep-").unwrap().parse::<i64>().unwrap());
+    let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
+
+    let currents: Vec<i64> = ids[..depth].to_vec();
+    let nexts: Vec<i64> = ids[1..].to_vec();
+    sqlx::query(
+        "INSERT INTO union_find (team_id, current, next, person_id) \
+         SELECT $1, x.c, x.n, NULL FROM unnest($2::bigint[], $3::bigint[]) AS x(c, n)",
+    )
+    .bind(team_id)
+    .bind(&currents)
+    .bind(&nexts)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO union_find (team_id, current, next, person_id) VALUES ($1, $2, NULL, $3)",
+    )
+    .bind(team_id)
+    .bind(ids[depth])
+    .bind(person_id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    ("deep-0".to_string(), format!("deep-{depth}"), person_uuid)
+}

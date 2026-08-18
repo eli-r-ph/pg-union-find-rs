@@ -331,7 +331,9 @@ Every node still walks to the *same* root, so every answer is unchanged — comp
 
 ## Known Sharp Edges
 
-Two implementation-level edge cases are known and tracked (found in review, reproduced against a live database); they bound the guarantees above:
+Two edge cases found in review (and reproduced against a live database) have been fixed; the current behavior is:
 
-1. **Root promotion can abort.** The atomic promote step (delete-root variant 3, move variant B) can fail with a unique-index error when the promoted child's internal id sorts before the old root's. The transaction rolls back cleanly — no corruption — but the operation returns 500 for that topology.
-2. **Walks cap at 1000 hops.** A chain deeper than 1000 (possible only if compression persistently fails to run) resolves as "not found," and a write could then mistake a live id for an orphan. Compression normally keeps depth near the threshold (default 20), far from the cap.
+1. **Root promotion is ordered.** Promoting a child to root happens in two steps inside one transaction — the old root releases the person *before* the child claims it — so the one-root-per-person invariant holds at every instant, for every topology. (The original single-statement version could abort depending on physical row order.)
+2. **Walks cap at 1000 hops and fail loudly.** A chain deeper than 1000 (possible only if compression persistently fails to run) returns an explicit error — never "not found," and never a silent re-assignment of a live id to the wrong person. One compression pass shortens such a chain and restores normal service.
+
+Both behaviors are locked down by regression tests, and a randomized model-based suite replays hundreds of random operation sequences against an independent in-memory model to guard the whole mutation surface.

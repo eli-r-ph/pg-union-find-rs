@@ -259,6 +259,8 @@ The handler creates a `(oneshot::Sender, oneshot::Receiver)` pair, wraps the sen
 
 **Why serialize writes?** Identity operations for the same team must not race. Two concurrent `/alias` calls could both read the chain, decide to merge, and produce conflicting link structures. Serialization avoids this without row-level locking or retry loops. Different teams may land on the same shard and serialize against each other, but this is an acceptable trade-off.
 
+**Deployment constraint: exactly one server process per database.** The serialization above lives in-process — nothing in Postgres enforces it. Running two server instances against the same database silently breaks the write-path correctness guarantees (two workers could concurrently resolve and relink the same team's chains). A multi-instance deployment would need per-team Postgres advisory locks (or an external team→instance router) before it is safe.
+
 ---
 
 ## API Operations
@@ -307,8 +309,9 @@ Step 2: Walk the chain via recursive CTE                 │  "anon_1"    │
 
 | Status | Condition |
 |--------|-----------|
+| 400    | distinct_id fails validation (illegal ids can never exist, so no lookup is attempted) |
 | 404    | distinct_id not found or resolves to a soft-deleted person |
-| 500    | DB connection or query failure |
+| 500    | DB failure, or the chain exceeds the walk cap / fails to reach a root (see [Path Compression](#path-compression)) |
 
 ---
 
@@ -684,7 +687,7 @@ Step 4: Classify each source
 
 Step 5: Batch insert NotFound sources (2 queries)
         INSERT INTO distinct_id_mappings ... SELECT unnest($2::text[])
-        INSERT INTO union_find row per new PK, each pointing at target
+        INSERT INTO union_find ... SELECT unnest(new_pks), all pointing at target
 
 Step 6: Process orphaned sources sequentially (rare — only after delete_person)
         For each orphan: unlink_did + link_did
@@ -817,11 +820,12 @@ After (a2 is promoted to root):
 
 Steps:
   1. Pick one parent of root (a2) as the promoted node
-  2. Single atomic UPDATE: clear old root's person_id, set promoted node's
-     person_id and next=NULL (done in one statement to avoid transient
-     unique constraint violations on the person_id index)
-  3. UPDATE remaining parents (b1): set next = promoted_pk
-  4. DELETE old root's union_find and distinct_id_mappings rows
+  2. UPDATE old root: clear person_id/next FIRST — Postgres checks the
+     unique person_id index per row as each statement runs, so the old
+     holder must release the person before the new one claims it
+  3. UPDATE promoted node (a2): set person_id, next=NULL
+  4. UPDATE remaining parents (b1): set next = promoted_pk
+  5. DELETE old root's union_find and distinct_id_mappings rows
 ```
 
 **Cascading person soft-delete:** After deletion, if no union_find row still references the person_id (no live root exists for that person), the person_mapping row is soft-deleted. This sets `person_deleted: true` in the response.
@@ -832,6 +836,7 @@ Steps:
 
 | Status | Condition |
 |--------|-----------|
+| 400    | distinct_id fails validation |
 | 404    | distinct_id not found |
 | 503    | worker queue full or timeout |
 | 500    | DB error |
@@ -891,7 +896,9 @@ WHERE pi.max_depth >= $3
 
 The entire walk + update runs as one SQL statement in one transaction. If compression races with a concurrent write, it sees a consistent MVCC snapshot and either compresses correctly or becomes a no-op.
 
-**Compression is best-effort.** On the write path, the handler retries enqueue up to 3 times with backoff; on the read path, a single `try_send` is attempted and silently dropped if the channel is full. In either case, chains are always correct regardless of depth — compression is purely a performance optimization.
+**Compression is best-effort.** On the write path, the handler retries enqueue up to 3 times with backoff; on the read path, a single `try_send` is attempted and silently dropped if the channel is full. Chains are always correct regardless of depth — compression is purely a performance optimization.
+
+**Walk cap.** Every chain walk is capped at `MAX_WALK_DEPTH` (1000) hops. A walk that hits the cap — or otherwise fails to end at a root — returns an Internal error (HTTP 500) rather than "not found": answering 404 for a live distinct_id would let write paths mis-classify it as an orphan and silently re-assign it to the wrong person. A single compression pass shortens an over-cap chain by up to 1000 hops, so service self-heals if this state is ever reached.
 
 ---
 

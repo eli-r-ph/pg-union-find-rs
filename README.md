@@ -26,7 +26,7 @@ union_find:           (team_id, current) PK, next (nullable), person_id (nullabl
 
 | Method | Path | Body | Description |
 |--------|------|------|-------------|
-| GET | `/health` | -- | Health check (verifies DB connection) |
+| GET | `/health` | -- | Health check (verifies worker channels are alive; does not query the DB) |
 | POST | `/create` | `{ team_id, distinct_id }` | Get-or-create a person for a single distinct_id |
 | POST | `/identify` | `{ team_id, target, anonymous }` | Link anonymous distinct_id to target (`$identify`) |
 | POST | `/alias` | `{ team_id, target, alias }` | Link alias distinct_id to target (`$create_alias`) |

@@ -504,6 +504,34 @@ async fn resolve_malformed_json() {
     resp.assert_status(axum::http::StatusCode::UNPROCESSABLE_ENTITY);
 }
 
+#[tokio::test]
+async fn resolve_illegal_distinct_id() {
+    let server = test_server().await;
+    let t = next_team_id();
+
+    let resp = server
+        .post("/resolve")
+        .json(&json!({"team_id": t, "distinct_id": "null"}))
+        .expect_failure()
+        .await;
+    resp.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    assert_error_body(&resp.json());
+}
+
+#[tokio::test]
+async fn delete_distinct_id_illegal_distinct_id() {
+    let server = test_server().await;
+    let t = next_team_id();
+
+    let resp = server
+        .post("/delete_distinct_id")
+        .json(&json!({"team_id": t, "distinct_id": "guest"}))
+        .expect_failure()
+        .await;
+    resp.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    assert_error_body(&resp.json());
+}
+
 // ===========================================================================
 // POST /delete_person
 // ===========================================================================
