@@ -4,6 +4,8 @@ This document describes the architecture and operation of `pg-union-find-rs`, a 
 
 If you are unfamiliar with union-find or recursive CTEs, the two background sections below give you enough context to follow the rest of the document.
 
+For diagrammed before/after examples of every operation — including the tree-position variants of deletes and orphan moves — and the argument for why each mutation is correct and minimal, see [CORRECTNESS.md](CORRECTNESS.md).
+
 ---
 
 ## Table of Contents

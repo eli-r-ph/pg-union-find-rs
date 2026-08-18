@@ -2,6 +2,8 @@
 
 A Postgres-backed union-find service for person/distinct_id resolution, modeled after PostHog's identity merge system. Built with Rust (Axum + SQLx + Tokio).
 
+**Docs:** [DESIGN.md](DESIGN.md) covers architecture and internals. [CORRECTNESS.md](CORRECTNESS.md) walks through diagrammed before/after examples of every read and mutation, showing why each one keeps the mappings correct while touching the minimum number of rows.
+
 ## Architecture
 
 - **Three tables:** `person_mapping`, `distinct_id_mappings`, `union_find` -- the union_find table forms a linked chain of distinct_id PKs traversed by a recursive CTE. Root rows carry the `person_id`.
